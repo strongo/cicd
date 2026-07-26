@@ -143,21 +143,31 @@ on:
           tested source; nobody executed what got uploaded). Three layers,
           all gated by this one switch: (1) download the release asset per
           platform in artifact_smoke_test_platforms and run it under a
-          timeout — always a hard failure, since a binary that won't even run
-          standalone is unambiguously broken; (2) on macOS, statically assert
-          the artifact is signed with a real Developer ID and notarized; (3)
-          when this repo publishes a Homebrew cask
-          (artifact_smoke_test_homebrew_cask), `brew install --cask` it and
-          run the INSTALLED binary — the path a real user actually takes.
-          Layers 2 and 3 exist because layer 1 alone is insufficient:
-          specscore-cli v0.24.0 shipped a Homebrew cask that macOS Gatekeeper
-          silently blocked for every user (ad-hoc signature, no
-          notarization) even though the raw downloaded binary ran fine
-          standalone — a curl-and-run test alone would have passed this
-          exact incident. See require_notarized_macos for layer 2/3
-          severity. Defaults to true deliberately — a default-off check
-          would have caught nothing. Set false to opt out entirely for a
-          repo that doesn't publish a runnable CLI binary.
+          timeout; (2) on macOS, statically assert the artifact is signed
+          with a real Developer ID and notarized; (3) when this repo
+          publishes a Homebrew cask (artifact_smoke_test_homebrew_cask),
+          `brew install --cask` it and run the INSTALLED binary — the path a
+          real user actually takes. Layers 2 and 3 exist because layer 1
+          alone is insufficient: specscore-cli v0.24.0 shipped a Homebrew
+          cask that macOS Gatekeeper silently blocked for every user
+          (ad-hoc signature, no notarization) even though the raw downloaded
+          binary ran fine standalone — a curl-and-run test alone would have
+          passed this exact incident. See require_notarized_macos for layer
+          2/3 severity.
+          Every layer distinguishes "could not test" from "tested and
+          broken": no matching release asset, an unrecognized archive, no
+          binary found inside it, or a failed `brew install --cask` logs
+          `::warning::` and is SKIPPED (not a failure) — this workflow is
+          reused by repos not enumerated here, including libraries and
+          Docker-only releases with no per-arch archive, and a naming/shape
+          mismatch is not evidence of a broken release. Once the binary is
+          actually found and executed, a hang / non-zero exit / empty output
+          is ALWAYS a hard failure for layer 1 (unconditional — it passes
+          today) and gated by require_notarized_macos for layers 2/3.
+          Defaults to true deliberately — a default-off check would have
+          caught nothing, and the could-not-test/tested-and-broken split
+          above is what makes that default safe. Set false to opt out
+          entirely for a repo that doesn't publish a runnable CLI binary.
       artifact_smoke_test_binary:
         type: string
         required: false
@@ -171,7 +181,12 @@ on:
           "-cli" stripped (specscore-cli -> specscore), or the org name for a
           repo literally named "cli" (chatwright/cli -> chatwright). Set this
           explicitly for a multi-binary repo (inference only checks the first
-          build) or whenever the guess is wrong.
+          build) or whenever the guess is wrong. EXCEPTION: if this repo's
+          tag_prefix looks like a subdirectory-module path (e.g. "ingitdb/v")
+          and no config was found at the repo root, step (2) is skipped —
+          guessing from the repo name would likely name the wrong module —
+          and the whole smoke test is skipped with a warning instead. Set
+          this input explicitly to enable it for that case.
       artifact_smoke_test_command:
         type: string
         required: false
@@ -179,7 +194,12 @@ on:
         description: >-
           Arguments passed to the published binary for the smoke test
           (layers 1 and 3), e.g. '--version'. The run must exit 0 and print
-          non-empty output.
+          non-empty output; once the binary is found, this is always a hard
+          failure if it isn't (see artifact_smoke_test). Set this for a CLI
+          whose default invocation doesn't support a bare `--version` (e.g.
+          it prints usage and exits non-zero) — that's a real, if
+          non-obvious, way to opt into a meaningful test rather than a false
+          "broken" reading of a command this CLI never claimed to support.
       artifact_smoke_test_timeout_seconds:
         type: number
         required: false
@@ -206,9 +226,13 @@ on:
           darwin/arm64 (macos-latest, an Apple Silicon GitHub-hosted runner —
           the platform the specscore-cli v0.24.0 incident actually shipped
           on). For each platform, the release asset is matched by the
-          GoReleaser-standard `*_<goos>_<goarch>.*` filename suffix. Override
-          to add/remove platforms (e.g. windows) or trim to what this repo
-          actually publishes.
+          GoReleaser-standard `*_<goos>_<goarch>.{tar.gz,tgz,zip}` filename
+          (archive extensions only, so a checksum/signature/SBOM sidecar
+          sharing the same os/arch-suffixed name is never mistaken for the
+          real archive). No match is treated as "could not test" for that
+          platform (a warning, not a failure) — see artifact_smoke_test.
+          Override to add/remove platforms (e.g. windows) or trim to what
+          this repo actually publishes.
       artifact_smoke_test_homebrew_cask:
         type: boolean
         required: false
@@ -220,7 +244,11 @@ on:
           macos-latest and execute the INSTALLED binary under
           artifact_smoke_test_timeout_seconds. This is the path a real
           Homebrew user takes, and the only layer that reproduces Homebrew's
-          quarantine attribute on the installed binary. Severity follows
+          quarantine attribute on the installed binary. A `brew tap`/`brew
+          install` failure (transient Homebrew/network issue, tap-visibility
+          timing, a cask-not-found mismatch) is "could not test" — a
+          warning, not a failure, regardless of require_notarized_macos.
+          Once installed, hang/non-zero-exit/empty-output severity follows
           require_notarized_macos, same as layer 2. KNOWN GAP, confirmed by
           actually running this against the quarantined specscore-cli
           v0.24.0 Homebrew-cask binary on a GitHub-hosted macos-latest
@@ -447,11 +475,16 @@ jobs:
     needs: release
     if: ${{ inputs.artifact_smoke_test && !failure() && !cancelled() && (needs.release.outputs.tag != '' || github.ref_type == 'tag') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       binary: ${{ steps.resolve.outputs.binary }}
+      # false only for the specific case where we deliberately refuse to
+      # guess (see the tag_prefix branch in "Resolve binary name" below).
+      # Downstream jobs skip entirely rather than test/fail on a guess.
+      binary_resolved: ${{ steps.resolve.outputs.binary_resolved }}
       has_homebrew_cask: ${{ steps.resolve.outputs.has_homebrew_cask }}
       homebrew_tap: ${{ steps.resolve.outputs.homebrew_tap }}
       homebrew_cask_name: ${{ steps.resolve.outputs.homebrew_cask_name }}
@@ -485,6 +518,7 @@ jobs:
         env:
           BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}
           TAG: ${{ steps.release_tag.outputs.tag }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
         run: |
           set -euo pipefail
           config_file=""
@@ -496,6 +530,8 @@ jobs:
           has_cask="false"
           tap=""
           cask_name=""
+          binary_resolved="true"
+          resolve_note=""
 
           if [ -n "$config_file" ] && command -v yq >/dev/null 2>&1; then
             if [ -z "$binary" ]; then
@@ -527,20 +563,46 @@ jobs:
           # literally named "cli" (chatwright/cli -> chatwright). Homebrew
           # cask detection has no such fallback — it's config-only, since
           # there's nothing sensible to guess.
+          #
+          # EXCEPTION: if tag_prefix looks like a subdirectory-module path
+          # (e.g. "ingitdb/v", documented above for the CD bump path) and no
+          # root-level config was found, the repo-name guess is very likely
+          # wrong for a subdirectory module -- the module has its own name,
+          # not the repo's. Refuse to guess: leave binary unresolved. This is
+          # "could not test", not "tested and broken" -- downstream jobs
+          # skip entirely (see binary_resolved in job outputs) rather than
+          # test, or hard-fail on, a binary name that was never verified
+          # against reality. (Checked against every current consumer of this
+          # workflow at the time this was written: none combine a
+          # subdirectory tag_prefix with this fallback, but the workflow is
+          # reused by repos not enumerated here, so this stays defensive.)
           if [ -z "$binary" ]; then
-            repo_name="${GITHUB_REPOSITORY#*/}"
-            org_name="${GITHUB_REPOSITORY%%/*}"
-            if [ "$repo_name" = "cli" ]; then
-              binary="$org_name"
-            else
-              binary="${repo_name%-cli}"
-            fi
+            case "$TAG_PREFIX" in
+              */*)
+                binary_resolved="false"
+                resolve_note="Could not resolve a binary name to smoke test: tag_prefix '$TAG_PREFIX' looks like a subdirectory-module path, but no .goreleaser.yaml/.goreleaser.yml/goreleaser.yaml/goreleaser.yml was found at the REPO ROOT at tag $TAG. Guessing from the repo name would likely name the wrong module. Skipping the artifact smoke test for this release rather than testing (or failing on) an unverified guess. Set artifact_smoke_test_binary explicitly to enable it."
+                ;;
+              *)
+                repo_name="${GITHUB_REPOSITORY#*/}"
+                org_name="${GITHUB_REPOSITORY%%/*}"
+                if [ "$repo_name" = "cli" ]; then
+                  binary="$org_name"
+                else
+                  binary="${repo_name%-cli}"
+                fi
+                ;;
+            esac
           fi
 
-          echo "Resolved: tag=$TAG binary=$binary has_homebrew_cask=$has_cask homebrew_tap=$tap homebrew_cask_name=$cask_name"
+          if [ "$binary_resolved" = "false" ]; then
+            echo "::warning::$resolve_note"
+          fi
+
+          echo "Resolved: tag=$TAG binary=$binary binary_resolved=$binary_resolved has_homebrew_cask=$has_cask homebrew_tap=$tap homebrew_cask_name=$cask_name"
           {
             echo "tag=$TAG"
             echo "binary=$binary"
+            echo "binary_resolved=$binary_resolved"
             echo "has_homebrew_cask=$has_cask"
             echo "homebrew_tap=$tap"
             echo "homebrew_cask_name=$cask_name"
@@ -552,11 +614,25 @@ jobs:
   # which would reproduce the exact blind spot that let specscore-cli
   # v0.24.0 ship broken while CI stayed green (CI only ever tested source,
   # never what got uploaded).
+  #
+  # TAXONOMY, applied throughout this job and the Homebrew-cask job below:
+  # "could not test" (no matching asset, no recognizable archive, no binary
+  # found inside it, brew install itself failed) is NOT the same claim as
+  # "tested and broken" (the binary was found, executed, and hung / exited
+  # non-zero / printed nothing). Only the second justifies failing a
+  # release — this workflow is consumed by repos not enumerated here,
+  # including libraries and Docker-only releases with no per-arch archive,
+  # and a naming/shape mismatch is not evidence the release is broken.
+  # "Could not test" always logs ::warning:: and skips (exit 0); "tested and
+  # broken" always hard-fails (exit 1), unconditionally for layer 1.
   artifact_smoke_test:
     name: 'Smoke test published artifact (${{ matrix.goos }}/${{ matrix.goarch }})'
     needs: [ release, resolve_artifact_smoke_test ]
-    if: ${{ needs.resolve_artifact_smoke_test.result == 'success' }}
+    if: >-
+      ${{ needs.resolve_artifact_smoke_test.result == 'success' &&
+          needs.resolve_artifact_smoke_test.outputs.binary_resolved != 'false' }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     permissions:
       contents: read
     strategy:
@@ -572,56 +648,140 @@ jobs:
       REQUIRE_NOTARIZED: ${{ inputs.require_notarized_macos }}
 
     steps:
+      # Selects only real archives ("*_<goos>_<goarch>.{tar.gz,tgz,zip}"),
+      # never a sidecar that happens to share the os/arch-suffixed name
+      # (checksums, cosign .sig, SBOMs, .intoto.jsonl provenance) — those
+      # don't get downloaded at all now, rather than relying on picking the
+      # right file out of a mixed download afterward (see the Extract step;
+      # this is finding 4 from review: nondeterministic `find` order over an
+      # unfiltered download could previously select a sidecar instead of the
+      # archive and flap between pass/fail across identical releases).
+      #
+      # No matching asset is NOT evidence of a broken release — see the
+      # taxonomy note on the job above — so a miss here warns and skips
+      # (asset_found=false) rather than failing. Wrapped in an explicit
+      # timeout (network step; GitHub Actions' default job timeout is 6
+      # hours, which the watchdog below exists specifically to avoid ever
+      # relying on).
       - name: Download published release asset
+        id: download
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          set +e
+
+          # Duplicated in this job's brew-install step and both "run the
+          # binary" steps below (and in the Homebrew-cask job) — GitHub
+          # Actions has no mechanism to share a bash function across steps
+          # within one workflow file, so each step that needs a watchdog
+          # redefines it.
+          run_with_timeout() {
+            local seconds="$1"; shift
+            "$@" &
+            local cmd_pid=$!
+            (
+              sleep "$seconds"
+              if kill -0 "$cmd_pid" 2>/dev/null; then
+                touch "${RUNNER_TEMP}/.download_timed_out"
+                kill -TERM "$cmd_pid" 2>/dev/null
+                sleep 2
+                kill -KILL "$cmd_pid" 2>/dev/null
+              fi
+            ) &
+            local watchdog_pid=$!
+            wait "$cmd_pid" 2>/dev/null
+            local exit_code=$?
+            kill "$watchdog_pid" 2>/dev/null
+            wait "$watchdog_pid" 2>/dev/null
+            return "$exit_code"
+          }
+
           mkdir -p "${RUNNER_TEMP}/artifact-smoke"
-          pattern="*_${{ matrix.goos }}_${{ matrix.goarch }}.*"
-          echo "Downloading a release asset matching '$pattern' from $GITHUB_REPOSITORY@$TAG"
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$pattern" --dir "${RUNNER_TEMP}/artifact-smoke" --clobber
+          rm -f "${RUNNER_TEMP}/.download_timed_out"
+          goos="${{ matrix.goos }}"
+          goarch="${{ matrix.goarch }}"
+          echo "Downloading a ${goos}/${goarch} archive from $GITHUB_REPOSITORY@$TAG (timeout 120s)"
+          run_with_timeout 120 gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "*_${goos}_${goarch}.tar.gz" \
+            --pattern "*_${goos}_${goarch}.tgz" \
+            --pattern "*_${goos}_${goarch}.zip" \
+            --dir "${RUNNER_TEMP}/artifact-smoke" --clobber
+          status=$?
+
+          if [ -f "${RUNNER_TEMP}/.download_timed_out" ]; then
+            echo "::warning::Could not test ${goos}/${goarch}: 'gh release download' did not finish within 120s and was killed (network slowness or a GitHub API issue this run). This is NOT evidence the release is broken."
+            echo "asset_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::Could not test ${goos}/${goarch}: no release asset matched '*_${goos}_${goarch}.{tar.gz,tgz,zip}' for tag $TAG. This is NOT evidence the release is broken -- it means this platform isn't testable by this check as configured. Common legitimate reasons: this release doesn't publish ${goos}/${goarch} at all (a library, a Docker-only release, a universal macOS binary with no arch suffix), or its archive naming differs from GoReleaser's default '<name>_<version>_<os>_<arch>' convention (e.g. a custom archives.name_template). If ${goos}/${goarch} SHOULD be testable, fix the naming; otherwise trim artifact_smoke_test_platforms, or set artifact_smoke_test: false if this repo doesn't publish a runnable CLI binary at all."
+            echo "asset_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           ls -la "${RUNNER_TEMP}/artifact-smoke"
+          echo "asset_found=true" >> "$GITHUB_OUTPUT"
 
       - name: Extract published archive
         id: extract
+        if: ${{ steps.download.outputs.asset_found == 'true' }}
         shell: bash
         working-directory: ${{ runner.temp }}/artifact-smoke
         run: |
-          set -euo pipefail
-          archive="$(find . -maxdepth 1 -type f ! -name '*.txt' | head -n1)"
+          set -uo pipefail
+          set +e
+          archive="$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.zip' \) | head -n1)"
           if [ -z "$archive" ]; then
-            echo "::error::No release asset matched '*_${{ matrix.goos }}_${{ matrix.goarch }}.*' for tag $TAG. Nothing to smoke test for this platform — either this release doesn't publish ${{ matrix.goos }}/${{ matrix.goarch }}, or its archive naming differs from GoReleaser's default '<name>_<version>_<os>_<arch>' convention. Adjust artifact_smoke_test_platforms, or set artifact_smoke_test: false if this repo doesn't publish a runnable CLI binary."
-            exit 1
+            echo "::warning::Could not test ${{ matrix.goos }}/${{ matrix.goarch }}: the download matched a release asset by name but none of them was a recognizable archive (.tar.gz/.tgz/.zip) once filtered — only non-archive sidecars (checksums, signatures, SBOMs) may have matched. This is NOT evidence the release is broken."
+            echo "extracted=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           echo "Testing artifact: $archive"
+          extract_ok=true
           case "$archive" in
-            *.zip) unzip -o -q "$archive" ;;
-            *.tar.gz|*.tgz) tar xzf "$archive" ;;
-            *) echo "::error::Don't know how to extract '$archive' (unsupported archive format)."; exit 1 ;;
+            *.zip) unzip -o -q "$archive" || extract_ok=false ;;
+            *.tar.gz|*.tgz) tar xzf "$archive" || extract_ok=false ;;
           esac
+          if [ "$extract_ok" = false ]; then
+            echo "::warning::Could not test ${{ matrix.goos }}/${{ matrix.goarch }}: failed to extract '$archive'. This is NOT evidence the release is broken -- the archive may be malformed, or built in a way this check's extraction logic doesn't handle."
+            echo "extracted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           bin_path=""
-          if [ -f "$BINARY" ]; then
+          if [ -n "$BINARY" ] && [ -f "$BINARY" ]; then
             bin_path="$BINARY"
-          else
+          elif [ -n "$BINARY" ]; then
             bin_path="$(find . -maxdepth 3 -type f -name "$BINARY" | head -n1)"
           fi
           if [ -z "$bin_path" ] || [ ! -f "$bin_path" ]; then
-            echo "::error::Extracted '$archive' but found no '$BINARY' executable inside it. Set artifact_smoke_test_binary to the correct name (this repo may build more than one binary, or use a build id/binary name that differs from project_name)."
-            exit 1
+            if [ -z "$BINARY" ]; then
+              echo "::warning::Could not test ${{ matrix.goos }}/${{ matrix.goarch }}: no binary name was resolved for this repo (see the 'Resolve artifact smoke test target' job above), so this check doesn't know what to look for inside '$archive'. Set artifact_smoke_test_binary explicitly."
+            else
+              echo "::warning::Could not test ${{ matrix.goos }}/${{ matrix.goarch }}: extracted '$archive' but found no '$BINARY' executable inside it. This is NOT evidence the release is broken -- this repo may build more than one binary (inference only checks the first 'builds[]' entry), or use a build id/binary name that differs from project_name. Set artifact_smoke_test_binary if this persists."
+            fi
+            echo "extracted=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           chmod +x "$bin_path"
-          echo "archive=$archive" >> "$GITHUB_OUTPUT"
-          echo "bin_path=$bin_path" >> "$GITHUB_OUTPUT"
+          {
+            echo "archive=$archive"
+            echo "bin_path=$bin_path"
+            echo "extracted=true"
+          } >> "$GITHUB_OUTPUT"
 
-      # LAYER 1 — download-and-run of the raw release asset. Always a hard
-      # failure (it passes today; a binary that won't even run standalone is
-      # unambiguously broken) regardless of require_notarized_macos. Proves
-      # the artifact itself is a working binary. It does NOT prove a
-      # Homebrew-cask user can run it — that's layer 3 below. Runs first:
-      # it's cheap, platform-agnostic, and unconditional, so a genuinely
-      # broken binary fails fast before the macOS-only layer 2 check below.
+      # LAYER 1 — download-and-run of the raw release asset. Once the binary
+      # was actually found and executed, this is always a hard failure (it
+      # passes today; a binary that won't even run standalone is
+      # unambiguously broken) regardless of require_notarized_macos — this
+      # is "tested and broken", the one case the taxonomy above always
+      # fails. Proves the artifact itself is a working binary. It does NOT
+      # prove a Homebrew-cask user can run it — that's layer 3 below. Runs
+      # first: it's cheap, platform-agnostic, and unconditional, so a
+      # genuinely broken binary fails fast before the macOS-only layer 2
+      # check below. Skipped (not run at all) when extraction couldn't find
+      # a binary to test — see the Extract step's "could not test" branches.
       - name: 'Layer 1: run the published binary (must exit within timeout)'
+        if: ${{ steps.extract.outputs.extracted == 'true' }}
         shell: bash
         working-directory: ${{ runner.temp }}/artifact-smoke
         env:
@@ -697,7 +857,7 @@ jobs:
       # binary: `codesign -dv` showed Identifier=a.out, TeamIdentifier=not
       # set (ad-hoc signature only); `spctl -a -vv` returned "rejected".
       - name: 'Layer 2: assert macOS code signing / notarization'
-        if: ${{ matrix.goos == 'darwin' }}
+        if: ${{ matrix.goos == 'darwin' && steps.extract.outputs.extracted == 'true' }}
         shell: bash
         working-directory: ${{ runner.temp }}/artifact-smoke
         env:
@@ -767,9 +927,11 @@ jobs:
     needs: [ release, resolve_artifact_smoke_test ]
     if: >-
       ${{ needs.resolve_artifact_smoke_test.result == 'success' &&
+          needs.resolve_artifact_smoke_test.outputs.binary_resolved != 'false' &&
           inputs.artifact_smoke_test_homebrew_cask &&
           needs.resolve_artifact_smoke_test.outputs.has_homebrew_cask == 'true' }}
     runs-on: macos-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     env:
@@ -781,19 +943,72 @@ jobs:
       REQUIRE_NOTARIZED: ${{ inputs.require_notarized_macos }}
 
     steps:
+      # A `brew tap`/`brew install --cask` failure here is "could not test"
+      # (transient Homebrew/network issue, tap-visibility timing right
+      # after GoReleaser pushed the cask manifest, or a name mismatch) — NOT
+      # evidence the release is broken, so this warns and skips the rest of
+      # this job rather than failing it unconditionally regardless of
+      # require_notarized_macos, which is what it did before this review
+      # (finding 3). Wrapped in an explicit timeout for the same reason as
+      # the download step in the job above: no watchdog here meant a hang
+      # was bounded only by GitHub's 6-hour default job timeout.
       - name: brew install --cask (the real user path)
+        id: brew_install
         shell: bash
         run: |
-          set -euo pipefail
-          echo "Tapping $HOMEBREW_TAP and installing --cask $HOMEBREW_TAP/$CASK_NAME"
-          brew tap "$HOMEBREW_TAP"
-          brew install --cask "$HOMEBREW_TAP/$CASK_NAME"
+          set -uo pipefail
+          set +e
+
+          run_with_timeout() {
+            local seconds="$1"; shift
+            "$@" &
+            local cmd_pid=$!
+            (
+              sleep "$seconds"
+              if kill -0 "$cmd_pid" 2>/dev/null; then
+                touch "${RUNNER_TEMP}/.brew_install_timed_out"
+                kill -TERM "$cmd_pid" 2>/dev/null
+                sleep 2
+                kill -KILL "$cmd_pid" 2>/dev/null
+              fi
+            ) &
+            local watchdog_pid=$!
+            wait "$cmd_pid" 2>/dev/null
+            local exit_code=$?
+            kill "$watchdog_pid" 2>/dev/null
+            wait "$watchdog_pid" 2>/dev/null
+            return "$exit_code"
+          }
+
+          rm -f "${RUNNER_TEMP}/.brew_install_timed_out"
+          echo "Tapping $HOMEBREW_TAP and installing --cask $HOMEBREW_TAP/$CASK_NAME (timeout 300s)"
+          # Single-quoted on purpose: $HOMEBREW_TAP/$CASK_NAME must expand in
+          # the inner `bash -c` shell (against its inherited environment),
+          # not in this outer shell, so the timeout wraps both commands as
+          # one unit.
+          # shellcheck disable=SC2016
+          run_with_timeout 300 bash -c 'set -e; brew tap "$HOMEBREW_TAP" && brew install --cask "$HOMEBREW_TAP/$CASK_NAME"'
+          status=$?
+
+          if [ -f "${RUNNER_TEMP}/.brew_install_timed_out" ]; then
+            echo "::warning::Could not test the Homebrew-cask install path: 'brew tap'/'brew install --cask $HOMEBREW_TAP/$CASK_NAME' did not finish within 300s and was killed. This is NOT evidence the release is broken -- this check could not verify it this run (Homebrew/network slowness). Investigate separately if this recurs across releases."
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::Could not test the Homebrew-cask install path: 'brew tap $HOMEBREW_TAP' / 'brew install --cask $HOMEBREW_TAP/$CASK_NAME' exited $status (see the log above for the actual brew error). This is NOT evidence the release is broken. Common causes: a transient Homebrew/network issue, tap-visibility timing right after GoReleaser pushed the cask manifest, or a cask-name/tap mismatch (double check homebrew_casks[0].name / .repository in .goreleaser.yaml against '$CASK_NAME' / '$HOMEBREW_TAP' resolved here)."
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "installed=true" >> "$GITHUB_OUTPUT"
 
       # Runs the binary Homebrew actually put on disk — quarantine
       # attribute and all. Uses the same portable timeout wrapper as layer
       # 1 (no reliance on GNU `timeout`/`gtimeout`, neither of which ships
-      # on the stock macOS runner image).
+      # on the stock macOS runner image). Skipped entirely when the install
+      # step above couldn't verify anything.
       - name: 'Layer 3: run the Homebrew-installed binary (must exit within timeout)'
+        if: ${{ steps.brew_install.outputs.installed == 'true' }}
         shell: bash
         run: |
           # See "Layer 1" above: GitHub Actions' default bash invocation is
@@ -805,8 +1020,16 @@ jobs:
           set +e
           bin_path="$(brew --prefix)/bin/$BINARY"
           if [ ! -x "$bin_path" ]; then
-            echo "::error::brew install --cask succeeded but '$bin_path' is not an executable. Set artifact_smoke_test_binary if this cask's binary name differs from the inferred name ('$BINARY')."
-            exit 1
+            # "Could not test", not "tested and broken": brew reported a
+            # successful install, so this is much more likely our binary
+            # name guess being wrong than the cask actually being empty --
+            # GoReleaser's homebrew_casks always emits a `binary` stanza
+            # that Homebrew auto-symlinks, so a genuinely broken cask would
+            # usually fail brew install itself, not silently install with no
+            # symlink. Warn and skip rather than fail the release on an
+            # unverified guess.
+            echo "::warning::Could not test the Homebrew-cask install path: brew install --cask reported success, but '$bin_path' is not an executable. This is NOT evidence the release is broken -- most likely artifact_smoke_test_binary's resolved name ('$BINARY') doesn't match this cask's actual binary. Set artifact_smoke_test_binary explicitly if this persists."
+            exit 0
           fi
 
           run_with_timeout() {

@@ -129,13 +129,17 @@ layers, all under `artifact_smoke_test` (default **on**):
 
 1. **Run the published GitHub release asset.** Downloads the archive for
    each platform in `artifact_smoke_test_platforms` (default: linux/amd64 on
-   `ubuntu-latest`, darwin/arm64 on `macos-latest`), extracts it, and runs
-   `<binary> --version` (configurable via `artifact_smoke_test_command`)
-   under an explicit watchdog (`artifact_smoke_test_timeout_seconds`,
-   default 30s) — a hang is killed and reported as a clear failure, never an
-   eventual multi-hour job timeout. **Always a hard failure.** This proves
-   the artifact is a working binary; it does **not** prove a Homebrew-cask
-   user can run it — a plain download carries no
+   `ubuntu-latest`, darwin/arm64 on `macos-latest`; matched by the
+   `*_<os>_<arch>.{tar.gz,tgz,zip}` archive extension, never a
+   same-named checksum/signature/SBOM sidecar), extracts it, and runs
+   `<binary> --version` (configurable via `artifact_smoke_test_command`, for
+   a CLI whose default invocation doesn't support a bare `--version`) under
+   an explicit watchdog (`artifact_smoke_test_timeout_seconds`, default
+   30s) — a hang is killed and reported as a clear failure, never an
+   eventual multi-hour job timeout. Once the binary is found and executed,
+   this is **always a hard failure** if it hangs, exits non-zero, or prints
+   nothing. This proves the artifact is a working binary; it does **not**
+   prove a Homebrew-cask user can run it — a plain download carries no
    `com.apple.quarantine` attribute, so this layer alone passed for
    v0.24.0.
 2. **Assert macOS code signing / notarization** (`codesign -dv`,
@@ -147,6 +151,30 @@ layers, all under `artifact_smoke_test` (default **on**):
    this repo's own `homebrew_casks:` config, no-op otherwise. The only layer
    that reproduces Homebrew's quarantine attribute, i.e. the only layer that
    actually reproduces the incident end-to-end.
+
+**"Could not test" is never "tested and broken."** This workflow is reused
+by repos not enumerated here, including libraries and Docker-only releases
+with no per-arch archive, so a naming/shape mismatch must never be read as
+"the release is broken." Every layer distinguishes the two explicitly: no
+matching release asset, an unrecognized archive format, no binary found
+inside it, an unresolvable binary name (see the `tag_prefix` note below), or
+a failed `brew tap`/`brew install --cask` (transient Homebrew/network issue,
+tap-visibility timing, a cask-not-found mismatch) all log `::warning::` and
+are **skipped**, unconditionally — never a failure, regardless of
+`require_notarized_macos`. Only "the binary was found and actually executed,
+and it hung / exited non-zero / printed nothing" fails a release: always for
+layer 1, and (once installed) gated by `require_notarized_macos` for layers
+2/3. This split is what makes shipping `artifact_smoke_test: true` by
+default safe as well as meaningful — a default-off check would have
+prevented nothing, but a default-on check that can't tell "untestable" from
+"broken" would have started failing releases it never should have.
+
+Every network step that isn't already bounded by the watchdog above
+(`gh release download`, `brew tap`/`brew install --cask`) has its own
+timeout too (120s / 300s respectively), plus each smoke-test job has a
+`timeout-minutes` well under GitHub's 6-hour default job timeout — the same
+"a hang must fail fast and legibly, never eventually" rationale extended to
+every step that talks to a network, not just the binary invocation itself.
 
 **Layers 2 and 3 currently only warn, by design.** As of this writing,
 *nothing this org publishes is notarized* — Developer ID signing and App
@@ -182,6 +210,19 @@ repos where the executable doesn't match `project_name` or a `-cli`-stripped
 repo name) should set `artifact_smoke_test_binary` explicitly. A repo that
 doesn't publish a runnable CLI binary at all should set
 `artifact_smoke_test: false`.
+
+Binary-name inference reads `.goreleaser.y*ml`/`goreleaser.y*ml` at the repo
+**root**. A repo using `tag_prefix` for a subdirectory module (e.g.
+`"ingitdb/v"`, see "Automatic version tagging" below) whose GoReleaser
+config lives in that subdirectory instead won't be found there — inference
+deliberately does **not** fall back to guessing from the repo name in that
+specific case (a subdirectory module's name isn't the repo's name), so the
+whole smoke test is skipped with a warning instead of testing, or failing
+on, an unverified guess. Set `artifact_smoke_test_binary` explicitly to
+enable it for that shape of repo. (No current consumer of this workflow
+combines a subdirectory `tag_prefix` with this fallback path — checked
+directly against every one at the time this was written — but the workflow
+is reused by repos not enumerated here, so this stays defensive.)
 
 **Known residual gap (confirmed empirically, not assumed):** GitHub-hosted
 macOS runners have no interactive user session, so the real, *indefinite*
