@@ -70,6 +70,34 @@ surface and is not part of this reusable-workflow timing policy. It uses `go
 mod download all` rather than `go get ./...`, so CI never rewrites a consumer's
 dependency requirements.
 
+## Private Go modules from multiple owners
+
+Set `GOPRIVATE` to the private module prefixes and `goprivate_git_hosts` to the
+matching Git URL prefixes that may receive `GH_TOKEN`. The latter accepts
+comma- or newline-separated `host/owner` entries:
+
+```yaml
+jobs:
+  ci:
+    uses: strongo/cicd/.github/workflows/workflow.yml@v1
+    with:
+      GOPRIVATE: github.com/sneat-co,github.com/sneat-games
+      goprivate_git_hosts: |
+        github.com/sneat-co
+        github.com/sneat-games
+    secrets:
+      GH_TOKEN: ${{ secrets.PRIVATE_MODULES_TOKEN }}
+```
+
+Each plural entry must include an owner or narrower repository path. A
+host-wide entry such as `github.com` is rejected, preventing the private-module
+token from being attached to unrelated GitHub fetches. The same inputs are
+available on `release.yml`.
+
+`goprivate_git_host` remains available for existing single-prefix callers. Its
+historical `github.com` default is preserved for backward compatibility, but
+new and migrated callers should use the scoped plural input.
+
 ## Releasing with `release.yml`
 
 `release.yml` runs the GoReleaser flow: checkout (full history) → setup-go →
