@@ -183,14 +183,21 @@ repo name) should set `artifact_smoke_test_binary` explicitly. A repo that
 doesn't publish a runnable CLI binary at all should set
 `artifact_smoke_test: false`.
 
-**Known residual gap:** GitHub-hosted macOS runners have no interactive user
-session, so a real "Apple could not verify…" Gatekeeper dialog never
-renders there — layer 3 detects the block because the process hangs and gets
-killed by the watchdog, not because it sees the dialog. That match is strong
-(the same ad-hoc-signed binary, quarantined, hangs identically whether or
-not a session is attached) but hasn't been independently confirmed against
-this exact workflow on a live GitHub Actions macOS runner as of this
-writing — validate a repo's first real run of layer 3 rather than assuming.
+**Known residual gap (confirmed empirically, not assumed):** GitHub-hosted
+macOS runners have no interactive user session, so the real, *indefinite*
+"Apple could not verify…" Gatekeeper dialog a logged-in user hits has
+nowhere to render. Layer 2 (static `codesign`/`spctl` inspection) is
+unaffected by this — it never executes the binary. But layer 3 (`brew
+install --cask` + run) was tested directly against the actual quarantined,
+ad-hoc-signed specscore-cli v0.24.0 Homebrew-cask binary on a real
+GitHub-hosted `macos-latest` runner, and it did **not** hang: the process
+completed after a ~30s Gatekeeper assessment delay and exited 0 with valid
+output — right at the edge of the default `artifact_smoke_test_timeout_seconds`.
+So **layer 3's pass/fail is not reliable evidence of what a real interactive
+user experiences on this runner type** — a pass there does not mean
+Homebrew-cask users aren't blocked. Layer 2 is the reliable, deterministic
+signal; treat layer 3 as corroborating only. This is exactly why layer 2 is
+positioned as the primary gate.
 
 ## Packaging conventions (apply to every product)
 
@@ -225,8 +232,17 @@ Decided 2026-07-17; applied to `ingitdb-cli` and `specscore-cli`.
 Ship unsigned macOS binaries by default. Wire notarization as a `notarize.macos`
 block whose `enabled` is gated on the signing secret
 (`{{ isEnvSet "MACOS_SIGN_P12" }}`), so with the secret unset it is skipped and
-can never break a release. Enabling it is a deliberate per-repo step: verify the
-Apple credentials, then forward `MACOS_SIGN_*` / `NOTARIZE_*` into this workflow.
+can never break a release. `release.yml` forwards five optional secrets into
+GoReleaser's env for exactly this: `MACOS_SIGN_P12`, `MACOS_SIGN_PASSWORD`
+(Developer ID Application cert + password), and `NOTARIZE_ISSUER_ID`,
+`NOTARIZE_KEY_ID`, `NOTARIZE_KEY` (App Store Connect API key). GoReleaser's
+notarize publisher is pure Go (quill), so it runs on this same ubuntu job —
+no macOS runner needed. Enabling it is a deliberate per-repo step: verify the
+Apple credentials are current, wire the five secrets above into the calling
+workflow's `secrets:` block (see `ingitdb-cli`'s `release.yml` for a worked
+example), then flip that repo's `require_notarized_macos` input (see
+"Post-release artifact smoke test" above) to true once its darwin artifacts
+actually pass `spctl -a -vv`.
 
 ## Keep the pin fresh with Renovate
 

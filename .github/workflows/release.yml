@@ -220,12 +220,17 @@ on:
           macos-latest and execute the INSTALLED binary under
           artifact_smoke_test_timeout_seconds. This is the path a real
           Homebrew user takes, and the only layer that reproduces Homebrew's
-          quarantine attribute on the installed binary — which is what
-          actually blocked specscore-cli v0.24.0 (the raw release asset ran
-          fine standalone in layer 1; the Homebrew-installed copy hung under
-          Gatekeeper). Severity follows require_notarized_macos, same as
-          layer 2. Set false to skip this layer, e.g. to save the ~30-90s it
-          costs while this repo's macOS build isn't notarized yet.
+          quarantine attribute on the installed binary. Severity follows
+          require_notarized_macos, same as layer 2. KNOWN GAP, confirmed by
+          actually running this against the quarantined specscore-cli
+          v0.24.0 Homebrew-cask binary on a GitHub-hosted macos-latest
+          runner: it does NOT reliably reproduce the real, indefinite
+          Gatekeeper dialog a logged-in user hits (a headless runner has no
+          session to render it) — that run completed after a ~30s
+          assessment delay and exited 0. Treat this layer as corroborating;
+          layer 2 is the reliable signal. Set false to skip this layer, e.g.
+          to save the ~30-90s it costs while this repo's macOS build isn't
+          notarized yet.
       require_notarized_macos:
         type: boolean
         required: false
@@ -418,6 +423,18 @@ jobs:
           GORELEASER_GITHUB_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
           WINGET_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          # Optional macOS signing + notarization (GoReleaser's `notarize`
+          # publisher, pure Go via quill — runs fine on this ubuntu job, no
+          # macOS runner needed). Empty when the caller doesn't pass them;
+          # a `.goreleaser.yaml` `notarize.macos[].enabled` block should gate
+          # itself on `{{ isEnvSet "MACOS_SIGN_P12" }}` so it's a no-op
+          # (today's unsigned binaries, unchanged) until this is set. See
+          # "macOS notarization" below.
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          NOTARIZE_ISSUER_ID: ${{ secrets.NOTARIZE_ISSUER_ID }}
+          NOTARIZE_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
+          NOTARIZE_KEY: ${{ secrets.NOTARIZE_KEY }}
 
   # Resolves what layers 1-3 below need to know about THIS repo's own
   # release: the tag that was just published, the binary name (read from the
@@ -710,7 +727,7 @@ jobs:
             exit 0
           fi
 
-          msg="Published macOS artifact is not properly signed/notarized: ${problems}To fix: get an Apple Developer ID Application certificate and App Store Connect API credentials, wire both into this release job as notarization secrets (see this repo's README, 'macOS notarization'), then set require_notarized_macos: true for this repo to enforce it going forward. Until fixed, Homebrew-cask users of this CLI are silently blocked by Gatekeeper the moment they run it — no dialog on a headless runner, just a hang; a real user sees an 'Apple could not verify' dialog instead. This is the exact specscore-cli v0.24.0 incident."
+          msg="Published macOS artifact is not properly signed/notarized: ${problems}To fix: get an Apple Developer ID Application certificate and App Store Connect API credentials, wire both into this release job as notarization secrets (see this repo's README, 'macOS notarization'), then set require_notarized_macos: true for this repo to enforce it going forward. Until fixed, a Homebrew-cask install of this CLI is blocked by Gatekeeper for real interactive users — an indefinite 'Apple could not verify' dialog with no way to proceed except manually approving it in System Settings. This is the exact specscore-cli v0.24.0 incident."
           if [ "$REQUIRE_NOTARIZED" = "true" ]; then
             echo "::error::$msg"
             exit 1
@@ -729,6 +746,16 @@ jobs:
   # macOS-only in this org's convention. Severity follows
   # require_notarized_macos, same as layer 2 (same root cause: no CLI this
   # org publishes is notarized yet).
+  #
+  # KNOWN GAP (confirmed empirically, not assumed — see PR description for
+  # the CI run): a GitHub-hosted macos-latest runner has no interactive
+  # session, so it cannot reproduce the real, INDEFINITE "Apple could not
+  # verify" Gatekeeper dialog a logged-in user hits. Run against the actual
+  # quarantined, ad-hoc-signed specscore-cli v0.24.0 Homebrew-cask binary,
+  # this job did not hang — it completed after a ~30s Gatekeeper assessment
+  # delay and exited 0, right at the edge of the default timeout. Treat this
+  # layer as corroborating; layer 2's static codesign/spctl assertion is the
+  # reliable, deterministic signal on this runner type.
   artifact_smoke_test_homebrew_cask:
     name: 'Smoke test Homebrew cask install (darwin/arm64)'
     needs: [ release, resolve_artifact_smoke_test ]
@@ -816,11 +843,24 @@ jobs:
           fi
 
           if [ -z "$problem" ]; then
-            echo "OK: the Homebrew-cask-installed binary runs and exits 0 with output."
+            # KNOWN GAP, confirmed empirically against the actual
+            # specscore-cli v0.24.0 artifact on a real GitHub-hosted
+            # macos-latest runner: this step passing does NOT prove real
+            # users can run this binary. A GitHub Actions runner has no
+            # interactive session, so the real, indefinite "Apple could not
+            # verify" Gatekeeper dialog a logged-in user hits has nowhere to
+            # render. The confirmed v0.24.0 binary, quarantined by this same
+            # `brew install --cask` step, did not hang here — it completed
+            # after a ~30s Gatekeeper assessment delay and ran successfully,
+            # right at the edge of the default timeout. Layer 2 (the
+            # codesign/spctl assertion above) is the reliable signal on this
+            # runner type; treat this layer as corroborating, not
+            # authoritative.
+            echo "OK: the Homebrew-cask-installed binary ran and exited 0 with output. NOTE: a headless GitHub Actions runner has no session to render Gatekeeper's dialog, so this does not prove an interactive user isn't blocked -- rely on the layer 2 signing assertion above for that guarantee."
             exit 0
           fi
 
-          msg="Homebrew-cask-installed binary $problem This is the exact specscore-cli v0.24.0 failure mode: the raw release asset runs fine (layer 1 passed), but the copy 'brew install --cask' puts on disk is quarantined, and Gatekeeper silently blocks an ad-hoc-signed, unnotarized binary the moment it is quarantined — a real user sees an 'Apple could not verify' dialog; a headless runner just hangs with no dialog to show. See the layer 2 signing diagnostics above for exactly what's missing. Fix: notarize this CLI's macOS build (Developer ID cert + App Store Connect API credentials), then set require_notarized_macos: true to enforce this going forward."
+          msg="Homebrew-cask-installed binary $problem This is the exact specscore-cli v0.24.0 failure mode: the raw release asset runs fine (layer 1 passed), but the copy 'brew install --cask' puts on disk is quarantined, and Gatekeeper blocks an ad-hoc-signed, unnotarized binary the moment it is quarantined — a real user sees an indefinite 'Apple could not verify' dialog. See the layer 2 signing diagnostics above for exactly what's missing. Fix: notarize this CLI's macOS build (Developer ID cert + App Store Connect API credentials), then set require_notarized_macos: true to enforce this going forward."
           if [ "$REQUIRE_NOTARIZED" = "true" ]; then
             echo "::error::$msg"
             exit 1
