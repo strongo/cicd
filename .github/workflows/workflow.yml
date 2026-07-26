@@ -51,9 +51,14 @@ on:
         default: ''
       goprivate_git_host:
         type: string
-        description: 'URL prefix (host or host/org) authenticated with GH_TOKEN when fetching private Go modules. Defaults to github.com (host-wide); set to e.g. github.com/my-org to scope narrower.'
+        description: 'Legacy single URL prefix authenticated with GH_TOKEN. Ignored when goprivate_git_hosts is set. Defaults to github.com for backward compatibility.'
         required: false
         default: 'github.com'
+      goprivate_git_hosts:
+        type: string
+        description: 'Comma- or newline-separated host/owner URL prefixes authenticated with GH_TOKEN, e.g. github.com/my-org,github.com/another-org. Each entry must include an owner; host-wide entries are rejected.'
+        required: false
+        default: ''
       additional_go_test_path:
         type: string
         required: false
@@ -166,7 +171,33 @@ jobs:
 
       - name: Set GitHub access token for GOPRIVATE
         if: ${{ inputs.GOPRIVATE }}
-        run: git config --global url."https://${{ secrets.GH_TOKEN }}:x-oauth-basic@${{ inputs.goprivate_git_host }}/".insteadOf "https://${{ inputs.goprivate_git_host }}/"
+        shell: bash
+        env:
+          PRIVATE_GIT_TOKEN: ${{ secrets.GH_TOKEN }}
+          PRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
+          PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PRIVATE_GIT_TOKEN" ]; then
+            echo "::error title=Missing private-module token::GH_TOKEN is required when GOPRIVATE is set."
+            exit 1
+          fi
+          prefixes="${PRIVATE_GIT_HOSTS:-$PRIVATE_GIT_HOST}"
+          configured=0
+          while IFS= read -r raw_prefix; do
+            prefix="$(printf '%s' "$raw_prefix" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
+            [ -z "$prefix" ] && continue
+            if [ -n "$PRIVATE_GIT_HOSTS" ] && ! [[ "$prefix" =~ ^[A-Za-z0-9.-]+/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
+              echo "::error title=Invalid goprivate_git_hosts entry::'$prefix' must be a host/owner URL prefix such as github.com/my-org; host-wide credential rewrites are not allowed."
+              exit 1
+            fi
+            git config --global "url.https://${PRIVATE_GIT_TOKEN}:x-oauth-basic@${prefix}/.insteadOf" "https://${prefix}/"
+            configured=$((configured + 1))
+          done < <(printf '%s\n' "$prefixes" | tr ',' '\n')
+          if [ "$configured" -eq 0 ]; then
+            echo "::error title=Missing GOPRIVATE Git prefix::Set goprivate_git_hosts or goprivate_git_host when GOPRIVATE is set."
+            exit 1
+          fi
 
       - name: Download dependencies
         run: go mod download all
@@ -235,7 +266,33 @@ jobs:
 
       - name: Set GitHub access token for GOPRIVATE
         if: ${{ inputs.GOPRIVATE }}
-        run: git config --global url."https://${{ secrets.GH_TOKEN }}:x-oauth-basic@${{ inputs.goprivate_git_host }}/".insteadOf "https://${{ inputs.goprivate_git_host }}/"
+        shell: bash
+        env:
+          PRIVATE_GIT_TOKEN: ${{ secrets.GH_TOKEN }}
+          PRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
+          PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PRIVATE_GIT_TOKEN" ]; then
+            echo "::error title=Missing private-module token::GH_TOKEN is required when GOPRIVATE is set."
+            exit 1
+          fi
+          prefixes="${PRIVATE_GIT_HOSTS:-$PRIVATE_GIT_HOST}"
+          configured=0
+          while IFS= read -r raw_prefix; do
+            prefix="$(printf '%s' "$raw_prefix" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
+            [ -z "$prefix" ] && continue
+            if [ -n "$PRIVATE_GIT_HOSTS" ] && ! [[ "$prefix" =~ ^[A-Za-z0-9.-]+/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
+              echo "::error title=Invalid goprivate_git_hosts entry::'$prefix' must be a host/owner URL prefix such as github.com/my-org; host-wide credential rewrites are not allowed."
+              exit 1
+            fi
+            git config --global "url.https://${PRIVATE_GIT_TOKEN}:x-oauth-basic@${prefix}/.insteadOf" "https://${prefix}/"
+            configured=$((configured + 1))
+          done < <(printf '%s\n' "$prefixes" | tr ',' '\n')
+          if [ "$configured" -eq 0 ]; then
+            echo "::error title=Missing GOPRIVATE Git prefix::Set goprivate_git_hosts or goprivate_git_host when GOPRIVATE is set."
+            exit 1
+          fi
 
       - name: Download dependencies
         run: go mod download all

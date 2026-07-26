@@ -188,6 +188,14 @@ jobs:
     permissions:
       contents: write
     uses: ./.github/workflows/workflow.yml
+    with:
+      # Exercise the scoped multi-owner path in both reusable-workflow jobs.
+      # This repository has no dependencies, so the values only validate
+      # configuration and cannot grant access to unrelated repositories.
+      GOPRIVATE: github.com/strongo,github.com/bots-go-framework
+      goprivate_git_hosts: |
+        github.com/strongo
+        github.com/bots-go-framework
 
     secrets:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
