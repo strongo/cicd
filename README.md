@@ -114,6 +114,84 @@ macOS signing (`xcrun`/`codesign`) — cannot run here. Keep them as a small
 per-repo job (`needs:` this one) and add `--skip=chocolatey,snapcraft` via
 `goreleaser_extra_args` so this job doesn't try to run them.
 
+## Post-release artifact smoke test
+
+**The incident this exists for (2026-07):** `specscore-cli` v0.24.0 released
+clean — every CI check green — but the Homebrew-cask-installed binary was
+silently blocked by macOS Gatekeeper on every invocation for every user. CI
+had tested the source, built it, and even uploaded the release artifact; it
+had never *run* the thing it published. A local `curl` + run of the exact
+same release asset worked instantly, which is what made this so easy to
+ship: the bug lived entirely in the install path, not the binary.
+
+`release.yml` now downloads and exercises what it just published, in three
+layers, all under `artifact_smoke_test` (default **on**):
+
+1. **Run the published GitHub release asset.** Downloads the archive for
+   each platform in `artifact_smoke_test_platforms` (default: linux/amd64 on
+   `ubuntu-latest`, darwin/arm64 on `macos-latest`), extracts it, and runs
+   `<binary> --version` (configurable via `artifact_smoke_test_command`)
+   under an explicit watchdog (`artifact_smoke_test_timeout_seconds`,
+   default 30s) — a hang is killed and reported as a clear failure, never an
+   eventual multi-hour job timeout. **Always a hard failure.** This proves
+   the artifact is a working binary; it does **not** prove a Homebrew-cask
+   user can run it — a plain download carries no
+   `com.apple.quarantine` attribute, so this layer alone passed for
+   v0.24.0.
+2. **Assert macOS code signing / notarization** (`codesign -dv`,
+   `spctl -a -vv`) against the same darwin binary — static inspection, no
+   execution, no Gatekeeper risk in the check itself. This is what actually
+   would have caught v0.24.0: an ad-hoc signature with no Developer ID.
+3. **`brew install --cask` and run the installed binary**
+   (`artifact_smoke_test_homebrew_cask`, default on) — auto-detected from
+   this repo's own `homebrew_casks:` config, no-op otherwise. The only layer
+   that reproduces Homebrew's quarantine attribute, i.e. the only layer that
+   actually reproduces the incident end-to-end.
+
+**Layers 2 and 3 currently only warn, by design.** As of this writing,
+*nothing this org publishes is notarized* — Developer ID signing and App
+Store Connect notarization aren't wired into the shared pipeline yet. A
+default hard-fail here would red every CLI's release on day one and just get
+disabled fleet-wide instead of fixed. They log a `::warning::` naming
+exactly what's missing (e.g. ad-hoc signature, `TeamIdentifier: not set`,
+`spctl` rejection) on every release so the gap stays visible. Set
+`require_notarized_macos: true` per repo the moment its macOS build is
+genuinely signed + notarized, to make that guarantee binding. This is the
+intended end state, not an optional extra.
+
+```yaml
+jobs:
+  release:
+    uses: strongo/cicd/.github/workflows/release.yml@v1
+    with:
+      # All of the below are optional; shown at their defaults.
+      # artifact_smoke_test: true
+      # artifact_smoke_test_binary: ''                 # '' infers from .goreleaser.y*ml / repo name
+      # artifact_smoke_test_command: '--version'
+      # artifact_smoke_test_timeout_seconds: 30
+      # artifact_smoke_test_homebrew_cask: true
+      # require_notarized_macos: false                 # flip once this repo is actually notarized
+    secrets: { ... }
+```
+
+Existing `@v1` callers get layer 1 automatically (hard-fail) and layers 2/3
+automatically (warn-only) the next time the maintainer advances the `v1`
+tag — no config changes required. A repo whose binary name the inference
+guesses wrong (multi-binary repos only check the first `builds[]` entry;
+repos where the executable doesn't match `project_name` or a `-cli`-stripped
+repo name) should set `artifact_smoke_test_binary` explicitly. A repo that
+doesn't publish a runnable CLI binary at all should set
+`artifact_smoke_test: false`.
+
+**Known residual gap:** GitHub-hosted macOS runners have no interactive user
+session, so a real "Apple could not verify…" Gatekeeper dialog never
+renders there — layer 3 detects the block because the process hangs and gets
+killed by the watchdog, not because it sees the dialog. That match is strong
+(the same ad-hoc-signed binary, quarantined, hangs identically whether or
+not a session is attached) but hasn't been independently confirmed against
+this exact workflow on a live GitHub Actions macOS runner as of this
+writing — validate a repo's first real run of layer 3 rather than assuming.
+
 ## Packaging conventions (apply to every product)
 
 These are ecosystem-wide `.goreleaser.yaml` standards so all our CLIs package

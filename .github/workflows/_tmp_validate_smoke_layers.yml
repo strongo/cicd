@@ -43,6 +43,7 @@ jobs:
         working-directory: ${{ runner.temp }}/smoke
         run: |
           set -uo pipefail
+          set +e
           run_with_timeout() {
             local seconds="$1"; shift
             "$@" &
@@ -79,6 +80,7 @@ jobs:
         working-directory: ${{ runner.temp }}/smoke
         run: |
           set -uo pipefail
+          set +e
           echo "=== codesign -dv --verbose=4 ==="
           codesign_out="$(codesign -dv --verbose=4 ./specscore 2>&1)"
           printf '%s\n' "$codesign_out"
@@ -105,6 +107,7 @@ jobs:
       - name: 'Layer 3 check: run the Homebrew-installed binary under timeout'
         run: |
           set -uo pipefail
+          set +e
           bin_path="$(brew --prefix)/bin/specscore"
           ls -la "$bin_path" || true
           xattr -l "$bin_path" || true

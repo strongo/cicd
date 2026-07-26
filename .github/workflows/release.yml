@@ -34,6 +34,41 @@ on:
           $AUR_SSH_PRIVATE_KEY. GoReleaser's `aurs` publisher accepts the key
           contents directly (`private_key: {{ .Env.AUR_SSH_PRIVATE_KEY }}`); the
           key must not be password-protected.
+      MACOS_SIGN_P12:
+        required: false
+        description: >-
+          Optional base64-encoded Apple Developer ID Application certificate
+          (.p12), forwarded to GoReleaser as $MACOS_SIGN_P12. Pairs with
+          MACOS_SIGN_PASSWORD. Referenced by a `notarize.macos[].sign` block
+          as `{{ .Env.MACOS_SIGN_P12 }}`, typically gated
+          `enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'` so the block is a
+          no-op (unsigned binaries, same as today) until this secret is set.
+          GoReleaser's notarize step is pure Go (quill) and runs on this same
+          ubuntu job — no macOS runner needed. Omit for repos not yet signing
+          macOS builds.
+      MACOS_SIGN_PASSWORD:
+        required: false
+        description: >-
+          Password for the MACOS_SIGN_P12 certificate, forwarded to
+          GoReleaser as $MACOS_SIGN_PASSWORD. Required alongside
+          MACOS_SIGN_P12 once that's set; otherwise unused.
+      NOTARIZE_ISSUER_ID:
+        required: false
+        description: >-
+          App Store Connect API issuer ID, forwarded to GoReleaser as
+          $NOTARIZE_ISSUER_ID for the `notarize.macos[].notarize` block.
+          Required alongside NOTARIZE_KEY_ID / NOTARIZE_KEY once
+          MACOS_SIGN_P12 is set; otherwise unused.
+      NOTARIZE_KEY_ID:
+        required: false
+        description: >-
+          App Store Connect API key ID, forwarded to GoReleaser as
+          $NOTARIZE_KEY_ID. See NOTARIZE_ISSUER_ID.
+      NOTARIZE_KEY:
+        required: false
+        description: >-
+          App Store Connect API private key (.p8 contents), forwarded to
+          GoReleaser as $NOTARIZE_KEY. See NOTARIZE_ISSUER_ID.
     inputs:
       GOPRIVATE:
         type: string
@@ -97,6 +132,119 @@ on:
           major_string_token sentinel. Pre-1.0, a breaking change is a minor
           bump; this preserves that. Set true only to intend a real major
           release (or push an explicit vX.0.0 tag, which bypasses the bump).
+      artifact_smoke_test:
+        type: boolean
+        required: false
+        default: true
+        description: >-
+          After GoReleaser publishes, verify the PUBLISHED artifacts actually
+          run for a user — never a fresh local build, which would reproduce
+          the exact blind spot that let a broken release ship (CI only ever
+          tested source; nobody executed what got uploaded). Three layers,
+          all gated by this one switch: (1) download the release asset per
+          platform in artifact_smoke_test_platforms and run it under a
+          timeout — always a hard failure, since a binary that won't even run
+          standalone is unambiguously broken; (2) on macOS, statically assert
+          the artifact is signed with a real Developer ID and notarized; (3)
+          when this repo publishes a Homebrew cask
+          (artifact_smoke_test_homebrew_cask), `brew install --cask` it and
+          run the INSTALLED binary — the path a real user actually takes.
+          Layers 2 and 3 exist because layer 1 alone is insufficient:
+          specscore-cli v0.24.0 shipped a Homebrew cask that macOS Gatekeeper
+          silently blocked for every user (ad-hoc signature, no
+          notarization) even though the raw downloaded binary ran fine
+          standalone — a curl-and-run test alone would have passed this
+          exact incident. See require_notarized_macos for layer 2/3
+          severity. Defaults to true deliberately — a default-off check
+          would have caught nothing. Set false to opt out entirely for a
+          repo that doesn't publish a runnable CLI binary.
+      artifact_smoke_test_binary:
+        type: string
+        required: false
+        default: ''
+        description: >-
+          Name of the published executable to smoke test. Empty (default)
+          infers it, in order: (1) the first `builds[].binary` (falling back
+          to `project_name`) read from the repo's own
+          .goreleaser.{yaml,yml}/goreleaser.{yaml,yml} at the released tag;
+          (2) if that file can't be read, the repo name with a trailing
+          "-cli" stripped (specscore-cli -> specscore), or the org name for a
+          repo literally named "cli" (chatwright/cli -> chatwright). Set this
+          explicitly for a multi-binary repo (inference only checks the first
+          build) or whenever the guess is wrong.
+      artifact_smoke_test_command:
+        type: string
+        required: false
+        default: '--version'
+        description: >-
+          Arguments passed to the published binary for the smoke test
+          (layers 1 and 3), e.g. '--version'. The run must exit 0 and print
+          non-empty output.
+      artifact_smoke_test_timeout_seconds:
+        type: number
+        required: false
+        default: 30
+        description: >-
+          Seconds to wait for the binary to exit (layers 1 and 3) before
+          killing it and failing/warning. Wrapped in an explicit watchdog
+          (not the runner/job timeout) so a hang is reported as a clear
+          smoke-test failure within this many seconds, never an eventual
+          multi-hour job timeout — this is precisely the specscore-cli
+          v0.24.0 failure mode as experienced by a user: Gatekeeper holding
+          the process pending a code-signing assessment with no dialog to
+          show on a headless runner (or, for the user, an assessment that
+          silently never resolves).
+      artifact_smoke_test_platforms:
+        type: string
+        required: false
+        default: >-
+          [{"runner":"ubuntu-latest","goos":"linux","goarch":"amd64"},{"runner":"macos-latest","goos":"darwin","goarch":"arm64"}]
+        description: >-
+          JSON array of {runner, goos, goarch} objects, one per platform
+          layer 1 (and, on darwin, layer 2) smoke tests; consumed as a job
+          matrix (`fromJson`). Defaults to linux/amd64 (ubuntu-latest) and
+          darwin/arm64 (macos-latest, an Apple Silicon GitHub-hosted runner —
+          the platform the specscore-cli v0.24.0 incident actually shipped
+          on). For each platform, the release asset is matched by the
+          GoReleaser-standard `*_<goos>_<goarch>.*` filename suffix. Override
+          to add/remove platforms (e.g. windows) or trim to what this repo
+          actually publishes.
+      artifact_smoke_test_homebrew_cask:
+        type: boolean
+        required: false
+        default: true
+        description: >-
+          Layer 3: when this repo's GoReleaser config publishes a
+          `homebrew_casks:` entry (auto-detected from the same config layer
+          1/2 read — no-ops otherwise), `brew install --cask` it on
+          macos-latest and execute the INSTALLED binary under
+          artifact_smoke_test_timeout_seconds. This is the path a real
+          Homebrew user takes, and the only layer that reproduces Homebrew's
+          quarantine attribute on the installed binary — which is what
+          actually blocked specscore-cli v0.24.0 (the raw release asset ran
+          fine standalone in layer 1; the Homebrew-installed copy hung under
+          Gatekeeper). Severity follows require_notarized_macos, same as
+          layer 2. Set false to skip this layer, e.g. to save the ~30-90s it
+          costs while this repo's macOS build isn't notarized yet.
+      require_notarized_macos:
+        type: boolean
+        required: false
+        default: false
+        description: >-
+          Whether layers 2 and 3 (macOS code-signing/notarization) HARD FAIL
+          the release. Default false: they still run every time and log a
+          `::warning::` naming exactly what's missing (e.g. ad-hoc
+          signature, `TeamIdentifier: not set`, spctl rejection) and what to
+          do about it, but never block. This is a transitional default, NOT
+          the intended end state — it's false only because, as of this
+          input landing, nothing this org publishes is notarized yet, so a
+          default hard-fail would red every release fleet-wide on day one
+          and just get disabled by everyone instead of fixed. Flip to true
+          per repo the moment its macOS build is actually signed with a
+          Developer ID and notarized (needs a Developer ID Application
+          certificate plus App Store Connect API credentials wired into the
+          release job — see the "macOS notarization" section of this repo's
+          README), to make that guarantee binding going forward.
     outputs:
       tag:
         description: >-
@@ -270,3 +418,413 @@ jobs:
           GORELEASER_GITHUB_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
           WINGET_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+  # Resolves what layers 1-3 below need to know about THIS repo's own
+  # release: the tag that was just published, the binary name (read from the
+  # repo's own GoReleaser config, not guessed blind), and whether it
+  # publishes a Homebrew cask (for layer 3). Runs once on ubuntu-latest —
+  # where `yq` is guaranteed present — so the per-platform jobs below don't
+  # each repeat this checkout/parse.
+  resolve_artifact_smoke_test:
+    name: Resolve artifact smoke test target
+    needs: release
+    if: ${{ inputs.artifact_smoke_test && !failure() && !cancelled() && (needs.release.outputs.tag != '' || github.ref_type == 'tag') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      binary: ${{ steps.resolve.outputs.binary }}
+      has_homebrew_cask: ${{ steps.resolve.outputs.has_homebrew_cask }}
+      homebrew_tap: ${{ steps.resolve.outputs.homebrew_tap }}
+      homebrew_cask_name: ${{ steps.resolve.outputs.homebrew_cask_name }}
+
+    steps:
+      - name: Determine the tag this run published
+        id: release_tag
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          [ -z "$tag" ] && tag="${GITHUB_REF_NAME}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Sparse, ref-pinned checkout: we only need the GoReleaser config as it
+      # existed at the exact tag that was released, not the whole repo.
+      - name: Checkout GoReleaser config at the released tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release_tag.outputs.tag }}
+          sparse-checkout: |
+            .goreleaser.yaml
+            .goreleaser.yml
+            goreleaser.yaml
+            goreleaser.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve binary name and Homebrew cask target
+        id: resolve
+        env:
+          BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}
+          TAG: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          config_file=""
+          for f in .goreleaser.yaml .goreleaser.yml goreleaser.yaml goreleaser.yml; do
+            if [ -f "$f" ]; then config_file="$f"; break; fi
+          done
+
+          binary="$BINARY_OVERRIDE"
+          has_cask="false"
+          tap=""
+          cask_name=""
+
+          if [ -n "$config_file" ] && command -v yq >/dev/null 2>&1; then
+            if [ -z "$binary" ]; then
+              binary="$(yq -r '.builds[0].binary // ""' "$config_file")"
+              [ "$binary" = "null" ] && binary=""
+              if [ -z "$binary" ]; then
+                binary="$(yq -r '.project_name // ""' "$config_file")"
+                [ "$binary" = "null" ] && binary=""
+              fi
+            fi
+            cask_count="$(yq -r '.homebrew_casks // [] | length' "$config_file")"
+            if [ -n "$cask_count" ] && [ "$cask_count" -gt 0 ]; then
+              cask_name="$(yq -r '.homebrew_casks[0].name // ""' "$config_file")"
+              tap_owner="$(yq -r '.homebrew_casks[0].repository.owner // ""' "$config_file")"
+              tap_repo="$(yq -r '.homebrew_casks[0].repository.name // ""' "$config_file")"
+              [ "$cask_name" = "null" ] && cask_name=""
+              [ "$tap_owner" = "null" ] && tap_owner=""
+              [ "$tap_repo" = "null" ] && tap_repo=""
+              if [ -n "$tap_owner" ] && [ -n "$tap_repo" ] && [ -n "$cask_name" ]; then
+                has_cask="true"
+                tap="${tap_owner}/${tap_repo}"
+              fi
+            fi
+          fi
+
+          # Fallback inference when the config can't be read (or has no
+          # explicit binary/project_name): repo name with a trailing "-cli"
+          # stripped (specscore-cli -> specscore), or the org name for a repo
+          # literally named "cli" (chatwright/cli -> chatwright). Homebrew
+          # cask detection has no such fallback — it's config-only, since
+          # there's nothing sensible to guess.
+          if [ -z "$binary" ]; then
+            repo_name="${GITHUB_REPOSITORY#*/}"
+            org_name="${GITHUB_REPOSITORY%%/*}"
+            if [ "$repo_name" = "cli" ]; then
+              binary="$org_name"
+            else
+              binary="${repo_name%-cli}"
+            fi
+          fi
+
+          echo "Resolved: tag=$TAG binary=$binary has_homebrew_cask=$has_cask homebrew_tap=$tap homebrew_cask_name=$cask_name"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+          echo "has_homebrew_cask=$has_cask" >> "$GITHUB_OUTPUT"
+          echo "homebrew_tap=$tap" >> "$GITHUB_OUTPUT"
+          echo "homebrew_cask_name=$cask_name" >> "$GITHUB_OUTPUT"
+
+  # LAYERS 1 (always hard-fail) and 2 (macOS only; severity gated by
+  # require_notarized_macos). Downloads the PUBLISHED release asset per
+  # platform in artifact_smoke_test_platforms — never rebuilds from source,
+  # which would reproduce the exact blind spot that let specscore-cli
+  # v0.24.0 ship broken while CI stayed green (CI only ever tested source,
+  # never what got uploaded).
+  artifact_smoke_test:
+    name: 'Smoke test published artifact (${{ matrix.goos }}/${{ matrix.goarch }})'
+    needs: [ release, resolve_artifact_smoke_test ]
+    if: ${{ needs.resolve_artifact_smoke_test.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(inputs.artifact_smoke_test_platforms) }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.resolve_artifact_smoke_test.outputs.tag }}
+      BINARY: ${{ needs.resolve_artifact_smoke_test.outputs.binary }}
+      SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
+      TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
+      REQUIRE_NOTARIZED: ${{ inputs.require_notarized_macos }}
+
+    steps:
+      - name: Download published release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/artifact-smoke"
+          pattern="*_${{ matrix.goos }}_${{ matrix.goarch }}.*"
+          echo "Downloading a release asset matching '$pattern' from $GITHUB_REPOSITORY@$TAG"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$pattern" --dir "${RUNNER_TEMP}/artifact-smoke" --clobber
+          ls -la "${RUNNER_TEMP}/artifact-smoke"
+
+      - name: Extract published archive
+        id: extract
+        shell: bash
+        working-directory: ${{ runner.temp }}/artifact-smoke
+        run: |
+          set -euo pipefail
+          archive="$(find . -maxdepth 1 -type f ! -name '*.txt' | head -n1)"
+          if [ -z "$archive" ]; then
+            echo "::error::No release asset matched '*_${{ matrix.goos }}_${{ matrix.goarch }}.*' for tag $TAG. Nothing to smoke test for this platform — either this release doesn't publish ${{ matrix.goos }}/${{ matrix.goarch }}, or its archive naming differs from GoReleaser's default '<name>_<version>_<os>_<arch>' convention. Adjust artifact_smoke_test_platforms, or set artifact_smoke_test: false if this repo doesn't publish a runnable CLI binary."
+            exit 1
+          fi
+          echo "Testing artifact: $archive"
+          case "$archive" in
+            *.zip) unzip -o -q "$archive" ;;
+            *.tar.gz|*.tgz) tar xzf "$archive" ;;
+            *) echo "::error::Don't know how to extract '$archive' (unsupported archive format)."; exit 1 ;;
+          esac
+
+          bin_path=""
+          if [ -f "$BINARY" ]; then
+            bin_path="$BINARY"
+          else
+            bin_path="$(find . -maxdepth 3 -type f -name "$BINARY" | head -n1)"
+          fi
+          if [ -z "$bin_path" ] || [ ! -f "$bin_path" ]; then
+            echo "::error::Extracted '$archive' but found no '$BINARY' executable inside it. Set artifact_smoke_test_binary to the correct name (this repo may build more than one binary, or use a build id/binary name that differs from project_name)."
+            exit 1
+          fi
+          chmod +x "$bin_path"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "bin_path=$bin_path" >> "$GITHUB_OUTPUT"
+
+      # LAYER 1 — download-and-run of the raw release asset. Always a hard
+      # failure (it passes today; a binary that won't even run standalone is
+      # unambiguously broken) regardless of require_notarized_macos. Proves
+      # the artifact itself is a working binary. It does NOT prove a
+      # Homebrew-cask user can run it — that's layer 3 below. Runs first:
+      # it's cheap, platform-agnostic, and unconditional, so a genuinely
+      # broken binary fails fast before the macOS-only layer 2 check below.
+      - name: 'Layer 1: run the published binary (must exit within timeout)'
+        shell: bash
+        working-directory: ${{ runner.temp }}/artifact-smoke
+        env:
+          BIN_PATH: ${{ steps.extract.outputs.bin_path }}
+        run: |
+          # GitHub Actions runs `shell: bash` steps as `bash -e {0}` by
+          # default regardless of what this script sets — `set -uo pipefail`
+          # alone does NOT turn errexit off. Without an explicit `set +e`
+          # here, `output="$(run_with_timeout ...)"` would abort the whole
+          # step the instant the wrapped command returns non-zero, before
+          # any of the diagnostics below ever run. (Caught by actually
+          # running this on a GitHub-hosted runner against a failing
+          # command — see PR description.)
+          set -uo pipefail
+          set +e
+
+          run_with_timeout() {
+            local seconds="$1"; shift
+            "$@" &
+            local cmd_pid=$!
+            (
+              sleep "$seconds"
+              if kill -0 "$cmd_pid" 2>/dev/null; then
+                touch .smoke_timed_out
+                kill -TERM "$cmd_pid" 2>/dev/null
+                sleep 2
+                kill -KILL "$cmd_pid" 2>/dev/null
+              fi
+            ) &
+            local watchdog_pid=$!
+            wait "$cmd_pid" 2>/dev/null
+            local exit_code=$?
+            kill "$watchdog_pid" 2>/dev/null
+            wait "$watchdog_pid" 2>/dev/null
+            return "$exit_code"
+          }
+
+          rm -f .smoke_timed_out
+          echo "Running: $BIN_PATH $SMOKE_CMD   (must exit within ${TIMEOUT_SECONDS}s)"
+          output="$(run_with_timeout "$TIMEOUT_SECONDS" "$BIN_PATH" $SMOKE_CMD 2>&1)"
+          status=$?
+
+          echo "----- output -----"
+          printf '%s\n' "$output"
+          echo "-------------------"
+
+          if [ -f .smoke_timed_out ]; then
+            echo "::error::Published artifact for ${{ matrix.goos }}/${{ matrix.goarch }} HUNG: '$BIN_PATH $SMOKE_CMD' did not exit within ${TIMEOUT_SECONDS}s and was killed. A published binary that hangs on every invocation is unambiguously broken — this is a hard failure regardless of require_notarized_macos."
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Published artifact for ${{ matrix.goos }}/${{ matrix.goarch }} exited $status running '$BIN_PATH $SMOKE_CMD'."
+            exit 1
+          fi
+          if [ -z "$(printf '%s' "$output" | tr -d '[:space:]')" ]; then
+            echo "::error::Published artifact for ${{ matrix.goos }}/${{ matrix.goarch }} exited 0 but printed no output running '$BIN_PATH $SMOKE_CMD'."
+            exit 1
+          fi
+          echo "OK: published ${{ matrix.goos }}/${{ matrix.goarch }} artifact runs standalone and exits 0 with output. (This does not prove a Homebrew-cask install of it works for a user — see layer 2/3.)"
+
+      # LAYER 2 — macOS only. Static inspection; never executes the binary,
+      # so this check itself carries no quarantine/Gatekeeper risk. This is
+      # what actually would have caught specscore-cli v0.24.0: layer 1 above
+      # PASSES for that release, because a plain download carries no
+      # com.apple.quarantine attribute — only the Homebrew-cask install path
+      # applies one (layer 3). An ad-hoc-signed, unnotarized binary runs
+      # fine until quarantined; the moment it is, Gatekeeper blocks it
+      # outright. Verified directly against the published v0.24.0 darwin
+      # binary: `codesign -dv` showed Identifier=a.out, TeamIdentifier=not
+      # set (ad-hoc signature only); `spctl -a -vv` returned "rejected".
+      - name: 'Layer 2: assert macOS code signing / notarization'
+        if: ${{ matrix.goos == 'darwin' }}
+        shell: bash
+        working-directory: ${{ runner.temp }}/artifact-smoke
+        env:
+          BIN_PATH: ${{ steps.extract.outputs.bin_path }}
+        run: |
+          # See the "Layer 1" step above: GitHub Actions' default bash
+          # invocation is `bash -e {0}`, so `set +e` is required here too or
+          # `spctl_out="$(spctl ...)"` aborts the step the instant spctl
+          # rejects the binary — before the warn-vs-fail branch below ever
+          # runs.
+          set -uo pipefail
+          set +e
+          echo "=== codesign -dv --verbose=4 ==="
+          codesign_out="$(codesign -dv --verbose=4 "$BIN_PATH" 2>&1)"
+          printf '%s\n' "$codesign_out"
+          echo
+          echo "=== spctl -a -vv ==="
+          spctl_out="$(spctl -a -vv "$BIN_PATH" 2>&1)"
+          spctl_status=$?
+          printf '%s\n' "$spctl_out"
+
+          team_id="$(printf '%s\n' "$codesign_out" | grep '^TeamIdentifier=' | cut -d'=' -f2-)"
+          problems=""
+          if [ -z "$team_id" ] || [ "$team_id" = "not set" ]; then
+            problems="${problems}no Developer ID (TeamIdentifier: ${team_id:-not set}); "
+          fi
+          if [ "$spctl_status" -ne 0 ]; then
+            problems="${problems}spctl rejected this binary (exit $spctl_status) — Gatekeeper will block it once quarantined; "
+          fi
+
+          if [ -z "$problems" ]; then
+            echo "OK: ${{ matrix.goos }}/${{ matrix.goarch }} artifact is signed with a real Developer ID and passes spctl assessment."
+            exit 0
+          fi
+
+          msg="Published macOS artifact is not properly signed/notarized: ${problems}To fix: get an Apple Developer ID Application certificate and App Store Connect API credentials, wire both into this release job as notarization secrets (see this repo's README, 'macOS notarization'), then set require_notarized_macos: true for this repo to enforce it going forward. Until fixed, Homebrew-cask users of this CLI are silently blocked by Gatekeeper the moment they run it — no dialog on a headless runner, just a hang; a real user sees an 'Apple could not verify' dialog instead. This is the exact specscore-cli v0.24.0 incident."
+          if [ "$REQUIRE_NOTARIZED" = "true" ]; then
+            echo "::error::$msg"
+            exit 1
+          else
+            echo "::warning::$msg"
+            exit 0
+          fi
+
+  # LAYER 3 — the path a real Homebrew user actually takes. Auto-detected
+  # from this repo's own GoReleaser config via resolve_artifact_smoke_test;
+  # no-ops for a repo that doesn't publish a Homebrew cask. `brew install
+  # --cask` is the only layer that reproduces Homebrew's quarantine
+  # attribute on the installed binary, which is what actually blocked
+  # specscore-cli v0.24.0 — the raw release asset (layer 1) ran fine
+  # standalone. Runs on macos-latest (Apple Silicon); Homebrew casks are
+  # macOS-only in this org's convention. Severity follows
+  # require_notarized_macos, same as layer 2 (same root cause: no CLI this
+  # org publishes is notarized yet).
+  artifact_smoke_test_homebrew_cask:
+    name: 'Smoke test Homebrew cask install (darwin/arm64)'
+    needs: [ release, resolve_artifact_smoke_test ]
+    if: >-
+      ${{ needs.resolve_artifact_smoke_test.result == 'success' &&
+          inputs.artifact_smoke_test_homebrew_cask &&
+          needs.resolve_artifact_smoke_test.outputs.has_homebrew_cask == 'true' }}
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      BINARY: ${{ needs.resolve_artifact_smoke_test.outputs.binary }}
+      HOMEBREW_TAP: ${{ needs.resolve_artifact_smoke_test.outputs.homebrew_tap }}
+      CASK_NAME: ${{ needs.resolve_artifact_smoke_test.outputs.homebrew_cask_name }}
+      SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
+      TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
+      REQUIRE_NOTARIZED: ${{ inputs.require_notarized_macos }}
+
+    steps:
+      - name: brew install --cask (the real user path)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Tapping $HOMEBREW_TAP and installing --cask $HOMEBREW_TAP/$CASK_NAME"
+          brew tap "$HOMEBREW_TAP"
+          brew install --cask "$HOMEBREW_TAP/$CASK_NAME"
+
+      # Runs the binary Homebrew actually put on disk — quarantine
+      # attribute and all. Uses the same portable timeout wrapper as layer
+      # 1 (no reliance on GNU `timeout`/`gtimeout`, neither of which ships
+      # on the stock macOS runner image).
+      - name: 'Layer 3: run the Homebrew-installed binary (must exit within timeout)'
+        shell: bash
+        run: |
+          # See "Layer 1" above: GitHub Actions' default bash invocation is
+          # `bash -e {0}`, so `set +e` is required here too or
+          # `output="$(run_with_timeout ...)"` aborts the step the instant
+          # the installed binary times out or exits non-zero — before the
+          # warn-vs-fail branch below ever runs.
+          set -uo pipefail
+          set +e
+          bin_path="$(brew --prefix)/bin/$BINARY"
+          if [ ! -x "$bin_path" ]; then
+            echo "::error::brew install --cask succeeded but '$bin_path' is not an executable. Set artifact_smoke_test_binary if this cask's binary name differs from the inferred name ('$BINARY')."
+            exit 1
+          fi
+
+          run_with_timeout() {
+            local seconds="$1"; shift
+            "$@" &
+            local cmd_pid=$!
+            (
+              sleep "$seconds"
+              if kill -0 "$cmd_pid" 2>/dev/null; then
+                touch "${RUNNER_TEMP}/.smoke_cask_timed_out"
+                kill -TERM "$cmd_pid" 2>/dev/null
+                sleep 2
+                kill -KILL "$cmd_pid" 2>/dev/null
+              fi
+            ) &
+            local watchdog_pid=$!
+            wait "$cmd_pid" 2>/dev/null
+            local exit_code=$?
+            kill "$watchdog_pid" 2>/dev/null
+            wait "$watchdog_pid" 2>/dev/null
+            return "$exit_code"
+          }
+
+          rm -f "${RUNNER_TEMP}/.smoke_cask_timed_out"
+          echo "Running: $bin_path $SMOKE_CMD   (must exit within ${TIMEOUT_SECONDS}s)"
+          output="$(run_with_timeout "$TIMEOUT_SECONDS" "$bin_path" $SMOKE_CMD 2>&1)"
+          status=$?
+
+          echo "----- output -----"
+          printf '%s\n' "$output"
+          echo "-------------------"
+
+          problem=""
+          if [ -f "${RUNNER_TEMP}/.smoke_cask_timed_out" ]; then
+            problem="HUNG: '$bin_path $SMOKE_CMD' did not exit within ${TIMEOUT_SECONDS}s and was killed."
+          elif [ "$status" -ne 0 ]; then
+            problem="exited $status."
+          elif [ -z "$(printf '%s' "$output" | tr -d '[:space:]')" ]; then
+            problem="exited 0 but printed no output."
+          fi
+
+          if [ -z "$problem" ]; then
+            echo "OK: the Homebrew-cask-installed binary runs and exits 0 with output."
+            exit 0
+          fi
+
+          msg="Homebrew-cask-installed binary $problem This is the exact specscore-cli v0.24.0 failure mode: the raw release asset runs fine (layer 1 passed), but the copy 'brew install --cask' puts on disk is quarantined, and Gatekeeper silently blocks an ad-hoc-signed, unnotarized binary the moment it is quarantined — a real user sees an 'Apple could not verify' dialog; a headless runner just hangs with no dialog to show. See the layer 2 signing diagnostics above for exactly what's missing. Fix: notarize this CLI's macOS build (Developer ID cert + App Store Connect API credentials), then set require_notarized_macos: true to enforce this going forward."
+          if [ "$REQUIRE_NOTARIZED" = "true" ]; then
+            echo "::error::$msg"
+            exit 1
+          else
+            echo "::warning::$msg"
+            exit 0
+          fi
