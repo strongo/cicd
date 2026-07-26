@@ -538,11 +538,13 @@ jobs:
           fi
 
           echo "Resolved: tag=$TAG binary=$binary has_homebrew_cask=$has_cask homebrew_tap=$tap homebrew_cask_name=$cask_name"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "binary=$binary" >> "$GITHUB_OUTPUT"
-          echo "has_homebrew_cask=$has_cask" >> "$GITHUB_OUTPUT"
-          echo "homebrew_tap=$tap" >> "$GITHUB_OUTPUT"
-          echo "homebrew_cask_name=$cask_name" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "binary=$binary"
+            echo "has_homebrew_cask=$has_cask"
+            echo "homebrew_tap=$tap"
+            echo "homebrew_cask_name=$cask_name"
+          } >> "$GITHUB_OUTPUT"
 
   # LAYERS 1 (always hard-fail) and 2 (macOS only; severity gated by
   # require_notarized_macos). Downloads the PUBLISHED release asset per
@@ -659,6 +661,10 @@ jobs:
 
           rm -f .smoke_timed_out
           echo "Running: $BIN_PATH $SMOKE_CMD   (must exit within ${TIMEOUT_SECONDS}s)"
+          # SMOKE_CMD is deliberately unquoted: it's a space-separated
+          # argument list (e.g. '--version'), split into words the same way
+          # ${{ inputs.goreleaser_extra_args }} is elsewhere in this file.
+          # shellcheck disable=SC2086
           output="$(run_with_timeout "$TIMEOUT_SECONDS" "$BIN_PATH" $SMOKE_CMD 2>&1)"
           status=$?
 
@@ -826,6 +832,8 @@ jobs:
 
           rm -f "${RUNNER_TEMP}/.smoke_cask_timed_out"
           echo "Running: $bin_path $SMOKE_CMD   (must exit within ${TIMEOUT_SECONDS}s)"
+          # SMOKE_CMD is deliberately unquoted; see the layer 1 step above.
+          # shellcheck disable=SC2086
           output="$(run_with_timeout "$TIMEOUT_SECONDS" "$bin_path" $SMOKE_CMD 2>&1)"
           status=$?
 
