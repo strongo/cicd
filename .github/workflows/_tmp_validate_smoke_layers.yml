@@ -12,6 +12,9 @@ name: TEMP validate smoke-test layers against known-bad specscore-cli v0.24.0
 #       the open residual-gap question from the incident review.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - agent/post-release-artifact-smoke
 
 jobs:
   validate:
