@@ -391,6 +391,19 @@ jobs:
             --bumped-version
             --tag-pattern ^${{ inputs.tag_prefix }}[0-9]+\.[0-9]+\.[0-9]+$
 
+      # git-cliff-action unpacks its binary into ./git-cliff/ inside the
+      # caller's checkout and never removes it. Any later step that inspects
+      # the worktree then sees an untracked directory: GoReleaser refuses
+      # outright with "git is in a dirty state", failing the release before it
+      # can tag anything. Three repositories hit this on the same day, each
+      # looking like a local problem. A shared workflow must not leave build
+      # artifacts in a consumer's worktree, so remove it as soon as the step
+      # that created it is done.
+      - name: Remove git-cliff working directory
+        if: ${{ always() }}
+        shell: bash
+        run: rm -rf git-cliff
+
       # Preserve default_bump for callers that explicitly request a release.
       - name: Resolve configured default bump
         id: resolved_bump
