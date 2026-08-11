@@ -724,6 +724,9 @@ jobs:
           # redefines it.
           run_with_timeout() {
             local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
             # Job control puts the command in its own process group. That lets
             # the watchdog terminate forked descendants as well as its parent
             # on both the Ubuntu and macOS hosted runners.
@@ -762,16 +765,16 @@ jobs:
             # A command can exit cleanly after forking a child. Do not return
             # while that child still owns this command's process group; keep
             # the leader's status and output, but terminate/reap descendants.
-            if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+            if process_group_exists "$cmd_pid"; then
               kill -TERM -- "-$cmd_pid" 2>/dev/null
               local deadline=$((SECONDS + 2))
-              while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
                 sleep 0.05
               done
-              if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+              if process_group_exists "$cmd_pid"; then
                 kill -KILL -- "-$cmd_pid" 2>/dev/null
                 local kill_deadline=$((SECONDS + 2))
-                while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$kill_deadline" ]; do
                   sleep 0.05
                 done
               fi
@@ -889,6 +892,9 @@ jobs:
 
           run_with_timeout() {
             local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
             set -m
             "$@" &
             local cmd_pid=$!
@@ -918,16 +924,16 @@ jobs:
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
-            if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+            if process_group_exists "$cmd_pid"; then
               kill -TERM -- "-$cmd_pid" 2>/dev/null
               local deadline=$((SECONDS + 2))
-              while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
                 sleep 0.05
               done
-              if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+              if process_group_exists "$cmd_pid"; then
                 kill -KILL -- "-$cmd_pid" 2>/dev/null
                 local kill_deadline=$((SECONDS + 2))
-                while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$kill_deadline" ]; do
                   sleep 0.05
                 done
               fi
@@ -1079,6 +1085,9 @@ jobs:
 
           run_with_timeout() {
             local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
             set -m
             "$@" &
             local cmd_pid=$!
@@ -1108,16 +1117,16 @@ jobs:
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
-            if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+            if process_group_exists "$cmd_pid"; then
               kill -TERM -- "-$cmd_pid" 2>/dev/null
               local deadline=$((SECONDS + 2))
-              while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
                 sleep 0.05
               done
-              if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+              if process_group_exists "$cmd_pid"; then
                 kill -KILL -- "-$cmd_pid" 2>/dev/null
                 local kill_deadline=$((SECONDS + 2))
-                while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$kill_deadline" ]; do
                   sleep 0.05
                 done
               fi
@@ -1181,6 +1190,9 @@ jobs:
 
           run_with_timeout() {
             local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
             set -m
             "$@" &
             local cmd_pid=$!
@@ -1210,16 +1222,16 @@ jobs:
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
-            if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+            if process_group_exists "$cmd_pid"; then
               kill -TERM -- "-$cmd_pid" 2>/dev/null
               local deadline=$((SECONDS + 2))
-              while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
                 sleep 0.05
               done
-              if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+              if process_group_exists "$cmd_pid"; then
                 kill -KILL -- "-$cmd_pid" 2>/dev/null
                 local kill_deadline=$((SECONDS + 2))
-                while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$kill_deadline" ]; do
                   sleep 0.05
                 done
               fi

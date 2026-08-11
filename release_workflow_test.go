@@ -82,8 +82,10 @@ func TestReleaseWorkflowWatchdogsReturnPromptlyAndKillTimeouts(t *testing.T) {
 		t.Run(fmt.Sprintf("watchdog_%d", i+1), func(t *testing.T) {
 			workspace := t.TempDir()
 			watchdogPIDs := watchdogProcessHarness(t, workspace)
-			runImmediateCommand(t, workspace, watchdog, watchdogPIDs, "printf ready", 0, "ready")
-			runImmediateCommand(t, workspace, watchdog, watchdogPIDs, "printf broken; exit 23", 23, "broken")
+			for attempt := 1; attempt <= 3; attempt++ {
+				runImmediateCommand(t, workspace, watchdog, watchdogPIDs, "printf ready", 0, "ready")
+				runImmediateCommand(t, workspace, watchdog, watchdogPIDs, "printf broken; exit 23", 23, "broken")
+			}
 			runParentExitWithBackgroundChild(t, workspace, watchdog, watchdogPIDs)
 
 			timeoutProgram := strings.Join([]string{
@@ -300,7 +302,7 @@ func releaseWorkflowTimeoutHelpers(t *testing.T) []string {
 	t.Helper()
 	workflow := readReleaseWorkflow(t)
 	const startMarker = "          run_with_timeout() {\n"
-	const endMarker = "          }\n"
+	const endMarker = "\n          }\n"
 	var helpers []string
 	for remaining := workflow; ; {
 		start := strings.Index(remaining, startMarker)
