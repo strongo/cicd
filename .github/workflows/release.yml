@@ -477,7 +477,11 @@ jobs:
           git push origin "refs/tags/$tag"
           echo "new_tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - run: git fetch --tags
+      # The full-history checkout already fetched the remote tags, and a tag
+      # created above is present in this checkout immediately. Do not fetch
+      # again here: GoReleaser releases the local exact tag, while a redundant
+      # network round-trip can fail after the immutable tag has already been
+      # pushed and strand the release before publication.
 
       # Release the tag on HEAD: the exact tag on a tag-push, or the one the
       # guarded bump just cut on a branch/merge. On a branch/merge with no
