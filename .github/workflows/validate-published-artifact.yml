@@ -1,0 +1,278 @@
+name: Validate published artifact
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        required: true
+        description: >-
+          Exact existing release tag to validate. It must equal tag_prefix
+          followed by plain SemVer and is never replaced with the caller ref.
+      tag_prefix:
+        type: string
+        required: false
+        default: 'v'
+        description: Literal prefix before the release tag's SemVer value.
+      artifact_binary:
+        type: string
+        required: true
+        description: Exact executable filename expected inside each archive.
+      artifact_command:
+        type: string
+        required: false
+        default: '--version'
+        description: Arguments passed to the published executable.
+      artifact_timeout_seconds:
+        type: number
+        required: false
+        default: 30
+        description: Maximum seconds the published executable may run.
+      artifact_platforms:
+        type: string
+        required: false
+        default: >-
+          [{"runner":"ubuntu-latest","goos":"linux","goarch":"amd64"},{"runner":"macos-latest","goos":"darwin","goarch":"arm64"}]
+        description: JSON array of runner, goos, and goarch objects to validate.
+      require_notarized_macos:
+        type: boolean
+        required: false
+        default: false
+        description: Hard-fail macOS signing and notarization findings when true.
+
+# This reusable workflow is deliberately separate from release.yml. GitHub
+# validates a called workflow's maximum permissions before evaluating job
+# conditions, so a read-only caller cannot call a workflow containing even a
+# skipped contents:write release job. Every job here is read-only by contract.
+permissions:
+  contents: read
+
+jobs:
+  validate_inputs:
+    name: Validate historical artifact request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release_tag: ${{ steps.validate.outputs.release_tag }}
+    steps:
+      - name: Validate exact release tag and platforms
+        id: validate
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          ARTIFACT_BINARY: ${{ inputs.artifact_binary }}
+          ARTIFACT_PLATFORMS: ${{ inputs.artifact_platforms }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_TAG" != "$TAG_PREFIX"* ]]; then
+            echo "::error title=Invalid release tag::'$RELEASE_TAG' must start with tag_prefix '$TAG_PREFIX'."
+            exit 1
+          fi
+          version="${RELEASE_TAG#"$TAG_PREFIX"}"
+          if [ -z "$version" ] || ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error title=Invalid release tag::'$RELEASE_TAG' must equal tag_prefix '$TAG_PREFIX' followed by plain SemVer (major.minor.patch without leading zeroes)."
+            exit 1
+          fi
+          if [ -z "$ARTIFACT_BINARY" ] || ! [[ "$ARTIFACT_BINARY" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+            echo "::error title=Invalid artifact binary::artifact_binary must be one executable filename, not a path."
+            exit 1
+          fi
+          if ! python3 - "$ARTIFACT_PLATFORMS" <<'PY'
+          import json
+          import sys
+
+          try:
+              platforms = json.loads(sys.argv[1])
+          except (TypeError, ValueError):
+              sys.exit(1)
+          if not isinstance(platforms, list) or not platforms:
+              sys.exit(1)
+          required = {"runner", "goos", "goarch"}
+          if any(not isinstance(item, dict) or not required.issubset(item) for item in platforms):
+              sys.exit(1)
+          if any(not all(isinstance(item[key], str) and item[key] for key in required) for item in platforms):
+              sys.exit(1)
+          PY
+          then
+            echo "::error title=Invalid artifact platforms::artifact_platforms must be a non-empty JSON array of non-empty runner, goos, and goarch strings."
+            exit 1
+          fi
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  validate_artifact:
+    name: 'Validate published artifact (${{ matrix.goos }}/${{ matrix.goarch }})'
+    needs: validate_inputs
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.artifact_platforms) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.validate_inputs.outputs.release_tag }}
+      ARTIFACT_BINARY: ${{ inputs.artifact_binary }}
+      ARTIFACT_COMMAND: ${{ inputs.artifact_command }}
+      ARTIFACT_TIMEOUT_SECONDS: ${{ inputs.artifact_timeout_seconds }}
+      REQUIRE_NOTARIZED: ${{ inputs.require_notarized_macos }}
+    steps:
+      - name: Prepare bounded process runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner="${RUNNER_TEMP}/cicd-run-with-timeout.py"
+          printf '%s\n' \
+            'import os' \
+            'from pathlib import Path' \
+            'import signal' \
+            'import subprocess' \
+            'import sys' \
+            'import time' \
+            'timeout = float(sys.argv[1])' \
+            'marker = Path(sys.argv[2])' \
+            'command = sys.argv[3:]' \
+            'process = subprocess.Popen(command, start_new_session=True)' \
+            'try:' \
+            '    status = process.wait(timeout=timeout)' \
+            'except subprocess.TimeoutExpired:' \
+            '    marker.touch()' \
+            '    os.killpg(process.pid, signal.SIGTERM)' \
+            '    try:' \
+            '        process.wait(timeout=2)' \
+            '    except subprocess.TimeoutExpired:' \
+            '        os.killpg(process.pid, signal.SIGKILL)' \
+            '        process.wait()' \
+            '    status = 124' \
+            'def group_exists():' \
+            '    try:' \
+            '        os.killpg(process.pid, 0)' \
+            '        return True' \
+            '    except ProcessLookupError:' \
+            '        return False' \
+            'if group_exists():' \
+            '    os.killpg(process.pid, signal.SIGTERM)' \
+            '    deadline = time.monotonic() + 2' \
+            '    while group_exists() and time.monotonic() < deadline:' \
+            '        time.sleep(0.05)' \
+            '    if group_exists():' \
+            '        os.killpg(process.pid, signal.SIGKILL)' \
+            'sys.exit(status)' > "$runner"
+
+      - name: Download exact published release archive
+        id: download
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -uo pipefail
+          set +e
+          artifact_dir="${RUNNER_TEMP}/artifact-smoke"
+          timeout_marker="${RUNNER_TEMP}/.download_timed_out"
+          mkdir -p "$artifact_dir"
+          rm -f "$timeout_marker"
+          echo "Downloading ${GOOS}/${GOARCH} from exact release $GITHUB_REPOSITORY@$RELEASE_TAG"
+          python3 "${RUNNER_TEMP}/cicd-run-with-timeout.py" 120 "$timeout_marker" \
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "*_${GOOS}_${GOARCH}.tar.gz" \
+            --pattern "*_${GOOS}_${GOARCH}.tgz" \
+            --pattern "*_${GOOS}_${GOARCH}.zip" \
+            --dir "$artifact_dir" --clobber
+          status=$?
+          if [ -f "$timeout_marker" ]; then
+            echo "::error::Could not download the exact $RELEASE_TAG ${GOOS}/${GOARCH} published archive within 120 seconds; no artifact was executed."
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::No ${GOOS}/${GOARCH} published archive matched exact release $RELEASE_TAG; no artifact was executed."
+            exit 1
+          fi
+          archive="$(find "$artifact_dir" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.zip' \) | head -n1)"
+          if [ -z "$archive" ]; then
+            echo "::error::The exact $RELEASE_TAG download contained no recognized ${GOOS}/${GOARCH} archive; no artifact was executed."
+            exit 1
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Extract exact published release archive
+        id: extract
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.download.outputs.archive }}
+        run: |
+          set -euo pipefail
+          extract_dir="${RUNNER_TEMP}/artifact-smoke/extracted"
+          mkdir -p "$extract_dir"
+          case "$ARCHIVE" in
+            *.zip) unzip -o -q "$ARCHIVE" -d "$extract_dir" ;;
+            *.tar.gz|*.tgz) tar xzf "$ARCHIVE" -C "$extract_dir" ;;
+            *) echo "::error::Unrecognized archive '$ARCHIVE'; no artifact was executed."; exit 1 ;;
+          esac
+          bin_path="$(find "$extract_dir" -maxdepth 3 -type f -name "$ARTIFACT_BINARY" | head -n1)"
+          if [ -z "$bin_path" ] || [ ! -f "$bin_path" ]; then
+            echo "::error::Exact release $RELEASE_TAG archive did not contain '$ARTIFACT_BINARY'; no artifact was executed."
+            exit 1
+          fi
+          bin_path="$(cd "$(dirname "$bin_path")" && pwd -P)/$(basename "$bin_path")"
+          chmod +x "$bin_path"
+          echo "bin_path=$bin_path" >> "$GITHUB_OUTPUT"
+
+      - name: Run exact published executable
+        shell: bash
+        env:
+          BIN_PATH: ${{ steps.extract.outputs.bin_path }}
+        run: |
+          set -uo pipefail
+          set +e
+          timeout_marker="${RUNNER_TEMP}/.artifact_timed_out"
+          rm -f "$timeout_marker"
+          echo "Running exact published artifact: $BIN_PATH $ARTIFACT_COMMAND"
+          # ARTIFACT_COMMAND is a space-separated argument list. Expansion is
+          # intentionally unquoted so ordinary multi-argument commands work.
+          # shellcheck disable=SC2086
+          output="$(python3 "${RUNNER_TEMP}/cicd-run-with-timeout.py" "$ARTIFACT_TIMEOUT_SECONDS" "$timeout_marker" "$BIN_PATH" $ARTIFACT_COMMAND 2>&1)"
+          status=$?
+          printf '%s\n' "$output"
+          if [ -f "$timeout_marker" ]; then
+            echo "::error::Exact release $RELEASE_TAG artifact hung and was killed after ${ARTIFACT_TIMEOUT_SECONDS}s."
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Exact release $RELEASE_TAG artifact exited $status."
+            exit 1
+          fi
+          if [ -z "$(printf '%s' "$output" | tr -d '[:space:]')" ]; then
+            echo "::error::Exact release $RELEASE_TAG artifact exited 0 but printed no output."
+            exit 1
+          fi
+          echo "OK: exact $RELEASE_TAG ${ARTIFACT_BINARY} artifact executed successfully."
+
+      - name: Inspect macOS signing and notarization
+        if: ${{ matrix.goos == 'darwin' }}
+        shell: bash
+        env:
+          BIN_PATH: ${{ steps.extract.outputs.bin_path }}
+        run: |
+          set -uo pipefail
+          set +e
+          codesign_out="$(codesign -dv --verbose=4 "$BIN_PATH" 2>&1)"
+          spctl_out="$(spctl -a -vv "$BIN_PATH" 2>&1)"
+          spctl_status=$?
+          printf '%s\n%s\n' "$codesign_out" "$spctl_out"
+          team_id="$(printf '%s\n' "$codesign_out" | grep '^TeamIdentifier=' | cut -d= -f2-)"
+          problems=""
+          if [ -z "$team_id" ] || [ "$team_id" = "not set" ]; then
+            problems="${problems}no Developer ID; "
+          fi
+          if [ "$spctl_status" -ne 0 ]; then
+            problems="${problems}spctl rejected the binary; "
+          fi
+          if [ -z "$problems" ]; then
+            echo "OK: exact $RELEASE_TAG macOS artifact is signed and passes spctl."
+          elif [ "$REQUIRE_NOTARIZED" = "true" ]; then
+            echo "::error::Exact $RELEASE_TAG macOS artifact is not properly signed/notarized: $problems"
+            exit 1
+          else
+            echo "::warning::Exact $RELEASE_TAG macOS artifact is not properly signed/notarized: $problems"
+          fi

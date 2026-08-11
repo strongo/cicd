@@ -16,6 +16,7 @@ coverage, and automatic SemVer tagging.
 | --- | --- | --- |
 | `.github/workflows/workflow.yml` | Reusable workflow (`workflow_call`) | Full Go CI: lint, test (+coverage), build, and version bump. The primary entry point. |
 | `.github/workflows/release.yml` | Reusable workflow (`workflow_call`) | GoReleaser release flow (tag + `goreleaser release`). |
+| `.github/workflows/validate-published-artifact.yml` | Reusable workflow (`workflow_call`) | Read-only, exact-tag validation of already published CLI archives. |
 | `action.yml` | Composite action | Single-job CI for callers that want CI steps inline in their own job. |
 | `default.json` | Renovate preset | Shareable config consumers `extends` to auto-track this repo's tag (see below). |
 
@@ -238,6 +239,36 @@ repos where the executable doesn't match `project_name` or a `-cli`-stripped
 repo name) should set `artifact_smoke_test_binary` explicitly. A repo that
 doesn't publish a runnable CLI binary at all should set
 `artifact_smoke_test: false`.
+
+## Revalidating an existing published artifact
+
+Use `validate-published-artifact.yml` when an already published CLI archive
+needs to be executed again without creating a tag or release. This is separate
+from `release.yml` because reusable-workflow permissions can only stay the same
+or become more restrictive: a `contents: read` validation caller cannot call a
+workflow containing a `contents: write` release job, even when that job would be
+conditionally skipped.
+
+The validation workflow has only `contents: read`, requires the exact release
+tag and executable name, downloads archives only from that tag, and hard-fails
+unless every configured platform reaches and successfully executes the
+published binary. It has no GoReleaser, tag creation, publishing, or Homebrew
+cask path.
+
+```yaml
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: strongo/cicd/.github/workflows/validate-published-artifact.yml@v1
+    permissions:
+      contents: read
+    with:
+      release_tag: v0.33.0
+      artifact_binary: my-cli
+      artifact_command: --version
+```
 
 Binary-name inference reads `.goreleaser.y*ml`/`goreleaser.y*ml` at the repo
 **root**. A repo using `tag_prefix` for a subdirectory module (e.g.
