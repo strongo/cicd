@@ -80,6 +80,73 @@ func TestReleaseWorkflowExtractsAnAbsoluteRunnableBinaryPath(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflowReleasesTheLocallyCreatedTagWithoutRefetching(t *testing.T) {
+	workflow := readReleaseWorkflow(t)
+	if !strings.Contains(workflow, "uses: actions/checkout@v7\n        with:\n          fetch-depth: 0") {
+		t.Fatal("release workflow must retain its full-history checkout before computing or releasing tags")
+	}
+	if strings.Contains(workflow, "git fetch --tags") {
+		t.Fatal("release workflow must not refetch after pushing its locally created immutable tag")
+	}
+	tagIndex := strings.Index(workflow, "git tag \"$tag\"")
+	releaseIndex := strings.Index(workflow, "- name: Run GoReleaser")
+	if tagIndex == -1 || releaseIndex == -1 || tagIndex > releaseIndex {
+		t.Fatal("release workflow must create its local immutable tag before running GoReleaser")
+	}
+	if !strings.Contains(workflow, "if: ${{ github.ref_type == 'tag' || steps.tag.outputs.new_tag != '' }}") {
+		t.Fatal("release workflow must retain the exact existing-tag GoReleaser path")
+	}
+
+	tagScript := releaseWorkflowRunBlock(t, "Determine and push guarded tag")
+	workspace := t.TempDir()
+	fakeBinDir := filepath.Join(workspace, "bin")
+	if err := os.MkdirAll(fakeBinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	callsFile := filepath.Join(workspace, "git-calls")
+	fakeGit := filepath.Join(fakeBinDir, "git")
+	if err := os.WriteFile(fakeGit, []byte(`#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$CICD_GIT_CALLS"
+case "$1" in
+  tag|push) exit 0 ;;
+  fetch)
+    echo 'server certificate verification failed. CAfile: none CRLfile: none' >&2
+    exit 128
+    ;;
+  *) exit 2 ;;
+esac
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	outputFile := filepath.Join(workspace, "github-output")
+	output, err := runBash(workspace, tagScript, map[string]string{
+		"PREV":           "0.33.2",
+		"NEXT":           "0.33.3",
+		"NEXT_TAG":       "v0.33.3",
+		"PREV_TAG":       "v0.33.2",
+		"ALLOW_MAJOR":    "false",
+		"PREFIX":         "v",
+		"GITHUB_OUTPUT":  outputFile,
+		"CICD_GIT_CALLS": callsFile,
+		"PATH":           fakeBinDir + ":" + os.Getenv("PATH"),
+	})
+	if err != nil {
+		t.Fatalf("create and push local tag: %v\n%s", err, output)
+	}
+	if got := githubOutput(t, outputFile, "new_tag"); got != "v0.33.3" {
+		t.Fatalf("new_tag = %q, want v0.33.3", got)
+	}
+	calls, err := os.ReadFile(callsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(calls), "tag v0.33.3\npush origin refs/tags/v0.33.3\n"; got != want {
+		t.Fatalf("git calls = %q, want %q", got, want)
+	}
+}
+
 func TestPublishedArtifactWorkflowValidatesTheExactRequestedTag(t *testing.T) {
 	validateScript := publishedArtifactWorkflowRunBlock(t, "Validate exact release tag and platforms")
 
