@@ -118,17 +118,6 @@ on:
           Prefix for version tags, e.g. "ingitdb/v" for a subdirectory module.
           Defaults to "v". Used when the CD bump path (branch/merge trigger)
           computes and pushes the next tag.
-      existing_artifact_tag:
-        type: string
-        required: false
-        default: ''
-        description: >-
-          Exact existing release tag to validate without creating or publishing
-          anything. It must equal tag_prefix followed by a plain SemVer value
-          (for example, tag_prefix "v" plus "0.33.0" is "v0.33.0"). When
-          set, the release/tagging/GoReleaser path is skipped and only the
-          resolved published-archive smoke jobs run against this exact tag.
-          Leave empty for the normal release behavior.
       default_bump:
         type: string
         required: false
@@ -309,80 +298,8 @@ on:
 #      - 'v*.*.*'   # triggers only on tags like v1.26.0
 
 jobs:
-  validate_release_mode:
-    name: Validate release mode
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      existing_artifact_tag: ${{ steps.validate.outputs.existing_artifact_tag }}
-      historical_artifact_validation: ${{ steps.validate.outputs.historical_artifact_validation }}
-    steps:
-      - name: Validate existing artifact tag and release-mode inputs
-        id: validate
-        shell: bash
-        env:
-          EXISTING_ARTIFACT_TAG: ${{ inputs.existing_artifact_tag }}
-          TAG_PREFIX: ${{ inputs.tag_prefix }}
-          DEFAULT_BUMP: ${{ inputs.default_bump }}
-          ALLOW_MAJOR_VERSION_BUMP: ${{ inputs.allow_major_version_bump }}
-          GORELEASER_EXTRA_ARGS: ${{ inputs.goreleaser_extra_args }}
-          ARTIFACT_SMOKE_TEST: ${{ inputs.artifact_smoke_test }}
-          ARTIFACT_SMOKE_TEST_PLATFORMS: ${{ inputs.artifact_smoke_test_platforms }}
-          GITHUB_REF_TYPE: ${{ github.ref_type }}
-        run: |
-          set -euo pipefail
-          tag="$EXISTING_ARTIFACT_TAG"
-          if [ -z "$tag" ]; then
-            echo "historical_artifact_validation=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ "$tag" != "$TAG_PREFIX"* ]]; then
-            echo "::error title=Invalid existing artifact tag::'$tag' must start with tag_prefix '$TAG_PREFIX'."
-            exit 1
-          fi
-          version="${tag#"$TAG_PREFIX"}"
-          if [ -z "$version" ] || ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error title=Invalid existing artifact tag::'$tag' must equal tag_prefix '$TAG_PREFIX' followed by plain SemVer (major.minor.patch)."
-            exit 1
-          fi
-
-          # Historical validation is deliberately non-publishing. Reject inputs
-          # that request release behavior instead of silently ignoring them.
-          if [ "$GITHUB_REF_TYPE" = "tag" ] || [ "$DEFAULT_BUMP" != "false" ] || [ "$ALLOW_MAJOR_VERSION_BUMP" = "true" ] || [ -n "$GORELEASER_EXTRA_ARGS" ]; then
-            echo "::error title=Conflicting release-mode input::existing_artifact_tag cannot be combined with a tag trigger, default_bump, allow_major_version_bump, or goreleaser_extra_args. Dispatch validation from a branch with release-mode inputs at their defaults."
-            exit 1
-          fi
-          if [ "$ARTIFACT_SMOKE_TEST" != "true" ]; then
-            echo "::error title=Historical validation disabled::existing_artifact_tag requires artifact_smoke_test: true so a validation dispatch cannot pass without executing a published artifact."
-            exit 1
-          fi
-          if ! python3 - "$ARTIFACT_SMOKE_TEST_PLATFORMS" <<'PY'
-          import json
-          import sys
-
-          try:
-              platforms = json.loads(sys.argv[1])
-          except (TypeError, ValueError):
-              sys.exit(1)
-          if not isinstance(platforms, list) or not platforms:
-              sys.exit(1)
-          PY
-          then
-            echo "::error title=No historical validation platform::existing_artifact_tag requires a non-empty artifact_smoke_test_platforms JSON array so the workflow cannot pass without executing a published artifact."
-            exit 1
-          fi
-
-          {
-            echo "existing_artifact_tag=$tag"
-            echo "historical_artifact_validation=true"
-          } >> "$GITHUB_OUTPUT"
-
   release:
     name: GoReleaser
-    needs: validate_release_mode
-    if: ${{ needs.validate_release_mode.result == 'success' && inputs.existing_artifact_tag == '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required for GoReleaser to push GitHub releases
@@ -602,14 +519,8 @@ jobs:
   # each repeat this checkout/parse.
   resolve_artifact_smoke_test:
     name: Resolve artifact smoke test target
-    needs: [ validate_release_mode, release ]
-    if: >-
-      ${{ always() && !cancelled() &&
-          needs.validate_release_mode.result == 'success' &&
-          inputs.artifact_smoke_test &&
-          (inputs.existing_artifact_tag != '' ||
-            (needs.release.result == 'success' &&
-              (needs.release.outputs.tag != '' || github.ref_type == 'tag'))) }}
+    needs: release
+    if: ${{ inputs.artifact_smoke_test && !failure() && !cancelled() && (needs.release.outputs.tag != '' || github.ref_type == 'tag') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -626,22 +537,14 @@ jobs:
       homebrew_cask_name: ${{ steps.resolve.outputs.homebrew_cask_name }}
 
     steps:
-      - name: Determine the artifact tag to verify
+      - name: Determine the tag this run published
         id: release_tag
         env:
-          EXISTING_ARTIFACT_TAG: ${{ needs.validate_release_mode.outputs.existing_artifact_tag }}
           RELEASE_TAG: ${{ needs.release.outputs.tag }}
         run: |
           set -euo pipefail
-          if [ -n "$EXISTING_ARTIFACT_TAG" ]; then
-            # This mode must never use the dispatch ref as a fallback: the
-            # checked-out config and downloaded archive must be for the exact
-            # historical release the caller requested.
-            tag="$EXISTING_ARTIFACT_TAG"
-          else
-            tag="$RELEASE_TAG"
-            [ -z "$tag" ] && tag="${GITHUB_REF_NAME}"
-          fi
+          tag="$RELEASE_TAG"
+          [ -z "$tag" ] && tag="${GITHUB_REF_NAME}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       # Sparse, ref-pinned checkout: we only need the GoReleaser config as it
@@ -663,7 +566,6 @@ jobs:
           BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}
           TAG: ${{ steps.release_tag.outputs.tag }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
-          HISTORICAL_ARTIFACT_VALIDATION: ${{ inputs.existing_artifact_tag != '' }}
         run: |
           set -euo pipefail
           config_file=""
@@ -740,10 +642,6 @@ jobs:
           fi
 
           if [ "$binary_resolved" = "false" ]; then
-            if [ "$HISTORICAL_ARTIFACT_VALIDATION" = "true" ]; then
-              echo "::error::$resolve_note Historical artifact validation requires a resolved executable and cannot skip this check."
-              exit 1
-            fi
             echo "::warning::$resolve_note"
           fi
 
@@ -772,16 +670,13 @@ jobs:
   # release — this workflow is consumed by repos not enumerated here,
   # including libraries and Docker-only releases with no per-arch archive,
   # and a naming/shape mismatch is not evidence the release is broken.
-  # During a normal release, "could not test" logs ::warning:: and skips
-  # (exit 0); "tested and broken" always hard-fails (exit 1), unconditionally
-  # for layer 1. Historical validation is an explicit request for proof, so
-  # every "could not test" path is a hard failure there too: a green run must
-  # mean the requested published executable was actually invoked.
+  # "Could not test" always logs ::warning:: and skips (exit 0); "tested and
+  # broken" always hard-fails (exit 1), unconditionally for layer 1.
   artifact_smoke_test:
     name: 'Smoke test published artifact (${{ matrix.goos }}/${{ matrix.goarch }})'
     needs: [ release, resolve_artifact_smoke_test ]
     if: >-
-      ${{ always() && needs.resolve_artifact_smoke_test.result == 'success' &&
+      ${{ needs.resolve_artifact_smoke_test.result == 'success' &&
           needs.resolve_artifact_smoke_test.outputs.binary_resolved != 'false' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
@@ -798,7 +693,6 @@ jobs:
       SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
       TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
       REQUIRE_NOTARIZED: ${{ inputs.require_notarized_macos }}
-      HISTORICAL_ARTIFACT_VALIDATION: ${{ inputs.existing_artifact_tag != '' }}
 
     steps:
       # Selects only real archives ("*_<goos>_<goarch>.{tar.gz,tgz,zip}"),
@@ -903,19 +797,11 @@ jobs:
           status=$?
 
           if [ -f "${RUNNER_TEMP}/.download_timed_out" ]; then
-            if [ "$HISTORICAL_ARTIFACT_VALIDATION" = "true" ]; then
-              echo "::error::Historical artifact validation could not download ${goos}/${goarch}: 'gh release download' did not finish within 120s and was killed. The requested published artifact was not executed."
-              exit 1
-            fi
             echo "::warning::Could not test ${goos}/${goarch}: 'gh release download' did not finish within 120s and was killed (network slowness or a GitHub API issue this run). This is NOT evidence the release is broken."
             echo "asset_found=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$status" -ne 0 ]; then
-            if [ "$HISTORICAL_ARTIFACT_VALIDATION" = "true" ]; then
-              echo "::error::Historical artifact validation could not download ${goos}/${goarch}: no release asset matched '*_${goos}_${goarch}.{tar.gz,tgz,zip}' for exact tag $TAG. The requested published artifact was not executed."
-              exit 1
-            fi
             echo "::warning::Could not test ${goos}/${goarch}: no release asset matched '*_${goos}_${goarch}.{tar.gz,tgz,zip}' for tag $TAG. This is NOT evidence the release is broken -- it means this platform isn't testable by this check as configured. Common legitimate reasons: this release doesn't publish ${goos}/${goarch} at all (a library, a Docker-only release, a universal macOS binary with no arch suffix), or its archive naming differs from GoReleaser's default '<name>_<version>_<os>_<arch>' convention (e.g. a custom archives.name_template). If ${goos}/${goarch} SHOULD be testable, fix the naming; otherwise trim artifact_smoke_test_platforms, or set artifact_smoke_test: false if this repo doesn't publish a runnable CLI binary at all."
             echo "asset_found=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -933,10 +819,6 @@ jobs:
           set +e
           archive="$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.zip' \) | head -n1)"
           if [ -z "$archive" ]; then
-            if [ "$HISTORICAL_ARTIFACT_VALIDATION" = "true" ]; then
-              echo "::error::Historical artifact validation downloaded assets for ${{ matrix.goos }}/${{ matrix.goarch }} but found no recognizable archive (.tar.gz/.tgz/.zip). The requested published artifact was not executed."
-              exit 1
-            fi
             echo "::warning::Could not test ${{ matrix.goos }}/${{ matrix.goarch }}: the download matched a release asset by name but none of them was a recognizable archive (.tar.gz/.tgz/.zip) once filtered — only non-archive sidecars (checksums, signatures, SBOMs) may have matched. This is NOT evidence the release is broken."
             echo "extracted=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -948,10 +830,6 @@ jobs:
             *.tar.gz|*.tgz) tar xzf "$archive" || extract_ok=false ;;
           esac
           if [ "$extract_ok" = false ]; then
-            if [ "$HISTORICAL_ARTIFACT_VALIDATION" = "true" ]; then
-              echo "::error::Historical artifact validation failed to extract '$archive' for ${{ matrix.goos }}/${{ matrix.goarch }}. The requested published artifact was not executed."
-              exit 1
-            fi
             echo "::warning::Could not test ${{ matrix.goos }}/${{ matrix.goarch }}: failed to extract '$archive'. This is NOT evidence the release is broken -- the archive may be malformed, or built in a way this check's extraction logic doesn't handle."
             echo "extracted=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -964,10 +842,6 @@ jobs:
             bin_path="$(find . -maxdepth 3 -type f -name "$BINARY" | head -n1)"
           fi
           if [ -z "$bin_path" ] || [ ! -f "$bin_path" ]; then
-            if [ "$HISTORICAL_ARTIFACT_VALIDATION" = "true" ]; then
-              echo "::error::Historical artifact validation extracted '$archive' for ${{ matrix.goos }}/${{ matrix.goarch }} but found no '$BINARY' executable. The requested published artifact was not executed."
-              exit 1
-            fi
             if [ -z "$BINARY" ]; then
               echo "::warning::Could not test ${{ matrix.goos }}/${{ matrix.goarch }}: no binary name was resolved for this repo (see the 'Resolve artifact smoke test target' job above), so this check doesn't know what to look for inside '$archive'. Set artifact_smoke_test_binary explicitly."
             else
@@ -1176,9 +1050,8 @@ jobs:
     name: 'Smoke test Homebrew cask install (darwin/arm64)'
     needs: [ release, resolve_artifact_smoke_test ]
     if: >-
-      ${{ always() && needs.resolve_artifact_smoke_test.result == 'success' &&
+      ${{ needs.resolve_artifact_smoke_test.result == 'success' &&
           needs.resolve_artifact_smoke_test.outputs.binary_resolved != 'false' &&
-          inputs.existing_artifact_tag == '' &&
           inputs.artifact_smoke_test_homebrew_cask &&
           needs.resolve_artifact_smoke_test.outputs.has_homebrew_cask == 'true' }}
     runs-on: macos-latest
