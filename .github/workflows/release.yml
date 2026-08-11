@@ -734,7 +734,10 @@ jobs:
                 sleep 2
                 kill -KILL "$cmd_pid" 2>/dev/null
               fi
-            ) &
+            # A command substitution captures this step's stdout. Keep the
+            # watchdog's sleep from inheriting that pipe, otherwise an already
+            # completed command still waits for the full timeout below.
+            ) >/dev/null 2>&1 &
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
@@ -809,6 +812,10 @@ jobs:
             echo "extracted=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # `find` may return a bare filename (e.g. "specscore"), which Bash
+          # only looks up on PATH when invoked later. Publish an absolute path
+          # so the following step executes the artifact we just extracted.
+          bin_path="$(cd "$(dirname "$bin_path")" && pwd -P)/$(basename "$bin_path")"
           chmod +x "$bin_path"
           {
             echo "archive=$archive"
@@ -857,7 +864,9 @@ jobs:
                 sleep 2
                 kill -KILL "$cmd_pid" 2>/dev/null
               fi
-            ) &
+            # Do not let this background sleep retain command-substitution
+            # stdout after an immediate command has completed.
+            ) >/dev/null 2>&1 &
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
@@ -1018,7 +1027,9 @@ jobs:
                 sleep 2
                 kill -KILL "$cmd_pid" 2>/dev/null
               fi
-            ) &
+            # Do not let this background sleep retain command-substitution
+            # stdout after an immediate command has completed.
+            ) >/dev/null 2>&1 &
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
@@ -1091,7 +1102,9 @@ jobs:
                 sleep 2
                 kill -KILL "$cmd_pid" 2>/dev/null
               fi
-            ) &
+            # Do not let this background sleep retain command-substitution
+            # stdout after an immediate command has completed.
+            ) >/dev/null 2>&1 &
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
