@@ -759,6 +759,23 @@ jobs:
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
+            # A command can exit cleanly after forking a child. Do not return
+            # while that child still owns this command's process group; keep
+            # the leader's status and output, but terminate/reap descendants.
+            if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+                local kill_deadline=$((SECONDS + 2))
+                while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                  sleep 0.05
+                done
+              fi
+            fi
             kill "$watchdog_pid" 2>/dev/null
             wait "$watchdog_pid" 2>/dev/null
             return "$exit_code"
@@ -901,6 +918,20 @@ jobs:
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
+            if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+                local kill_deadline=$((SECONDS + 2))
+                while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                  sleep 0.05
+                done
+              fi
+            fi
             kill "$watchdog_pid" 2>/dev/null
             wait "$watchdog_pid" 2>/dev/null
             return "$exit_code"
@@ -1077,6 +1108,20 @@ jobs:
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
+            if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+                local kill_deadline=$((SECONDS + 2))
+                while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                  sleep 0.05
+                done
+              fi
+            fi
             kill "$watchdog_pid" 2>/dev/null
             wait "$watchdog_pid" 2>/dev/null
             return "$exit_code"
@@ -1165,6 +1210,20 @@ jobs:
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
+            if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if kill -0 -- "-$cmd_pid" 2>/dev/null; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+                local kill_deadline=$((SECONDS + 2))
+                while kill -0 -- "-$cmd_pid" 2>/dev/null && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                  sleep 0.05
+                done
+              fi
+            fi
             kill "$watchdog_pid" 2>/dev/null
             wait "$watchdog_pid" 2>/dev/null
             return "$exit_code"

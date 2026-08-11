@@ -84,6 +84,7 @@ func TestReleaseWorkflowWatchdogsReturnPromptlyAndKillTimeouts(t *testing.T) {
 			watchdogPIDs := watchdogProcessHarness(t, workspace)
 			runImmediateCommand(t, workspace, watchdog, watchdogPIDs, "printf ready", 0, "ready")
 			runImmediateCommand(t, workspace, watchdog, watchdogPIDs, "printf broken; exit 23", 23, "broken")
+			runParentExitWithBackgroundChild(t, workspace, watchdog, watchdogPIDs)
 
 			timeoutProgram := strings.Join([]string{
 				"set +e",
@@ -115,6 +116,41 @@ func TestReleaseWorkflowWatchdogsReturnPromptlyAndKillTimeouts(t *testing.T) {
 			}
 		})
 	}
+}
+
+func runParentExitWithBackgroundChild(t *testing.T, workspace, watchdog string, harness watchdogHarness) {
+	t.Helper()
+	if err := os.Remove(harness.readyFile); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Remove(harness.childPIDFile); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	program := strings.Join([]string{
+		"set +e",
+		watchdog,
+		`output="$(run_with_timeout 2 bash -c '(while :; do :; done) >/dev/null 2>&1 & printf "%s\n" "$!" > "$CHILD_PID_FILE"; while [ ! -f "$CICD_WATCHDOG_READY_FILE" ]; do :; done; printf leader-exited')"`,
+		"status=$?",
+		`printf 'status=%s output=%s\n' "$status" "$output"`,
+	}, "\n")
+	started := time.Now()
+	output, err := runBash(workspace, program, harness.environment())
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("leader-exit command: %v\n%s", err, output)
+	}
+	if elapsed >= 1500*time.Millisecond {
+		t.Fatalf("leader-exit command waited %s\n%s", elapsed, output)
+	}
+	if string(output) != "status=0 output=leader-exited\n" {
+		t.Fatalf("leader-exit result = %q", output)
+	}
+	childPID := readPID(t, harness.childPIDFile)
+	t.Cleanup(func() { killProcess(childPID) })
+	if processIsAlive(childPID) {
+		t.Fatalf("child process %d survived after its leader exited", childPID)
+	}
+	harness.assertAllExited(t)
 }
 
 func runImmediateCommand(t *testing.T, workspace, watchdog string, harness watchdogHarness, command string, wantStatus int, wantOutput string) {
@@ -239,6 +275,9 @@ func readPID(t *testing.T, path string) int {
 }
 
 func processIsAlive(pid int) bool {
+	if output, err := exec.Command("ps", "-o", "stat=", "-p", fmt.Sprint(pid)).Output(); err == nil && strings.HasPrefix(strings.TrimSpace(string(output)), "Z") {
+		return false
+	}
 	return exec.Command("kill", "-0", fmt.Sprint(pid)).Run() == nil
 }
 
