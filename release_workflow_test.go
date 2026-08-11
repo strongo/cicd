@@ -81,38 +81,20 @@ func TestReleaseWorkflowWatchdogsReturnPromptlyAndKillTimeouts(t *testing.T) {
 	for i, watchdog := range releaseWorkflowTimeoutHelpers(t) {
 		t.Run(fmt.Sprintf("watchdog_%d", i+1), func(t *testing.T) {
 			workspace := t.TempDir()
-			program := strings.Join([]string{
-				"set +e",
-				watchdog,
-				`success_output="$(run_with_timeout 3 bash -c 'printf ready')"`,
-				"success_status=$?",
-				`failure_output="$(run_with_timeout 3 bash -c 'printf broken; exit 23')"`,
-				"failure_status=$?",
-				`printf 'success=%s:%s failure=%s:%s\n' "$success_status" "$success_output" "$failure_status" "$failure_output"`,
-			}, "\n")
-			started := time.Now()
-			output, err := runBash(workspace, program, map[string]string{"RUNNER_TEMP": workspace})
-			elapsed := time.Since(started)
-			if err != nil {
-				t.Fatalf("immediate commands: %v\n%s", err, output)
-			}
-			if elapsed >= 1500*time.Millisecond {
-				t.Fatalf("immediate commands waited %s for their 3s watchdogs\n%s", elapsed, output)
-			}
-			if string(output) != "success=0:ready failure=23:broken\n" {
-				t.Fatalf("unexpected immediate command result: %q", output)
-			}
+			watchdogPIDs := watchdogProcessHarness(t, workspace)
+			runImmediateCommand(t, workspace, watchdog, watchdogPIDs, "printf ready", 0, "ready")
+			runImmediateCommand(t, workspace, watchdog, watchdogPIDs, "printf broken; exit 23", 23, "broken")
 
 			timeoutProgram := strings.Join([]string{
 				"set +e",
 				watchdog,
-				`run_with_timeout 1 bash -c 'trap "" TERM; while :; do sleep 0.05; done'`,
+				`run_with_timeout 1 bash -c 'trap "" TERM; (trap "" TERM; while :; do :; done) & printf '%s\n' "$!" > "$CHILD_PID_FILE"; while :; do :; done'`,
 				"status=$?",
 				`printf 'status=%s\n' "$status"`,
 			}, "\n")
-			started = time.Now()
-			output, err = runBash(workspace, timeoutProgram, map[string]string{"RUNNER_TEMP": workspace})
-			elapsed = time.Since(started)
+			started := time.Now()
+			output, err := runBash(workspace, timeoutProgram, watchdogPIDs.environment())
+			elapsed := time.Since(started)
 			if err != nil {
 				t.Fatalf("timed command: %v\n%s", err, output)
 			}
@@ -122,12 +104,146 @@ func TestReleaseWorkflowWatchdogsReturnPromptlyAndKillTimeouts(t *testing.T) {
 			if !strings.HasPrefix(string(output), "status=") || string(output) == "status=0\n" {
 				t.Fatalf("timed command must be killed, got %q", output)
 			}
+			childPID := readPID(t, watchdogPIDs.childPIDFile)
+			t.Cleanup(func() { killProcess(childPID) })
+			if processIsAlive(childPID) {
+				t.Fatalf("timed command's child process %d survived the process-group kill", childPID)
+			}
 			matches, err := filepath.Glob(filepath.Join(workspace, ".*_timed_out"))
 			if err != nil || len(matches) != 1 {
 				t.Fatalf("timeout marker = %v, %v; want one marker", matches, err)
 			}
 		})
 	}
+}
+
+func runImmediateCommand(t *testing.T, workspace, watchdog string, harness watchdogHarness, command string, wantStatus int, wantOutput string) {
+	t.Helper()
+	if err := os.Remove(harness.readyFile); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	program := strings.Join([]string{
+		"set +e",
+		watchdog,
+		`output="$(run_with_timeout 2 bash -c 'while [ ! -f "$CICD_WATCHDOG_READY_FILE" ]; do :; done; exec bash -c "$CICD_IMMEDIATE_COMMAND"')"`,
+		"status=$?",
+		`printf 'status=%s output=%s\n' "$status" "$output"`,
+	}, "\n")
+	env := harness.environment()
+	env["CICD_IMMEDIATE_COMMAND"] = command
+	started := time.Now()
+	output, err := runBash(workspace, program, env)
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("immediate command: %v\n%s", err, output)
+	}
+	if elapsed >= 1500*time.Millisecond {
+		t.Fatalf("immediate command waited %s for its 2s watchdog\n%s", elapsed, output)
+	}
+	want := fmt.Sprintf("status=%d output=%s\n", wantStatus, wantOutput)
+	if string(output) != want {
+		t.Fatalf("immediate command result = %q, want %q", output, want)
+	}
+	harness.assertAllExited(t)
+}
+
+type watchdogHarness struct {
+	path          string
+	pythonPIDFile string
+	sleepPIDFile  string
+	childPIDFile  string
+	readyFile     string
+	realPython    string
+}
+
+func watchdogProcessHarness(t *testing.T, workspace string) watchdogHarness {
+	t.Helper()
+	realPython, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := watchdogHarness{
+		path:          filepath.Join(workspace, "fake-bin"),
+		pythonPIDFile: filepath.Join(workspace, "python-pids"),
+		sleepPIDFile:  filepath.Join(workspace, "sleep-pids"),
+		childPIDFile:  filepath.Join(workspace, "child-pid"),
+		readyFile:     filepath.Join(workspace, "watchdog-ready"),
+		realPython:    realPython,
+	}
+	if err := os.MkdirAll(harness.path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(harness.path, "python3"), "#!/usr/bin/env bash\nprintf '%s\\n' \"$$\" >> \"$CICD_PYTHON_PID_FILE\"\ncase \"$*\" in *time.sleep*) touch \"$CICD_WATCHDOG_READY_FILE\" ;; esac\nexec \"$CICD_REAL_PYTHON\" \"$@\"\n")
+	writeExecutable(t, filepath.Join(harness.path, "sleep"), "#!/usr/bin/env bash\nprintf '%s\\n' \"$$\" >> \"$CICD_SLEEP_PID_FILE\"\ntouch \"$CICD_WATCHDOG_READY_FILE\"\nexec /bin/sleep \"$@\"\n")
+	return harness
+}
+
+func (h watchdogHarness) environment() map[string]string {
+	return map[string]string{
+		"RUNNER_TEMP":              filepath.Dir(h.path),
+		"PATH":                     h.path + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"CICD_REAL_PYTHON":         h.realPython,
+		"CICD_PYTHON_PID_FILE":     h.pythonPIDFile,
+		"CICD_SLEEP_PID_FILE":      h.sleepPIDFile,
+		"CICD_WATCHDOG_READY_FILE": h.readyFile,
+		"CHILD_PID_FILE":           h.childPIDFile,
+	}
+}
+
+func (h watchdogHarness) assertAllExited(t *testing.T) {
+	t.Helper()
+	for _, pidFile := range []string{h.pythonPIDFile, h.sleepPIDFile} {
+		for _, pid := range readPIDs(t, pidFile) {
+			t.Cleanup(func() { killProcess(pid) })
+			if processIsAlive(pid) {
+				t.Fatalf("watchdog process %d from %s survived a completed command", pid, filepath.Base(pidFile))
+			}
+		}
+	}
+}
+
+func writeExecutable(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readPIDs(t *testing.T, path string) []int {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pids []int
+	for _, text := range strings.Fields(string(content)) {
+		var pid int
+		if _, err := fmt.Sscanf(text, "%d", &pid); err != nil {
+			t.Fatalf("parse PID %q from %s: %v", text, path, err)
+		}
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	pids := readPIDs(t, path)
+	if len(pids) != 1 {
+		t.Fatalf("PIDs in %s = %v, want one", path, pids)
+	}
+	return pids[0]
+}
+
+func processIsAlive(pid int) bool {
+	return exec.Command("kill", "-0", fmt.Sprint(pid)).Run() == nil
+}
+
+func killProcess(pid int) {
+	_ = exec.Command("kill", "-KILL", fmt.Sprint(pid)).Run()
 }
 
 func releaseWorkflowRunBlock(t *testing.T, stepName string) string {
