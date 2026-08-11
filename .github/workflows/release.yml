@@ -724,20 +724,61 @@ jobs:
           # redefines it.
           run_with_timeout() {
             local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
+            # Job control puts the command in its own process group. That lets
+            # the watchdog terminate forked descendants as well as its parent
+            # on both the Ubuntu and macOS hosted runners.
+            set -m
             "$@" &
             local cmd_pid=$!
-            (
-              sleep "$seconds"
-              if kill -0 "$cmd_pid" 2>/dev/null; then
-                touch "${RUNNER_TEMP}/.download_timed_out"
-                kill -TERM "$cmd_pid" 2>/dev/null
-                sleep 2
-                kill -KILL "$cmd_pid" 2>/dev/null
-              fi
-            ) &
+            set +m
+            # Use a single watchdog process rather than a shell plus a child
+            # `sleep`: stopping and waiting for this PID cannot orphan a sleep
+            # that keeps a command substitution open after the command exits.
+            python3 -c '
+          import os
+          import signal
+          import sys
+          import time
+
+          seconds = float(sys.argv[1])
+          pgid = int(sys.argv[2])
+          marker = sys.argv[3]
+          time.sleep(seconds)
+          try:
+              os.killpg(pgid, 0)
+          except ProcessLookupError:
+              sys.exit(0)
+          open(marker, "a").close()
+          os.killpg(pgid, signal.SIGTERM)
+          time.sleep(2)
+          try:
+              os.killpg(pgid, signal.SIGKILL)
+          except ProcessLookupError:
+              pass
+          ' "$seconds" "$cmd_pid" "${RUNNER_TEMP}/.download_timed_out" >/dev/null 2>&1 &
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
+            # A command can exit cleanly after forking a child. Do not return
+            # while that child still owns this command's process group; keep
+            # the leader's status and output, but terminate/reap descendants.
+            if process_group_exists "$cmd_pid"; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if process_group_exists "$cmd_pid"; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+                local kill_deadline=$((SECONDS + 2))
+                while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                  sleep 0.05
+                done
+              fi
+            fi
             kill "$watchdog_pid" 2>/dev/null
             wait "$watchdog_pid" 2>/dev/null
             return "$exit_code"
@@ -809,6 +850,10 @@ jobs:
             echo "extracted=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # `find` may return a bare filename (e.g. "specscore"), which Bash
+          # only looks up on PATH when invoked later. Publish an absolute path
+          # so the following step executes the artifact we just extracted.
+          bin_path="$(cd "$(dirname "$bin_path")" && pwd -P)/$(basename "$bin_path")"
           chmod +x "$bin_path"
           {
             echo "archive=$archive"
@@ -847,20 +892,52 @@ jobs:
 
           run_with_timeout() {
             local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
+            set -m
             "$@" &
             local cmd_pid=$!
-            (
-              sleep "$seconds"
-              if kill -0 "$cmd_pid" 2>/dev/null; then
-                touch .smoke_timed_out
-                kill -TERM "$cmd_pid" 2>/dev/null
-                sleep 2
-                kill -KILL "$cmd_pid" 2>/dev/null
-              fi
-            ) &
+            set +m
+            python3 -c '
+          import os
+          import signal
+          import sys
+          import time
+
+          seconds = float(sys.argv[1])
+          pgid = int(sys.argv[2])
+          marker = sys.argv[3]
+          time.sleep(seconds)
+          try:
+              os.killpg(pgid, 0)
+          except ProcessLookupError:
+              sys.exit(0)
+          open(marker, "a").close()
+          os.killpg(pgid, signal.SIGTERM)
+          time.sleep(2)
+          try:
+              os.killpg(pgid, signal.SIGKILL)
+          except ProcessLookupError:
+              pass
+          ' "$seconds" "$cmd_pid" .smoke_timed_out >/dev/null 2>&1 &
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
+            if process_group_exists "$cmd_pid"; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if process_group_exists "$cmd_pid"; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+                local kill_deadline=$((SECONDS + 2))
+                while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                  sleep 0.05
+                done
+              fi
+            fi
             kill "$watchdog_pid" 2>/dev/null
             wait "$watchdog_pid" 2>/dev/null
             return "$exit_code"
@@ -1008,20 +1085,52 @@ jobs:
 
           run_with_timeout() {
             local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
+            set -m
             "$@" &
             local cmd_pid=$!
-            (
-              sleep "$seconds"
-              if kill -0 "$cmd_pid" 2>/dev/null; then
-                touch "${RUNNER_TEMP}/.brew_install_timed_out"
-                kill -TERM "$cmd_pid" 2>/dev/null
-                sleep 2
-                kill -KILL "$cmd_pid" 2>/dev/null
-              fi
-            ) &
+            set +m
+            python3 -c '
+          import os
+          import signal
+          import sys
+          import time
+
+          seconds = float(sys.argv[1])
+          pgid = int(sys.argv[2])
+          marker = sys.argv[3]
+          time.sleep(seconds)
+          try:
+              os.killpg(pgid, 0)
+          except ProcessLookupError:
+              sys.exit(0)
+          open(marker, "a").close()
+          os.killpg(pgid, signal.SIGTERM)
+          time.sleep(2)
+          try:
+              os.killpg(pgid, signal.SIGKILL)
+          except ProcessLookupError:
+              pass
+          ' "$seconds" "$cmd_pid" "${RUNNER_TEMP}/.brew_install_timed_out" >/dev/null 2>&1 &
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
+            if process_group_exists "$cmd_pid"; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if process_group_exists "$cmd_pid"; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+                local kill_deadline=$((SECONDS + 2))
+                while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                  sleep 0.05
+                done
+              fi
+            fi
             kill "$watchdog_pid" 2>/dev/null
             wait "$watchdog_pid" 2>/dev/null
             return "$exit_code"
@@ -1081,20 +1190,52 @@ jobs:
 
           run_with_timeout() {
             local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
+            set -m
             "$@" &
             local cmd_pid=$!
-            (
-              sleep "$seconds"
-              if kill -0 "$cmd_pid" 2>/dev/null; then
-                touch "${RUNNER_TEMP}/.smoke_cask_timed_out"
-                kill -TERM "$cmd_pid" 2>/dev/null
-                sleep 2
-                kill -KILL "$cmd_pid" 2>/dev/null
-              fi
-            ) &
+            set +m
+            python3 -c '
+          import os
+          import signal
+          import sys
+          import time
+
+          seconds = float(sys.argv[1])
+          pgid = int(sys.argv[2])
+          marker = sys.argv[3]
+          time.sleep(seconds)
+          try:
+              os.killpg(pgid, 0)
+          except ProcessLookupError:
+              sys.exit(0)
+          open(marker, "a").close()
+          os.killpg(pgid, signal.SIGTERM)
+          time.sleep(2)
+          try:
+              os.killpg(pgid, signal.SIGKILL)
+          except ProcessLookupError:
+              pass
+          ' "$seconds" "$cmd_pid" "${RUNNER_TEMP}/.smoke_cask_timed_out" >/dev/null 2>&1 &
             local watchdog_pid=$!
             wait "$cmd_pid" 2>/dev/null
             local exit_code=$?
+            if process_group_exists "$cmd_pid"; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if process_group_exists "$cmd_pid"; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+                local kill_deadline=$((SECONDS + 2))
+                while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                  sleep 0.05
+                done
+              fi
+            fi
             kill "$watchdog_pid" 2>/dev/null
             wait "$watchdog_pid" 2>/dev/null
             return "$exit_code"
