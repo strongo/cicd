@@ -2,6 +2,7 @@ package go_ci_action
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -74,6 +75,275 @@ func TestReleaseWorkflowExtractsAnAbsoluteRunnableBinaryPath(t *testing.T) {
 				t.Fatalf("binary output = %q", output)
 			}
 		})
+	}
+}
+
+func TestReleaseWorkflowHistoricalArtifactModeSelectsOnlyTheExactRequestedTag(t *testing.T) {
+	validateScript := releaseWorkflowRunBlock(t, "Validate existing artifact tag and release-mode inputs")
+	resolveTagScript := releaseWorkflowRunBlock(t, "Determine the artifact tag to verify")
+
+	for _, tc := range []struct {
+		name       string
+		env        map[string]string
+		wantStatus int
+		wantTag    string
+	}{
+		{
+			name: "valid plain semver tag",
+			env: map[string]string{
+				"EXISTING_ARTIFACT_TAG":    "v0.33.0",
+				"TAG_PREFIX":               "v",
+				"DEFAULT_BUMP":             "false",
+				"ALLOW_MAJOR_VERSION_BUMP": "false",
+				"GORELEASER_EXTRA_ARGS":    "",
+				"GITHUB_REF_TYPE":          "branch",
+			},
+			wantStatus: 0,
+			wantTag:    "v0.33.0",
+		},
+		{
+			name: "scoped prefix",
+			env: map[string]string{
+				"EXISTING_ARTIFACT_TAG":    "ingitdb/v0.33.0",
+				"TAG_PREFIX":               "ingitdb/v",
+				"DEFAULT_BUMP":             "false",
+				"ALLOW_MAJOR_VERSION_BUMP": "false",
+				"GORELEASER_EXTRA_ARGS":    "",
+				"GITHUB_REF_TYPE":          "branch",
+			},
+			wantStatus: 0,
+			wantTag:    "ingitdb/v0.33.0",
+		},
+		{
+			name: "rejects invalid semver",
+			env: map[string]string{
+				"EXISTING_ARTIFACT_TAG":    "v0.33",
+				"TAG_PREFIX":               "v",
+				"DEFAULT_BUMP":             "false",
+				"ALLOW_MAJOR_VERSION_BUMP": "false",
+				"GORELEASER_EXTRA_ARGS":    "",
+				"GITHUB_REF_TYPE":          "branch",
+			},
+			wantStatus: 1,
+		},
+		{
+			name: "rejects semver component with leading zero",
+			env: map[string]string{
+				"EXISTING_ARTIFACT_TAG":    "v01.2.3",
+				"TAG_PREFIX":               "v",
+				"DEFAULT_BUMP":             "false",
+				"ALLOW_MAJOR_VERSION_BUMP": "false",
+				"GORELEASER_EXTRA_ARGS":    "",
+				"GITHUB_REF_TYPE":          "branch",
+			},
+			wantStatus: 1,
+		},
+		{
+			name: "rejects release mode conflict",
+			env: map[string]string{
+				"EXISTING_ARTIFACT_TAG":    "v0.33.0",
+				"TAG_PREFIX":               "v",
+				"DEFAULT_BUMP":             "patch",
+				"ALLOW_MAJOR_VERSION_BUMP": "false",
+				"GORELEASER_EXTRA_ARGS":    "",
+				"GITHUB_REF_TYPE":          "branch",
+			},
+			wantStatus: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outputFile := filepath.Join(t.TempDir(), "github-output")
+			env := maps.Clone(tc.env)
+			env["GITHUB_OUTPUT"] = outputFile
+			env["ARTIFACT_SMOKE_TEST"] = "true"
+			env["ARTIFACT_SMOKE_TEST_PLATFORMS"] = `[{"runner":"ubuntu-latest","goos":"linux","goarch":"amd64"}]`
+			output, err := runBash(t.TempDir(), validateScript, env)
+			if tc.wantStatus == 0 {
+				if err != nil {
+					t.Fatalf("validate historical mode: %v\n%s", err, output)
+				}
+				if got := githubOutput(t, outputFile, "existing_artifact_tag"); got != tc.wantTag {
+					t.Fatalf("validated tag = %q, want %q", got, tc.wantTag)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("invalid historical mode succeeded:\n%s", output)
+			}
+		})
+	}
+
+	outputFile := filepath.Join(t.TempDir(), "github-output")
+	output, err := runBash(t.TempDir(), resolveTagScript, map[string]string{
+		"EXISTING_ARTIFACT_TAG": "v0.33.0",
+		"RELEASE_TAG":           "v99.99.99",
+		"GITHUB_REF_NAME":       "main",
+		"GITHUB_OUTPUT":         outputFile,
+	})
+	if err != nil {
+		t.Fatalf("resolve exact historical tag: %v\n%s", err, output)
+	}
+	if got := githubOutput(t, outputFile, "tag"); got != "v0.33.0" {
+		t.Fatalf("resolver fell back from requested historical tag: got %q, want %q", got, "v0.33.0")
+	}
+}
+
+func TestReleaseWorkflowHistoricalArtifactCannotPassWithoutExecutingAnArtifact(t *testing.T) {
+	downloadScript := localWorkflowScript(releaseWorkflowRunBlock(t, "Download published release asset"))
+	extractScript := localWorkflowScript(releaseWorkflowRunBlock(t, "Extract published archive"))
+
+	t.Run("missing GitHub release or archive", func(t *testing.T) {
+		workspace := t.TempDir()
+		fakeBin := filepath.Join(workspace, "fake-bin")
+		if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeExecutable(t, filepath.Join(fakeBin, "gh"), "#!/usr/bin/env bash\nexit 1\n")
+
+		baseEnv := map[string]string{
+			"PATH":              fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"RUNNER_TEMP":       workspace,
+			"GITHUB_REPOSITORY": "specscore/specscore-cli",
+			"TAG":               "v0.33.0",
+		}
+		assertHistoricalFailureAndNormalSkip(t, workspace, downloadScript, baseEnv, "asset_found")
+	})
+
+	for _, tc := range []struct {
+		name    string
+		prepare func(*testing.T, string)
+	}{
+		{
+			name: "downloaded set has no recognized archive",
+			prepare: func(t *testing.T, workspace string) {
+				if err := os.WriteFile(filepath.Join(workspace, "checksums.txt"), []byte("sidecar"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "archive extraction fails",
+			prepare: func(t *testing.T, workspace string) {
+				if err := os.WriteFile(filepath.Join(workspace, "specscore_linux_amd64.tar.gz"), []byte("not an archive"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "archive has no resolved binary",
+			prepare: func(t *testing.T, workspace string) {
+				readme := filepath.Join(workspace, "README.md")
+				if err := os.WriteFile(readme, []byte("no executable here"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				archive := exec.Command("tar", "-C", workspace, "-czf", filepath.Join(workspace, "specscore_linux_amd64.tar.gz"), "README.md")
+				if output, err := archive.CombinedOutput(); err != nil {
+					t.Fatalf("create archive without binary: %v\n%s", err, output)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			tc.prepare(t, workspace)
+			assertHistoricalFailureAndNormalSkip(t, workspace, extractScript, map[string]string{
+				"BINARY": "specscore",
+			}, "extracted")
+		})
+	}
+}
+
+func TestReleaseWorkflowSuccessfulHistoricalValidationInvokesExecutable(t *testing.T) {
+	workspace := t.TempDir()
+	payloadDir := filepath.Join(workspace, "payload")
+	if err := os.MkdirAll(payloadDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	invokedFile := filepath.Join(workspace, "invoked")
+	writeExecutable(t, filepath.Join(payloadDir, "specscore"), "#!/usr/bin/env bash\nprintf invoked > \"$INVOKED_FILE\"\nprintf '0.33.0\\n'\n")
+	archivePath := filepath.Join(workspace, "specscore_linux_amd64.tar.gz")
+	archive := exec.Command("tar", "-C", payloadDir, "-czf", archivePath, "specscore")
+	if output, err := archive.CombinedOutput(); err != nil {
+		t.Fatalf("create valid archive: %v\n%s", err, output)
+	}
+
+	extractOutput := filepath.Join(workspace, "extract-output")
+	extractScript := localWorkflowScript(releaseWorkflowRunBlock(t, "Extract published archive"))
+	if output, err := runBash(workspace, extractScript, map[string]string{
+		"BINARY":                         "specscore",
+		"GITHUB_OUTPUT":                  extractOutput,
+		"HISTORICAL_ARTIFACT_VALIDATION": "true",
+	}); err != nil {
+		t.Fatalf("extract valid historical artifact: %v\n%s", err, output)
+	}
+
+	runScript := localWorkflowScript(releaseWorkflowRunBlock(t, "'Layer 1: run the published binary (must exit within timeout)'"))
+	output, err := runBash(workspace, runScript, map[string]string{
+		"BIN_PATH":        githubOutput(t, extractOutput, "bin_path"),
+		"SMOKE_CMD":       "--version",
+		"TIMEOUT_SECONDS": "2",
+		"INVOKED_FILE":    invokedFile,
+	})
+	if err != nil {
+		t.Fatalf("run valid historical artifact: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(invokedFile); err != nil {
+		t.Fatalf("successful historical validation did not invoke the executable: %v\n%s", err, output)
+	}
+}
+
+func assertHistoricalFailureAndNormalSkip(t *testing.T, workspace, script string, baseEnv map[string]string, outputKey string) {
+	t.Helper()
+	for _, tc := range []struct {
+		name       string
+		historical string
+		wantError  bool
+	}{
+		{name: "historical mode fails", historical: "true", wantError: true},
+		{name: "normal release mode keeps warning skip", historical: "false", wantError: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outputFile := filepath.Join(workspace, strings.ReplaceAll(tc.name, " ", "-")+"-output")
+			env := maps.Clone(baseEnv)
+			env["GITHUB_OUTPUT"] = outputFile
+			env["HISTORICAL_ARTIFACT_VALIDATION"] = tc.historical
+			output, err := runBash(workspace, script, env)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("historical could-not-test path passed:\n%s", output)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normal release could-not-test path no longer soft-skips: %v\n%s", err, output)
+			}
+			if got := githubOutput(t, outputFile, outputKey); got != "false" {
+				t.Fatalf("normal release %s = %q, want false", outputKey, got)
+			}
+		})
+	}
+}
+
+func localWorkflowScript(script string) string {
+	replacer := strings.NewReplacer(
+		"${{ matrix.goos }}", "linux",
+		"${{ matrix.goarch }}", "amd64",
+	)
+	return replacer.Replace(script)
+}
+
+func TestReleaseWorkflowHistoricalArtifactModeSkipsPublishingAndHomebrew(t *testing.T) {
+	workflow := readReleaseWorkflow(t)
+	for _, want := range []string{
+		"if: ${{ needs.validate_release_mode.result == 'success' && inputs.existing_artifact_tag == '' }}",
+		"${{ always() && !cancelled() &&",
+		"inputs.existing_artifact_tag != '' ||",
+		"inputs.existing_artifact_tag == '' &&",
+		"ref: ${{ steps.release_tag.outputs.tag }}",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("workflow does not preserve historical artifact safety contract %q", want)
+		}
 	}
 }
 
