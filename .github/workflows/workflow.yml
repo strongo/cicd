@@ -67,6 +67,17 @@ on:
         type: number
         required: false
         description: 'Minimum test coverage percentage required to pass the build'
+      coverpkg:
+        type: string
+        required: false
+        default: ''
+        description: >-
+          Value forwarded to `go test -coverpkg` in the coverage step, e.g. "./...".
+          Attributes coverage across package boundaries — a conformance suite in one
+          package (e.g. a fake-repository test harness) driving code in another
+          package — instead of crediting a statement only when its own test lives in
+          the same package directory. Leave empty (the default) to preserve today's
+          per-package attribution unchanged.
       run-goreleaser:
         type: boolean
         description: 'Run GoReleaser'
@@ -343,7 +354,7 @@ jobs:
 
       - if: ${{ (inputs.code_coverage && github.ref == 'refs/heads/main') || inputs.min_test_coverage_percent != '' }}
         name: Run tests with coverage
-        run: go test ./... -coverprofile=profile.cov -count=1
+        run: go test ./... -coverprofile=profile.cov -count=1 ${{ inputs.coverpkg && format('-coverpkg={0}', inputs.coverpkg) || '' }}
         shell: bash
         env:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
@@ -363,7 +374,12 @@ jobs:
         name: Check test coverage
         shell: bash
         run: |
-          total_coverage=$(go tool cover -func=profile.cov | grep total | awk '{print $3}' | sed 's/%//')
+          # Anchored on column 1 rather than `grep total`: a function whose name
+          # merely contains "total" (e.g. totalsByParticipant) would otherwise
+          # produce two matching lines and make `$3` read the wrong one, failing
+          # the build for the wrong reason. `go tool cover -func` always labels
+          # its single summary row "total:" in the first column.
+          total_coverage=$(go tool cover -func=profile.cov | awk '$1 == "total:" {print $3}' | sed 's/%//')
           echo "Total coverage: $total_coverage%"
           awk -v t="$total_coverage" -v m="${{ inputs.min_test_coverage_percent }}" 'BEGIN { if (t < m) { print "Coverage " t "% is below required " m "%"; exit 1 } }'
 
