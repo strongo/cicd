@@ -249,7 +249,19 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27'
+          # PINNED TOGETHER WITH golangci-lint BELOW -- these two versions are
+          # not independent. golangci-lint must be built with a Go at least as
+          # new as the toolchain it analyses, or it cannot typecheck the
+          # standard library ("unknown field rfd in struct literal of type
+          # splicePipe" from internal/poll, on v2.12.2 against Go 1.27).
+          #
+          # Renovate raised this to 1.27 in 4576f10 on 2026-08-20. Combined
+          # with golangci v2.13.0 landing the same morning, that turned the
+          # whole Go fleet red. Back to 1.26, which is also what the consumer
+          # modules actually declare (sneat-go go.mod: 1.26.1,
+          # sneat-core-modules: 1.26) -- linting them under 1.27 was ahead of
+          # the code being linted. Raise both versions together, deliberately.
+          go-version: '1.26'
           cache: false
 
       - uses: ./
