@@ -222,7 +222,27 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          #          version: v2.0
+          # PINNED. Without this the action resolves "latest" at run time, so a
+          # golangci-lint release turns every Go repo in the fleet red at once
+          # with no change on our side. That happened on 2026-08-20: v2.13.0
+          # superseded v2.12.2 and broke two repos in different ways, both
+          # traced to the staticcheck release candidate it bundles
+          # (honnef.co/go/tools v0.8.0-rc.1):
+          #
+          #   sneat-go            the nilness analyzer PANICS -- "internal
+          #                       error: unhandled builtin recover" -- while
+          #                       analysing the third-party sentry package, and
+          #                       the run then times out. No change to our own
+          #                       code can fix an analyzer crash.
+          #   sneat-core-modules  new SA4023 findings in auth/api4auth. True
+          #                       positives, but on long-dead Facebook sign-in
+          #                       code whose only non-panicking exits already
+          #                       return a non-nil error.
+          #
+          # A release candidate analyzer is not a thing to gate every merge on.
+          # Bump this deliberately once v2.13.x ships a stable staticcheck, and
+          # expect to fix the SA4023 findings as part of that bump.
+          version: v2.12.2
 
           args: --timeout=${{ inputs.lint-timeout }}
 
