@@ -163,7 +163,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           # Cache restore/save is owned explicitly below. Letting setup-go save
           # from both parallel jobs causes a cold-cache reservation race.
           cache: false
@@ -261,7 +261,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           # The Build & test job is the sole writer for the shared Go cache;
           # see the matching restore in Lint above.
           cache: false
