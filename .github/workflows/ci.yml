@@ -8,6 +8,7 @@ on:
       - 'v*.*.*' # Push events to semantic-version tags, i.e. v20.15.10
     paths:
       - '.github/workflows/**.yml'
+      - '.gitignore'
       - 'src/**'
       - 'go.*'
       - '*.go'
@@ -17,6 +18,7 @@ on:
       - '**'
     paths:
       - '.github/workflows/**.yml'
+      - '.gitignore'
       - 'src/**'
       - 'go.*'
       - '*.go'
