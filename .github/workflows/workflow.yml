@@ -175,7 +175,7 @@ jobs:
           # modules actually declare (sneat-go go.mod: 1.26.1,
           # sneat-core-modules: 1.26) -- linting them under 1.27 was ahead of
           # the code being linted. Raise both versions together, deliberately.
-          go-version: '1.27'
+          go-version: '1.27.0'
           # Cache restore/save is owned explicitly below. Letting setup-go save
           # from both parallel jobs causes a cold-cache reservation race.
           cache: false
@@ -305,7 +305,7 @@ jobs:
           # modules actually declare (sneat-go go.mod: 1.26.1,
           # sneat-core-modules: 1.26) -- linting them under 1.27 was ahead of
           # the code being linted. Raise both versions together, deliberately.
-          go-version: '1.27'
+          go-version: '1.27.0'
           # The Build & test job is the sole writer for the shared Go cache;
           # see the matching restore in Lint above.
           cache: false
