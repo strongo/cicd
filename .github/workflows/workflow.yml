@@ -91,7 +91,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.26'
+          go-version: '1.27.0'
           cache-dependency-path: ${{ inputs.working_directory }}/go.sum
 
       - run: go get ./...
@@ -143,7 +143,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.26'
+          go-version: '1.27.0'
           cache-dependency-path: ${{ inputs.working_directory }}/go.sum
 
       - if: ${{ inputs.install-firebase-tools }}
@@ -226,7 +226,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.26'
+          go-version: '1.27.0'
           cache-dependency-path: ${{ inputs.working_directory }}/go.sum
 
       - name: Set GitHub access token for GOPRIVATE
