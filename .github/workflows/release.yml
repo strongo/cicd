@@ -376,6 +376,51 @@ jobs:
               'commit_parsers = [{ message = "^(chore|ci|docs|refactor)(\\(.+\\))?:", skip = true }]'
           } > "${RUNNER_TEMP}/cicd-git-cliff.toml"
 
+      # Resolve the previous release tag once, before computing the bump, and
+      # share it with both this step and the resolver below. git-cliff's own
+      # tag auto-detection for `--bumped-version` has a gap: when a real
+      # (non-squash) merge lands on main, the commits it introduces are
+      # reachable from HEAD only through the merge commit's second parent,
+      # and git-cliff's undirected auto-range silently drops them from the
+      # bump calculation -- reporting no bump at all for a landed feat/fix --
+      # even though `git-cliff --unreleased` (used to render the changelog
+      # body) walks the same history and classifies those very commits
+      # correctly. Empirically verified against sneat-dev/wb#160: commit
+      # 298b9067c7686a4258b0e59d44d1db5a0e82d50e (a merge of a feat+fix PR)
+      # computes "nothing to bump" with an auto-detected range, and the
+      # correct v0.47.0 with an explicit `<previous-tag>..HEAD` range.
+      # Passing that explicit range closes the gap; squash-merge and
+      # direct-push landings are single-parent-only and unaffected either
+      # way.
+      - name: Resolve previous release tag
+        id: previous_tag
+        if: ${{ github.ref_type != 'tag' }}
+        env:
+          PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          latest_tag=""
+          while IFS= read -r candidate_tag; do
+            candidate_version="${candidate_tag#"$PREFIX"}"
+            if [[ "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              latest_tag="$candidate_tag"
+              break
+            fi
+          done < <(git tag --list "${PREFIX}*" --sort=-v:refname)
+          previous_version="${latest_tag#"$PREFIX"}"
+          if [ -z "$latest_tag" ] || ! [[ "$previous_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            previous_version="0.0.0"
+            latest_tag=""
+          fi
+          # No previous tag means the very first release: leave range empty
+          # so git-cliff falls back to processing full history, same as
+          # before this change.
+          range=""
+          if [ -n "$latest_tag" ]; then
+            range="${latest_tag}..HEAD"
+          fi
+          printf 'latest_tag=%s\nprevious_version=%s\nrange=%s\n' "$latest_tag" "$previous_version" "$range" >> "$GITHUB_OUTPUT"
+
       # The action prints the proposed tag (with the configured prefix) to its
       # `content` output; the resolver below converts it to bare SemVer.
       # A breaking change under v0 is a minor bump. We push with plain git so
@@ -390,6 +435,7 @@ jobs:
           args: >-
             --bumped-version
             --tag-pattern ^${{ inputs.tag_prefix }}[0-9]+\.[0-9]+\.[0-9]+$
+            ${{ steps.previous_tag.outputs.range }}
 
       # git-cliff-action unpacks its binary into ./git-cliff/ inside the
       # caller's checkout and never removes it. Any later step that inspects
@@ -405,6 +451,10 @@ jobs:
         run: rm -rf git-cliff
 
       # Preserve default_bump for callers that explicitly request a release.
+      # previous_version/latest_tag come from the "Resolve previous release
+      # tag" step above rather than being rescanned here, so the range fed to
+      # git-cliff and the baseline this step compares against can never
+      # disagree.
       - name: Resolve configured default bump
         id: resolved_bump
         if: ${{ github.ref == 'refs/heads/main' && github.ref_type != 'tag' }}
@@ -412,6 +462,8 @@ jobs:
           PROPOSED_VERSION: ${{ steps.bump_dry.outputs.content }}
           PREFIX: ${{ inputs.tag_prefix }}
           DEFAULT_BUMP: ${{ inputs.default_bump }}
+          LATEST_TAG: ${{ steps.previous_tag.outputs.latest_tag }}
+          PREVIOUS_VERSION: ${{ steps.previous_tag.outputs.previous_version }}
         run: |
           set -euo pipefail
           version_is_greater() {
@@ -420,19 +472,8 @@ jobs:
             [ "$candidate" != "$baseline" ] &&
               [ "$(printf '%s\n%s\n' "$baseline" "$candidate" | sort -V | tail -n 1)" = "$candidate" ]
           }
-          latest_tag=""
-          while IFS= read -r candidate_tag; do
-            candidate_version="${candidate_tag#"$PREFIX"}"
-            if [[ "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              latest_tag="$candidate_tag"
-              break
-            fi
-          done < <(git tag --list "${PREFIX}*" --sort=-v:refname)
-          previous_version="${latest_tag#"$PREFIX"}"
-          if [ -z "$latest_tag" ] || ! [[ "$previous_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            previous_version="0.0.0"
-            latest_tag=""
-          fi
+          latest_tag="$LATEST_TAG"
+          previous_version="$PREVIOUS_VERSION"
           proposed_tag="$(printf '%s' "$PROPOSED_VERSION" | tr -d '\r\n')"
           next_version="${proposed_tag#"$PREFIX"}"
           if [[ "$next_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && version_is_greater "$next_version" "$previous_version"; then

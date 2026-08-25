@@ -66,6 +66,30 @@ jobs:
           make_fixture prefixed-first 'fix: initial release' ''
           make_fixture shallow-source 'fix: release after a shallow checkout'
 
+          # A real (non-squash) merge commit, shaped like the GitHub "Merge
+          # pull request" commits release.yml's callers land day to day
+          # (sneat-dev/wb#160): base tagged v0.1.0, a side branch carrying the
+          # conventional commit, merged back with --no-ff so the merge
+          # commit's own subject stays non-conventional and the introduced
+          # commit is reachable from main only via the merge's second parent.
+          make_merge_fixture() {
+            local name="$1"
+            local message="$2"
+            local repository="$fixture_root/$name"
+            git init --initial-branch=main "$repository"
+            git -C "$repository" config user.email 'release-test@example.invalid'
+            git -C "$repository" config user.name 'Release Test'
+            git -C "$repository" commit --allow-empty -m 'chore: bootstrap'
+            git -C "$repository" tag v0.1.0
+            git -C "$repository" checkout -q -b side
+            git -C "$repository" commit --allow-empty -m "$message"
+            git -C "$repository" checkout -q main
+            git -C "$repository" merge --no-ff -q -m "Merge pull request #1 from side" side
+          }
+
+          make_merge_fixture merge-feat 'feat(cli): add adopt command'
+          make_merge_fixture merge-chore 'docs(cli): note the adopt command'
+
           git clone --depth 1 "file://${fixture_root}/shallow-source" "$fixture_root/shallow-clone"
           test "$(git -C "$fixture_root/shallow-clone" rev-parse --is-shallow-repository)" = 'true'
           test -z "$(git -C "$fixture_root/shallow-clone" tag --list 'v*')"
@@ -162,6 +186,69 @@ jobs:
         shell: bash
         env:
           ACTUAL: ${{ steps.docs_only.outputs.content }}
+        run: test "$ACTUAL" = 'v0.1.0'
+
+      # sneat-dev/wb#160: a real (non-squash) merge of PR #159 to sneat-dev/wb
+      # (commit 298b9067c7686a4258b0e59d44d1db5a0e82d50e) landed a feat, the
+      # shared release workflow ran and succeeded, and cut no tag. Against
+      # that repository's actual ~320-commit/~100-tag history, git-cliff's
+      # own auto-detected range for --bumped-version silently dropped the
+      # commits the merge introduced and reported "nothing to bump" -- even
+      # though `git-cliff --unreleased` (used to render the changelog body)
+      # walked the same history and classified those same commits correctly.
+      # The gap did not reproduce against small isolated fixtures of the same
+      # merge topology (tried up to 30 synthetic prior releases), so it is
+      # not pinned here as its own fixture -- it is undocumented git-cliff
+      # behavior that appears tied to history scale/shape in ways this
+      # module cannot cheaply reconstruct. What IS pinned below is the actual
+      # fix release.yml now relies on unconditionally: an EXPLICIT
+      # `<previous-tag>..HEAD` range, which computed the correct v0.47.0
+      # against the real repository and is asserted here against the same
+      # merge topology at fixture scale.
+      - name: Compute a merge-introduced feature version with an explicit range
+        id: merge_feat_explicit
+        uses: orhun/git-cliff-action@v4.8.0
+        with:
+          version: v2.13.1
+          config: ${{ runner.temp }}/cicd-git-cliff.toml
+          args: >-
+            --repository ${{ runner.temp }}/release-calculator-fixtures/merge-feat
+            --bumped-version
+            --tag-pattern ^v[0-9]+\.[0-9]+\.[0-9]+$
+            v0.1.0..HEAD
+
+      - name: Remove git-cliff working directory
+        if: ${{ always() }}
+        shell: bash
+        run: rm -rf git-cliff
+
+      - name: Assert the explicit range correctly bumps a merge-introduced feature
+        shell: bash
+        env:
+          ACTUAL: ${{ steps.merge_feat_explicit.outputs.content }}
+        run: test "$ACTUAL" = 'v0.2.0'
+
+      - name: Compute a merge-introduced chore-only version with an explicit range
+        id: merge_chore_explicit
+        uses: orhun/git-cliff-action@v4.8.0
+        with:
+          version: v2.13.1
+          config: ${{ runner.temp }}/cicd-git-cliff.toml
+          args: >-
+            --repository ${{ runner.temp }}/release-calculator-fixtures/merge-chore
+            --bumped-version
+            --tag-pattern ^v[0-9]+\.[0-9]+\.[0-9]+$
+            v0.1.0..HEAD
+
+      - name: Remove git-cliff working directory
+        if: ${{ always() }}
+        shell: bash
+        run: rm -rf git-cliff
+
+      - name: Assert a merge introducing only docs/chores still cuts nothing
+        shell: bash
+        env:
+          ACTUAL: ${{ steps.merge_chore_explicit.outputs.content }}
         run: test "$ACTUAL" = 'v0.1.0'
 
       - name: Compute a first prefixed version

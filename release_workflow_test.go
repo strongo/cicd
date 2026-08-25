@@ -147,6 +147,222 @@ esac
 	}
 }
 
+// TestReleaseWorkflowResolvesPreviousReleaseTag exercises the "Resolve
+// previous release tag" step in isolation. It runs before "Compute next
+// version from Git history" so that step can pass git-cliff an EXPLICIT
+// <previous-tag>..HEAD range: git-cliff's own auto-detected range for
+// --bumped-version silently drops conventional commits that reach HEAD only
+// through a merge commit's second parent (sneat-dev/wb#160, empirically
+// reproduced against sneat-dev/wb commit
+// 298b9067c7686a4258b0e59d44d1db5a0e82d50e), even though the same commits
+// are correctly found and classified by `git-cliff --unreleased`. An
+// explicit range closes that gap.
+func TestReleaseWorkflowResolvesPreviousReleaseTag(t *testing.T) {
+	script := releaseWorkflowRunBlock(t, "Resolve previous release tag")
+
+	t.Run("no previous tag yet", func(t *testing.T) {
+		repository := initGitRepo(t)
+		outputFile := filepath.Join(t.TempDir(), "github-output")
+		output, err := runBash(repository, script, map[string]string{
+			"PREFIX":        "v",
+			"GITHUB_OUTPUT": outputFile,
+		})
+		if err != nil {
+			t.Fatalf("resolve previous release tag: %v\n%s", err, output)
+		}
+		if got := githubOutput(t, outputFile, "latest_tag"); got != "" {
+			t.Fatalf("latest_tag = %q, want empty", got)
+		}
+		if got := githubOutput(t, outputFile, "previous_version"); got != "0.0.0" {
+			t.Fatalf("previous_version = %q, want 0.0.0", got)
+		}
+		// No previous tag means the first release: git-cliff must fall back
+		// to processing full history, same as before this change, so the
+		// range passed to it must be empty rather than a bogus "..HEAD".
+		if got := githubOutput(t, outputFile, "range"); got != "" {
+			t.Fatalf("range = %q, want empty for the initial release", got)
+		}
+	})
+
+	t.Run("picks the highest matching tag and builds an explicit range", func(t *testing.T) {
+		repository := initGitRepo(t, "v0.1.0", "v0.2.0", "v0.10.0")
+		outputFile := filepath.Join(t.TempDir(), "github-output")
+		output, err := runBash(repository, script, map[string]string{
+			"PREFIX":        "v",
+			"GITHUB_OUTPUT": outputFile,
+		})
+		if err != nil {
+			t.Fatalf("resolve previous release tag: %v\n%s", err, output)
+		}
+		// --sort=-v:refname is numeric-aware: v0.10.0 outranks v0.2.0.
+		if got := githubOutput(t, outputFile, "latest_tag"); got != "v0.10.0" {
+			t.Fatalf("latest_tag = %q, want v0.10.0", got)
+		}
+		if got := githubOutput(t, outputFile, "previous_version"); got != "0.10.0" {
+			t.Fatalf("previous_version = %q, want 0.10.0", got)
+		}
+		if got := githubOutput(t, outputFile, "range"); got != "v0.10.0..HEAD" {
+			t.Fatalf("range = %q, want v0.10.0..HEAD", got)
+		}
+	})
+
+	t.Run("ignores tags outside the configured prefix", func(t *testing.T) {
+		repository := initGitRepo(t, "backend/v0.9.0")
+		outputFile := filepath.Join(t.TempDir(), "github-output")
+		output, err := runBash(repository, script, map[string]string{
+			"PREFIX":        "v",
+			"GITHUB_OUTPUT": outputFile,
+		})
+		if err != nil {
+			t.Fatalf("resolve previous release tag: %v\n%s", err, output)
+		}
+		if got := githubOutput(t, outputFile, "latest_tag"); got != "" {
+			t.Fatalf("latest_tag = %q, want empty (backend/v0.9.0 does not match prefix %q)", got, "v")
+		}
+	})
+
+	t.Run("scoped prefix with a slash", func(t *testing.T) {
+		repository := initGitRepo(t, "backend/v0.5.0")
+		outputFile := filepath.Join(t.TempDir(), "github-output")
+		output, err := runBash(repository, script, map[string]string{
+			"PREFIX":        "backend/v",
+			"GITHUB_OUTPUT": outputFile,
+		})
+		if err != nil {
+			t.Fatalf("resolve previous release tag: %v\n%s", err, output)
+		}
+		if got := githubOutput(t, outputFile, "latest_tag"); got != "backend/v0.5.0" {
+			t.Fatalf("latest_tag = %q, want backend/v0.5.0", got)
+		}
+		if got := githubOutput(t, outputFile, "range"); got != "backend/v0.5.0..HEAD" {
+			t.Fatalf("range = %q, want backend/v0.5.0..HEAD", got)
+		}
+	})
+}
+
+// TestReleaseWorkflowResolvesConfiguredDefaultBumpFromSharedPreviousTag locks
+// in the "Resolve configured default bump" step's post-refactor contract: it
+// now consumes LATEST_TAG/PREVIOUS_VERSION from the "Resolve previous release
+// tag" step's outputs instead of rescanning `git tag` itself, so the range fed
+// to git-cliff and the baseline this step compares against can never
+// disagree. A useful side effect is that the step is now a pure function of
+// its environment: these subtests run with no git repository at all.
+func TestReleaseWorkflowResolvesConfiguredDefaultBumpFromSharedPreviousTag(t *testing.T) {
+	script := releaseWorkflowRunBlock(t, "Resolve configured default bump")
+	workspace := t.TempDir() // deliberately not a git repository
+
+	t.Run("accepts a valid greater proposed version", func(t *testing.T) {
+		outputFile := filepath.Join(t.TempDir(), "github-output")
+		output, err := runBash(workspace, script, map[string]string{
+			"PROPOSED_VERSION": "v0.34.0",
+			"PREFIX":           "v",
+			"DEFAULT_BUMP":     "false",
+			"LATEST_TAG":       "v0.33.2",
+			"PREVIOUS_VERSION": "0.33.2",
+			"GITHUB_OUTPUT":    outputFile,
+		})
+		if err != nil {
+			t.Fatalf("resolve configured default bump: %v\n%s", err, output)
+		}
+		if got := githubOutput(t, outputFile, "new_version"); got != "0.34.0" {
+			t.Fatalf("new_version = %q, want 0.34.0", got)
+		}
+		if got := githubOutput(t, outputFile, "new_tag"); got != "v0.34.0" {
+			t.Fatalf("new_tag = %q, want v0.34.0", got)
+		}
+		if got := githubOutput(t, outputFile, "previous_tag"); got != "v0.33.2" {
+			t.Fatalf("previous_tag = %q, want v0.33.2", got)
+		}
+	})
+
+	t.Run("falls back to default_bump when git-cliff proposed nothing", func(t *testing.T) {
+		outputFile := filepath.Join(t.TempDir(), "github-output")
+		output, err := runBash(workspace, script, map[string]string{
+			"PROPOSED_VERSION": "v0.33.2", // unchanged: git-cliff found nothing to bump
+			"PREFIX":           "v",
+			"DEFAULT_BUMP":     "patch",
+			"LATEST_TAG":       "v0.33.2",
+			"PREVIOUS_VERSION": "0.33.2",
+			"GITHUB_OUTPUT":    outputFile,
+		})
+		if err != nil {
+			t.Fatalf("resolve configured default bump: %v\n%s", err, output)
+		}
+		if got := githubOutput(t, outputFile, "new_version"); got != "0.33.3" {
+			t.Fatalf("new_version = %q, want 0.33.3", got)
+		}
+	})
+
+	t.Run("stays silent when default_bump is disabled and nothing was proposed", func(t *testing.T) {
+		outputFile := filepath.Join(t.TempDir(), "github-output")
+		if err := os.WriteFile(outputFile, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		output, err := runBash(workspace, script, map[string]string{
+			"PROPOSED_VERSION": "v0.33.2",
+			"PREFIX":           "v",
+			"DEFAULT_BUMP":     "false",
+			"LATEST_TAG":       "v0.33.2",
+			"PREVIOUS_VERSION": "0.33.2",
+			"GITHUB_OUTPUT":    outputFile,
+		})
+		if err != nil {
+			t.Fatalf("resolve configured default bump: %v\n%s", err, output)
+		}
+		content, err := os.ReadFile(outputFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(content) != 0 {
+			t.Fatalf("GITHUB_OUTPUT = %q, want no output written", content)
+		}
+	})
+
+	t.Run("handles the very first release with no previous tag", func(t *testing.T) {
+		outputFile := filepath.Join(t.TempDir(), "github-output")
+		output, err := runBash(workspace, script, map[string]string{
+			"PROPOSED_VERSION": "v0.1.0",
+			"PREFIX":           "v",
+			"DEFAULT_BUMP":     "false",
+			"LATEST_TAG":       "",
+			"PREVIOUS_VERSION": "0.0.0",
+			"GITHUB_OUTPUT":    outputFile,
+		})
+		if err != nil {
+			t.Fatalf("resolve configured default bump: %v\n%s", err, output)
+		}
+		if got := githubOutput(t, outputFile, "new_version"); got != "0.1.0" {
+			t.Fatalf("new_version = %q, want 0.1.0", got)
+		}
+		if got := githubOutput(t, outputFile, "previous_tag"); got != "" {
+			t.Fatalf("previous_tag = %q, want empty", got)
+		}
+	})
+}
+
+// initGitRepo creates a git repository with a single commit and the given
+// tags, all pointed at that commit, and returns its path.
+func initGitRepo(t *testing.T, tags ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+		}
+	}
+	run("init", "--initial-branch=main", "-q")
+	run("config", "user.email", "release-test@example.invalid")
+	run("config", "user.name", "Release Test")
+	run("commit", "--allow-empty", "-q", "-m", "chore: bootstrap")
+	for _, tag := range tags {
+		run("tag", tag)
+	}
+	return dir
+}
+
 func TestPublishedArtifactWorkflowValidatesTheExactRequestedTag(t *testing.T) {
 	validateScript := publishedArtifactWorkflowRunBlock(t, "Validate exact release tag and platforms")
 
