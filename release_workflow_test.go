@@ -80,6 +80,49 @@ func TestReleaseWorkflowExtractsAnAbsoluteRunnableBinaryPath(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflowUsesExactGoReleaserQuillPreflight(t *testing.T) {
+	workflow := readReleaseWorkflow(t)
+	const quillVersion = "v0.0.0-20260630015114-8310f3e9a321"
+	if strings.Contains(workflow, "anchore/quill") {
+		t.Fatal("macOS signing preflight must not download the unrelated anchore/quill tool")
+	}
+	for _, required := range []string{
+		"  macos_signing_preflight:\n",
+		"if: ${{ inputs.require_notarized_macos }}",
+		"runs-on: macos-latest",
+		"go-version: '1.27'",
+		"version: v2.18.0",
+		"go mod edit -go=1.27 -require=github.com/goreleaser/quill@\"${QUILL_VERSION}\"",
+		"GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build",
+		"github.com/goreleaser/quill/quill",
+		"github.com/goreleaser/quill/quill/pki/load",
+		"QUILL_VERSION: " + quillVersion,
+		"NewSigningConfigFromP12",
+		"WithTimestampServer(\"http://timestamp.apple.com/ts01\")",
+		"quill.Notarize",
+		"codesign --verify --deep --strict --verbose=4",
+		"spctl -a -t install -vv",
+		"source=Notarized Developer ID",
+		"needs: macos_signing_preflight",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("release workflow is missing exact GoReleaser/quill preflight contract %q", required)
+		}
+	}
+	preflightIndex := strings.Index(workflow, "  macos_signing_preflight:\n")
+	tagGuardIndex := strings.Index(workflow, "Guard signing secret policy before tagging")
+	tagIndex := strings.Index(workflow, "Determine and push guarded tag")
+	if tagGuardIndex < 0 || tagIndex < 0 || tagGuardIndex > tagIndex {
+		t.Fatal("signing secret guard must run before the guarded tag step")
+	}
+	if preflightIndex > tagIndex {
+		t.Fatal("macOS signing preflight must be declared before the guarded tag step")
+	}
+	if !strings.Contains(workflow, `if [ -n "$SIGN_P12" ] && [ "${{ inputs.require_notarized_macos }}" != "true" ]; then`) {
+		t.Fatal("release workflow must reject a signing secret when notarization proof is disabled")
+	}
+}
+
 func TestReleaseWorkflowReleasesTheLocallyCreatedTagWithoutRefetching(t *testing.T) {
 	workflow := readReleaseWorkflow(t)
 	if !strings.Contains(workflow, "uses: actions/checkout@v7\n        with:\n          fetch-depth: 0") {

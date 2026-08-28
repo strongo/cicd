@@ -298,8 +298,130 @@ on:
 #      - 'v*.*.*'   # triggers only on tags like v1.26.0
 
 jobs:
+  # Reproduce the exact GoReleaser v2.18.0 Quill signing path before any tag
+  # or release is published. This is opt-in with require_notarized_macos so
+  # unsigned consumers retain the existing release path and do not pay for a
+  # macOS runner. The preflight intentionally uses the same module, P12
+  # loader, signing configuration, and timestamp endpoint as GoReleaser's
+  # internal macOS notifier; it does not infer a root cause from a passing
+  # or failing probe.
+  macos_signing_preflight:
+    name: macOS signing preflight
+    if: ${{ inputs.require_notarized_macos }}
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # The preflight reproduces the Go 1.27 signing path even when a
+          # caller's release build still uses an older Go version.
+          go-version: '1.27'
+
+      - name: Validate signing secrets
+        shell: bash
+        env:
+          SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARIZE_ISSUER_ID }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
+          NOTARY_KEY: ${{ secrets.NOTARIZE_KEY }}
+        run: |
+          set -euo pipefail
+          for name in SIGN_P12 SIGN_PASSWORD NOTARY_ISSUER_ID NOTARY_KEY_ID NOTARY_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::require_notarized_macos=true requires $name before release publication."
+              exit 1
+            fi
+          done
+
+      - name: Build and sign with GoReleaser's pinned Quill module
+        shell: bash
+        env:
+          QUILL_VERSION: v0.0.0-20260630015114-8310f3e9a321
+          SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARIZE_ISSUER_ID }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
+          NOTARY_KEY: ${{ secrets.NOTARIZE_KEY }}
+        run: |
+          set -euo pipefail
+          preflight_dir="${RUNNER_TEMP}/cicd-macos-signing-preflight"
+          mkdir -p "$preflight_dir"
+          (cd "$preflight_dir" && go mod init cicd-macos-signing-preflight && go mod edit -go=1.27 -require=github.com/goreleaser/quill@"${QUILL_VERSION}")
+          mkdir -p "$preflight_dir/target" "$preflight_dir/signer"
+          printf '%s\n' \
+            'package main' \
+            '' \
+            'import "fmt"' \
+            '' \
+            'func main() { fmt.Println("cicd macOS signing preflight") }' \
+            > "$preflight_dir/target/main.go"
+          printf '%s\n' \
+            'package main' \
+            '' \
+            'import (' \
+            '  "fmt"' \
+            '  "os"' \
+            '  "time"' \
+            '' \
+            '  "github.com/goreleaser/quill/quill"' \
+            '  "github.com/goreleaser/quill/quill/notary"' \
+            '  "github.com/goreleaser/quill/quill/pki/load"' \
+            ')' \
+            '' \
+            'func main() {' \
+            '  binaryPath := os.Args[1]' \
+            '  p12, err := load.P12(os.Getenv("MACOS_SIGN_P12_PATH"), os.Getenv("MACOS_SIGN_PASSWORD"))' \
+            '  if err != nil { panic(err) }' \
+            '  signingConfig, err := quill.NewSigningConfigFromP12(binaryPath, *p12, true)' \
+            '  if err != nil { panic(err) }' \
+            '  signingConfig = signingConfig.WithTimestampServer("http://timestamp.apple.com/ts01")' \
+            '  if err := quill.Sign(*signingConfig); err != nil { panic(err) }' \
+            '  notarizeConfig := quill.NewNotarizeConfig(os.Getenv("NOTARIZE_ISSUER_ID"), os.Getenv("NOTARIZE_KEY_ID"), os.Getenv("NOTARIZE_KEY")).WithStatusConfig(notary.StatusConfig{Timeout: 20 * time.Minute, Poll: 10 * time.Second, Wait: true})' \
+            '  status, err := quill.Notarize(binaryPath, *notarizeConfig)' \
+            '  if err != nil { panic(err) }' \
+            '  if status != notary.AcceptedStatus { panic(fmt.Sprintf("notarization status = %s", status)) }' \
+            '}' \
+            > "$preflight_dir/signer/main.go"
+          printf '%s' "$SIGN_P12" | base64 --decode > "$preflight_dir/signing.p12" 2>/dev/null || printf '%s' "$SIGN_P12" | base64 -D > "$preflight_dir/signing.p12"
+          export MACOS_SIGN_P12_PATH="$preflight_dir/signing.p12"
+          export MACOS_SIGN_PASSWORD="$SIGN_PASSWORD"
+          export NOTARIZE_ISSUER_ID NOTARIZE_KEY_ID NOTARIZE_KEY
+          (cd "$preflight_dir" && go mod download github.com/goreleaser/quill@"$QUILL_VERSION" && GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o "$preflight_dir/preflight-darwin-arm64" ./target && go build -o "$preflight_dir/quill-signer" ./signer)
+          "$preflight_dir/quill-signer" "$preflight_dir/preflight-darwin-arm64"
+
+      - name: Verify and execute the notarized preflight binary
+        shell: bash
+        env:
+          PRECHECK_BINARY: ${{ runner.temp }}/cicd-macos-signing-preflight/preflight-darwin-arm64
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict --verbose=4 "$PRECHECK_BINARY"
+          spctl_output="$(spctl -a -t install -vv "$PRECHECK_BINARY" 2>&1)" || {
+            printf '%s\n' "$spctl_output"
+            echo "::error::spctl rejected the notarized macOS signing preflight."
+            exit 1
+          }
+          printf '%s\n' "$spctl_output"
+          if ! printf '%s\n' "$spctl_output" | grep -q 'source=Notarized Developer ID'; then
+            echo "::error::spctl did not report source=Notarized Developer ID for the notarized preflight."
+            exit 1
+          fi
+          output="$("$PRECHECK_BINARY" --version)"
+          if [ -z "$output" ]; then
+            echo "::error::notarized macOS signing preflight produced empty output."
+            exit 1
+          fi
+          printf 'preflight output: %s\n' "$output"
+
   release:
     name: GoReleaser
+    needs: macos_signing_preflight
+    if: ${{ always() && (needs.macos_signing_preflight.result == 'success' || needs.macos_signing_preflight.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required for GoReleaser to push GitHub releases
@@ -317,6 +439,20 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: ${{ inputs.go_version }}
+
+      # A signing secret must never silently activate Quill in a release that
+      # did not opt into the pre-publication macOS proof. Fail before any tag
+      # or release mutation when the caller accidentally wires the secret.
+      - name: Guard signing secret policy before tagging
+        shell: bash
+        env:
+          SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SIGN_P12" ] && [ "${{ inputs.require_notarized_macos }}" != "true" ]; then
+            echo "::error::MACOS_SIGN_P12 is set but require_notarized_macos is false; refusing to tag or publish before the macOS signing preflight passes."
+            exit 1
+          fi
 
       # Authenticate private-module fetches (GoReleaser's `go mod tidy` hook runs
       # BEFORE the build and will fail to reach private deps otherwise). No-op for
@@ -533,7 +669,9 @@ jobs:
         if: ${{ github.ref_type == 'tag' || steps.tag.outputs.new_tag != '' }}
         uses: goreleaser/goreleaser-action@v7
         with:
-          version: v2
+          # Pin the exact GoReleaser release whose embedded Quill module is
+          # reproduced by macos_signing_preflight above.
+          version: v2.18.0
           args: release --clean ${{ inputs.goreleaser_extra_args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # required for releases
