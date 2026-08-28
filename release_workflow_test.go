@@ -97,6 +97,7 @@ func TestReleaseWorkflowUsesExactGoReleaserQuillPreflight(t *testing.T) {
 		"github.com/goreleaser/quill/quill",
 		"github.com/goreleaser/quill/quill/pki/load",
 		"QUILL_VERSION: " + quillVersion,
+		`load.P12("env:MACOS_SIGN_P12", os.Getenv("MACOS_SIGN_PASSWORD"))`,
 		"NewSigningConfigFromP12",
 		"WithTimestampServer(\"http://timestamp.apple.com/ts01\")",
 		"quill.Notarize",

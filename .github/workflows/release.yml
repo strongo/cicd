@@ -375,7 +375,7 @@ jobs:
             '' \
             'func main() {' \
             '  binaryPath := os.Args[1]' \
-            '  p12, err := load.P12(os.Getenv("MACOS_SIGN_P12_PATH"), os.Getenv("MACOS_SIGN_PASSWORD"))' \
+            '  p12, err := load.P12("env:MACOS_SIGN_P12", os.Getenv("MACOS_SIGN_PASSWORD"))' \
             '  if err != nil { panic(err) }' \
             '  signingConfig, err := quill.NewSigningConfigFromP12(binaryPath, *p12, true)' \
             '  if err != nil { panic(err) }' \
@@ -387,8 +387,7 @@ jobs:
             '  if status != notary.AcceptedStatus { panic(fmt.Sprintf("notarization status = %s", status)) }' \
             '}' \
             > "$preflight_dir/signer/main.go"
-          printf '%s' "$SIGN_P12" | base64 --decode > "$preflight_dir/signing.p12" 2>/dev/null || printf '%s' "$SIGN_P12" | base64 -D > "$preflight_dir/signing.p12"
-          export MACOS_SIGN_P12_PATH="$preflight_dir/signing.p12"
+          export MACOS_SIGN_P12="$SIGN_P12"
           export MACOS_SIGN_PASSWORD="$SIGN_PASSWORD"
           export NOTARIZE_ISSUER_ID NOTARIZE_KEY_ID NOTARIZE_KEY
           (cd "$preflight_dir" && go mod download github.com/goreleaser/quill@"$QUILL_VERSION" && GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o "$preflight_dir/preflight-darwin-arm64" ./target && go build -o "$preflight_dir/quill-signer" ./signer)
