@@ -337,6 +337,39 @@ jobs:
             fi
           done
 
+      # Match production release authentication before running the consumer's
+      # own GoReleaser snapshot. This keeps private-module builds equivalent
+      # without printing or exposing the token value.
+      - name: Set GitHub access token for GOPRIVATE
+        if: ${{ inputs.GOPRIVATE }}
+        shell: bash
+        env:
+          PRIVATE_GIT_TOKEN: ${{ secrets.GH_TOKEN }}
+          PRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
+          PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PRIVATE_GIT_TOKEN" ]; then
+            echo "::error title=Missing private-module token::GH_TOKEN is required when GOPRIVATE is set."
+            exit 1
+          fi
+          prefixes="${PRIVATE_GIT_HOSTS:-$PRIVATE_GIT_HOST}"
+          configured=0
+          while IFS= read -r raw_prefix; do
+            prefix="$(printf '%s' "$raw_prefix" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
+            [ -z "$prefix" ] && continue
+            if [ -n "$PRIVATE_GIT_HOSTS" ] && ! [[ "$prefix" =~ ^[A-Za-z0-9.-]+/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
+              echo "::error title=Invalid goprivate_git_hosts entry::'$prefix' must be a host/owner URL prefix such as github.com/my-org; host-wide credential rewrites are not allowed."
+              exit 1
+            fi
+            git config --global "url.https://${PRIVATE_GIT_TOKEN}:x-oauth-basic@${prefix}/.insteadOf" "https://${prefix}/"
+            configured=$((configured + 1))
+          done < <(printf '%s\n' "$prefixes" | tr ',' '\n')
+          if [ "$configured" -eq 0 ]; then
+            echo "::error title=Missing GOPRIVATE Git prefix::Set goprivate_git_hosts or goprivate_git_host when GOPRIVATE is set."
+            exit 1
+          fi
+
       - name: Build and sign the consumer snapshot with pinned GoReleaser
         uses: goreleaser/goreleaser-action@v7
         env:
@@ -420,6 +453,7 @@ jobs:
         env:
           BIN_PATH: ${{ steps.preflight_binary.outputs.bin_path }}
           SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
+          TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
         run: |
           set -uo pipefail
           set +e
@@ -439,12 +473,68 @@ jobs:
             exit 1
           fi
 
+          run_with_timeout() {
+            local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
+            # Put the command in its own process group so forked descendants
+            # cannot survive the watchdog or keep the job alive.
+            set -m
+            "$@" &
+            local cmd_pid=$!
+            set +m
+            python3 -c '
+          import os
+          import signal
+          import sys
+          import time
+
+          seconds = float(sys.argv[1])
+          pgid = int(sys.argv[2])
+          marker = sys.argv[3]
+          time.sleep(seconds)
+          try:
+              os.killpg(pgid, 0)
+          except ProcessLookupError:
+              sys.exit(0)
+          open(marker, "a").close()
+          os.killpg(pgid, signal.SIGTERM)
+          time.sleep(2)
+          try:
+              os.killpg(pgid, signal.SIGKILL)
+          except ProcessLookupError:
+              pass
+          ' "$seconds" "$cmd_pid" "${RUNNER_TEMP}/.preflight_timed_out" >/dev/null 2>&1 &
+            local watchdog_pid=$!
+            wait "$cmd_pid" 2>/dev/null
+            local exit_code=$?
+            if process_group_exists "$cmd_pid"; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if process_group_exists "$cmd_pid"; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+              fi
+            fi
+            kill "$watchdog_pid" 2>/dev/null
+            wait "$watchdog_pid" 2>/dev/null
+            return "$exit_code"
+          }
+
+          rm -f "${RUNNER_TEMP}/.preflight_timed_out"
           # SMOKE_CMD is deliberately unquoted: it is the same configured
           # space-separated argument list used by the published-artifact job.
           # shellcheck disable=SC2086
-          output="$( "$BIN_PATH" $SMOKE_CMD 2>&1 )"
+          output="$(run_with_timeout "$TIMEOUT_SECONDS" "$BIN_PATH" $SMOKE_CMD 2>&1)"
           status=$?
           printf '%s\n' "$output"
+          if [ -f "${RUNNER_TEMP}/.preflight_timed_out" ]; then
+            echo "::error::consumer darwin/arm64 snapshot exceeded ${TIMEOUT_SECONDS}s and was killed with its process group."
+            exit 1
+          fi
           if [ "$status" -ne 0 ]; then
             echo "::error::consumer darwin/arm64 snapshot exited $status running '$BIN_PATH $SMOKE_CMD'."
             exit 1

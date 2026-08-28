@@ -109,6 +109,11 @@ func TestReleaseWorkflowUsesConsumerGoReleaserSnapshotPreflight(t *testing.T) {
 		"TAG_PREFIX: ${{ inputs.tag_prefix }}",
 		"artifact_smoke_test_command",
 		"find dist -type f -name \"$binary\"",
+		"TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}",
+		"run_with_timeout \"$TIMEOUT_SECONDS\"",
+		"process_group_exists",
+		"os.killpg",
+		".preflight_timed_out",
 		"codesign --verify --deep --strict --verbose=4",
 		"spctl -a -t install -vv",
 		"source=Notarized Developer ID",
@@ -140,6 +145,22 @@ func TestReleaseWorkflowUsesConsumerGoReleaserSnapshotPreflight(t *testing.T) {
 	for _, forbidden := range []string{"git tag ", "gh release ", "brew install", "brew tap"} {
 		if strings.Contains(preflight, forbidden) {
 			t.Fatalf("macOS signing preflight must not mutate release tags, GitHub releases, or casks via %q", forbidden)
+		}
+	}
+	if strings.Contains(preflight, "output=\\\"( \\\"$BIN_PATH\\\" $SMOKE_CMD") {
+		t.Fatal("preflight smoke execution must use the bounded process-group watchdog")
+	}
+	for _, required := range []string{`printf '%s\n' "$output"`, `if [ "$status" -ne 0 ]; then`, `if [ -z "$(printf '%s' "$output"`} {
+		if !strings.Contains(preflight, required) {
+			t.Fatalf("preflight smoke must preserve execution diagnostics %q", required)
+		}
+	}
+	for _, required := range []string{
+		"Set GitHub access token for GOPRIVATE",
+		"git config --global \"url.https://${PRIVATE_GIT_TOKEN}:x-oauth-basic@${prefix}/.insteadOf\"",
+	} {
+		if !strings.Contains(preflight, required) {
+			t.Fatalf("macOS preflight must preserve the production private-module setup %q", required)
 		}
 	}
 	if !strings.Contains(workflow, `if [ -n "$SIGN_P12" ] && [ "${{ inputs.require_notarized_macos }}" != "true" ]; then`) {
@@ -1102,8 +1123,8 @@ func releaseWorkflowTimeoutHelpers(t *testing.T) []string {
 		helpers = append(helpers, helper)
 		remaining = remaining[end+len(endMarker):]
 	}
-	if len(helpers) != 4 {
-		t.Fatalf("found %d run_with_timeout helpers, want 4", len(helpers))
+	if len(helpers) != 5 {
+		t.Fatalf("found %d run_with_timeout helpers, want 5", len(helpers))
 	}
 	return helpers
 }
