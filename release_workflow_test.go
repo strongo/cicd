@@ -80,34 +80,43 @@ func TestReleaseWorkflowExtractsAnAbsoluteRunnableBinaryPath(t *testing.T) {
 	}
 }
 
-func TestReleaseWorkflowUsesExactGoReleaserQuillPreflight(t *testing.T) {
+func TestReleaseWorkflowUsesConsumerGoReleaserSnapshotPreflight(t *testing.T) {
 	workflow := readReleaseWorkflow(t)
-	const quillVersion = "v0.0.0-20260630015114-8310f3e9a321"
 	if strings.Contains(workflow, "anchore/quill") {
 		t.Fatal("macOS signing preflight must not download the unrelated anchore/quill tool")
+	}
+	for _, forbidden := range []string{
+		"go mod init cicd-macos-signing-preflight",
+		"github.com/goreleaser/quill/quill",
+		"NewSigningConfigFromP12",
+		"load.P12(",
+		"PRECHECK_BINARY",
+		"cicd-macos-signing-preflight",
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("macOS signing preflight must run the consumer's GoReleaser config, not a custom helper containing %q", forbidden)
+		}
 	}
 	for _, required := range []string{
 		"  macos_signing_preflight:\n",
 		"if: ${{ inputs.require_notarized_macos }}",
 		"runs-on: macos-latest",
-		"go-version: '1.27'",
+		"uses: goreleaser/goreleaser-action@v7",
+		"go-version: ${{ inputs.go_version }}",
 		"version: v2.18.0",
-		"go mod edit -go=1.27 -require=github.com/goreleaser/quill@\"${QUILL_VERSION}\"",
-		"GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build",
-		"github.com/goreleaser/quill/quill",
-		"github.com/goreleaser/quill/quill/pki/load",
-		"QUILL_VERSION: " + quillVersion,
-		`load.P12("env:MACOS_SIGN_P12", os.Getenv("MACOS_SIGN_PASSWORD"))`,
-		"NewSigningConfigFromP12",
-		"WithTimestampServer(\"http://timestamp.apple.com/ts01\")",
-		"quill.Notarize",
+		"args: release --snapshot --clean --skip=publish",
+		"BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}",
+		"TAG_PREFIX: ${{ inputs.tag_prefix }}",
+		"artifact_smoke_test_command",
+		"find dist -type f -name \"$binary\"",
 		"codesign --verify --deep --strict --verbose=4",
 		"spctl -a -t install -vv",
 		"source=Notarized Developer ID",
+		"SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}",
 		"needs: macos_signing_preflight",
 	} {
 		if !strings.Contains(workflow, required) {
-			t.Fatalf("release workflow is missing exact GoReleaser/quill preflight contract %q", required)
+			t.Fatalf("release workflow is missing exact consumer snapshot preflight contract %q", required)
 		}
 	}
 	preflightIndex := strings.Index(workflow, "  macos_signing_preflight:\n")
@@ -118,6 +127,20 @@ func TestReleaseWorkflowUsesExactGoReleaserQuillPreflight(t *testing.T) {
 	}
 	if preflightIndex > tagIndex {
 		t.Fatal("macOS signing preflight must be declared before the guarded tag step")
+	}
+	if !strings.Contains(workflow, "release --snapshot --clean --skip=publish") {
+		t.Fatal("macOS signing preflight must use GoReleaser snapshot mode without publication")
+	}
+	preflightStart := strings.Index(workflow, "\njobs:\n")
+	preflightEnd := strings.Index(workflow, "\n  release:")
+	if preflightStart < 0 || preflightEnd < 0 || preflightStart >= preflightEnd {
+		t.Fatal("release workflow must contain an inspectable macOS preflight job")
+	}
+	preflight := workflow[preflightStart:preflightEnd]
+	for _, forbidden := range []string{"git tag ", "gh release ", "brew install", "brew tap"} {
+		if strings.Contains(preflight, forbidden) {
+			t.Fatalf("macOS signing preflight must not mutate release tags, GitHub releases, or casks via %q", forbidden)
+		}
 	}
 	if !strings.Contains(workflow, `if [ -n "$SIGN_P12" ] && [ "${{ inputs.require_notarized_macos }}" != "true" ]; then`) {
 		t.Fatal("release workflow must reject a signing secret when notarization proof is disabled")

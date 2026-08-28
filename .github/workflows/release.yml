@@ -298,13 +298,12 @@ on:
 #      - 'v*.*.*'   # triggers only on tags like v1.26.0
 
 jobs:
-  # Reproduce the exact GoReleaser v2.18.0 Quill signing path before any tag
-  # or release is published. This is opt-in with require_notarized_macos so
+  # Run each consumer's own GoReleaser v2.18.0 snapshot before any tag or
+  # release is published. This is opt-in with require_notarized_macos so
   # unsigned consumers retain the existing release path and do not pay for a
-  # macOS runner. The preflight intentionally uses the same module, P12
-  # loader, signing configuration, and timestamp endpoint as GoReleaser's
-  # internal macOS notifier; it does not infer a root cause from a passing
-  # or failing probe.
+  # macOS runner. Snapshot mode skips validation and all publication pipes,
+  # while still building, signing, and notarizing the consumer's actual
+  # darwin/arm64 artifact from its checked-in GoReleaser configuration.
   macos_signing_preflight:
     name: macOS signing preflight
     if: ${{ inputs.require_notarized_macos }}
@@ -317,9 +316,9 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          # The preflight reproduces the Go 1.27 signing path even when a
-          # caller's release build still uses an older Go version.
-          go-version: '1.27'
+          # Match the consumer's configured toolchain; do not substitute a
+          # toy binary or a different Go version for the real release input.
+          go-version: ${{ inputs.go_version }}
 
       - name: Validate signing secrets
         shell: bash
@@ -338,84 +337,123 @@ jobs:
             fi
           done
 
-      - name: Build and sign with GoReleaser's pinned Quill module
-        shell: bash
+      - name: Build and sign the consumer snapshot with pinned GoReleaser
+        uses: goreleaser/goreleaser-action@v7
         env:
-          QUILL_VERSION: v0.0.0-20260630015114-8310f3e9a321
-          SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          NOTARY_ISSUER_ID: ${{ secrets.NOTARIZE_ISSUER_ID }}
-          NOTARY_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
-          NOTARY_KEY: ${{ secrets.NOTARIZE_KEY }}
-        run: |
-          set -euo pipefail
-          preflight_dir="${RUNNER_TEMP}/cicd-macos-signing-preflight"
-          mkdir -p "$preflight_dir"
-          (cd "$preflight_dir" && go mod init cicd-macos-signing-preflight && go mod edit -go=1.27 -require=github.com/goreleaser/quill@"${QUILL_VERSION}")
-          mkdir -p "$preflight_dir/target" "$preflight_dir/signer"
-          printf '%s\n' \
-            'package main' \
-            '' \
-            'import "fmt"' \
-            '' \
-            'func main() { fmt.Println("cicd macOS signing preflight") }' \
-            > "$preflight_dir/target/main.go"
-          printf '%s\n' \
-            'package main' \
-            '' \
-            'import (' \
-            '  "fmt"' \
-            '  "os"' \
-            '  "time"' \
-            '' \
-            '  "github.com/goreleaser/quill/quill"' \
-            '  "github.com/goreleaser/quill/quill/notary"' \
-            '  "github.com/goreleaser/quill/quill/pki/load"' \
-            ')' \
-            '' \
-            'func main() {' \
-            '  binaryPath := os.Args[1]' \
-            '  p12, err := load.P12("env:MACOS_SIGN_P12", os.Getenv("MACOS_SIGN_PASSWORD"))' \
-            '  if err != nil { panic(err) }' \
-            '  signingConfig, err := quill.NewSigningConfigFromP12(binaryPath, *p12, true)' \
-            '  if err != nil { panic(err) }' \
-            '  signingConfig = signingConfig.WithTimestampServer("http://timestamp.apple.com/ts01")' \
-            '  if err := quill.Sign(*signingConfig); err != nil { panic(err) }' \
-            '  notarizeConfig := quill.NewNotarizeConfig(os.Getenv("NOTARIZE_ISSUER_ID"), os.Getenv("NOTARIZE_KEY_ID"), os.Getenv("NOTARIZE_KEY")).WithStatusConfig(notary.StatusConfig{Timeout: 20 * time.Minute, Poll: 10 * time.Second, Wait: true})' \
-            '  status, err := quill.Notarize(binaryPath, *notarizeConfig)' \
-            '  if err != nil { panic(err) }' \
-            '  if status != notary.AcceptedStatus { panic(fmt.Sprintf("notarization status = %s", status)) }' \
-            '}' \
-            > "$preflight_dir/signer/main.go"
-          export MACOS_SIGN_P12="$SIGN_P12"
-          export MACOS_SIGN_PASSWORD="$SIGN_PASSWORD"
-          export NOTARIZE_ISSUER_ID NOTARIZE_KEY_ID NOTARIZE_KEY
-          (cd "$preflight_dir" && go mod download github.com/goreleaser/quill@"$QUILL_VERSION" && GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o "$preflight_dir/preflight-darwin-arm64" ./target && go build -o "$preflight_dir/quill-signer" ./signer)
-          "$preflight_dir/quill-signer" "$preflight_dir/preflight-darwin-arm64"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOPRIVATE: ${{ inputs.GOPRIVATE }}
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          NOTARIZE_ISSUER_ID: ${{ secrets.NOTARIZE_ISSUER_ID }}
+          NOTARIZE_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
+          NOTARIZE_KEY: ${{ secrets.NOTARIZE_KEY }}
+        with:
+          # GoReleaser v2.18.0 documents --snapshot as unversioned,
+          # non-publishing release mode; --skip=publish makes the no-publish
+          # contract explicit and is a supported release skip in this pin.
+          version: v2.18.0
+          args: release --snapshot --clean --skip=publish
 
-      - name: Verify and execute the notarized preflight binary
+      - name: Locate the consumer's darwin/arm64 snapshot binary
+        id: preflight_binary
         shell: bash
         env:
-          PRECHECK_BINARY: ${{ runner.temp }}/cicd-macos-signing-preflight/preflight-darwin-arm64
+          BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
         run: |
           set -euo pipefail
-          codesign --verify --deep --strict --verbose=4 "$PRECHECK_BINARY"
-          spctl_output="$(spctl -a -t install -vv "$PRECHECK_BINARY" 2>&1)" || {
-            printf '%s\n' "$spctl_output"
-            echo "::error::spctl rejected the notarized macOS signing preflight."
+          config_file=""
+          for f in .goreleaser.yaml .goreleaser.yml goreleaser.yaml goreleaser.yml; do
+            if [ -f "$f" ]; then config_file="$f"; break; fi
+          done
+
+          # Keep the same resolution contract as the published-artifact smoke
+          # job: explicit override, then builds[0].binary, then project_name,
+          # then the documented repo-name fallback.
+          binary="$BINARY_OVERRIDE"
+          if [ -n "$config_file" ] && command -v yq >/dev/null 2>&1; then
+            if [ -z "$binary" ]; then
+              binary="$(yq -r '.builds[0].binary // ""' "$config_file")"
+              [ "$binary" = "null" ] && binary=""
+              if [ -z "$binary" ]; then
+                binary="$(yq -r '.project_name // ""' "$config_file")"
+                [ "$binary" = "null" ] && binary=""
+              fi
+            fi
+          fi
+          if [ -z "$binary" ]; then
+            case "$TAG_PREFIX" in
+              */*)
+                echo "::error::Cannot resolve a preflight binary for subdirectory-module tag_prefix '$TAG_PREFIX'; set artifact_smoke_test_binary explicitly."
+                exit 1
+                ;;
+              *)
+                repo_name="${GITHUB_REPOSITORY#*/}"
+                org_name="${GITHUB_REPOSITORY%%/*}"
+                if [ "$repo_name" = "cli" ]; then
+                  binary="$org_name"
+                else
+                  binary="${repo_name%-cli}"
+                fi
+                ;;
+            esac
+          fi
+
+          bin_path=""
+          while IFS= read -r candidate; do
+            [ -x "$candidate" ] || continue
+            if file "$candidate" | grep -qE 'Mach-O.*arm64'; then
+              bin_path="$candidate"
+              break
+            fi
+          done < <(find dist -type f -name "$binary" -print)
+          if [ -z "$bin_path" ]; then
+            echo "::error::GoReleaser snapshot did not produce an executable darwin/arm64 '$binary' under dist."
             exit 1
-          }
+          fi
+          bin_path="$(cd "$(dirname "$bin_path")" && pwd -P)/$(basename "$bin_path")"
+          echo "Resolved consumer snapshot binary: $bin_path"
+          echo "bin_path=$bin_path" >> "$GITHUB_OUTPUT"
+
+      - name: Verify and execute the consumer's notarized snapshot
+        shell: bash
+        env:
+          BIN_PATH: ${{ steps.preflight_binary.outputs.bin_path }}
+          SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
+        run: |
+          set -uo pipefail
+          set +e
+          codesign_output="$(codesign --verify --deep --strict --verbose=4 "$BIN_PATH" 2>&1)"
+          codesign_status=$?
+          printf '%s\n' "$codesign_output"
+          if [ "$codesign_status" -ne 0 ]; then
+            echo "::error::consumer darwin/arm64 snapshot has an invalid code signature (codesign exited $codesign_status)."
+            exit 1
+          fi
+
+          spctl_output="$(spctl -a -t install -vv "$BIN_PATH" 2>&1)"
+          spctl_status=$?
           printf '%s\n' "$spctl_output"
-          if ! printf '%s\n' "$spctl_output" | grep -q 'source=Notarized Developer ID'; then
-            echo "::error::spctl did not report source=Notarized Developer ID for the notarized preflight."
+          if [ "$spctl_status" -ne 0 ] || ! printf '%s\n' "$spctl_output" | grep -q 'source=Notarized Developer ID'; then
+            echo "::error::consumer darwin/arm64 snapshot was not accepted as source=Notarized Developer ID."
             exit 1
           fi
-          output="$("$PRECHECK_BINARY" --version)"
-          if [ -z "$output" ]; then
-            echo "::error::notarized macOS signing preflight produced empty output."
+
+          # SMOKE_CMD is deliberately unquoted: it is the same configured
+          # space-separated argument list used by the published-artifact job.
+          # shellcheck disable=SC2086
+          output="$( "$BIN_PATH" $SMOKE_CMD 2>&1 )"
+          status=$?
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::consumer darwin/arm64 snapshot exited $status running '$BIN_PATH $SMOKE_CMD'."
             exit 1
           fi
-          printf 'preflight output: %s\n' "$output"
+          if [ -z "$(printf '%s' "$output" | tr -d '[:space:]')" ]; then
+            echo "::error::consumer darwin/arm64 snapshot exited 0 but produced no output running '$BIN_PATH $SMOKE_CMD'."
+            exit 1
+          fi
+          echo "OK: consumer darwin/arm64 snapshot is signed, notarized, runnable, and produced output."
 
   release:
     name: GoReleaser
