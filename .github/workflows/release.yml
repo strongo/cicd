@@ -1024,7 +1024,26 @@ jobs:
       # fine until quarantined; the moment it is, Gatekeeper blocks it
       # outright. Verified directly against the published v0.24.0 darwin
       # binary: `codesign -dv` showed Identifier=a.out, TeamIdentifier=not
-      # set (ad-hoc signature only); `spctl -a -vv` returned "rejected".
+      # set — genuinely ad-hoc signed, independently damning on its own.
+      #
+      # `spctl -a -vv` (no `-t`, which defaults to type `execute`) also
+      # returned "rejected" for that v0.24.0 binary, but that specific
+      # reading is CONFOUNDED and must not be trusted on its own: measured
+      # directly against the real, published, Developer-ID-signed and
+      # notarized `ingitdb/ingitdb-cli` v0.65.10 darwin/arm64 binary on
+      # macOS 15, both `spctl -a -vv` and `spctl -a -vv -t exec` REJECT it
+      # too (exit 3, "the code is valid but does not seem to be an app") —
+      # a bare Mach-O CLI binary is never an app bundle, so the
+      # default/`exec` assessment type rejects one regardless of signing or
+      # notarization state. `spctl -a -vv -t install` is the assessment type
+      # that returns Apple's real verdict for this artifact shape: it
+      # ACCEPTED that same notarized binary (exit 0) with
+      # `source=Notarized Developer ID` in its output — the string that
+      # actually proves notarization. That is the call this step uses below.
+      # Exit code 0 alone is still not sufficient: a Developer-ID-signed but
+      # never-notarized binary can also pass `-t install` with exit 0, so
+      # the step additionally greps the output for
+      # `source=Notarized Developer ID`.
       - name: 'Layer 2: assert macOS code signing / notarization'
         if: ${{ matrix.goos == 'darwin' && steps.extract.outputs.extracted == 'true' }}
         shell: bash
@@ -1043,8 +1062,8 @@ jobs:
           codesign_out="$(codesign -dv --verbose=4 "$BIN_PATH" 2>&1)"
           printf '%s\n' "$codesign_out"
           echo
-          echo "=== spctl -a -vv ==="
-          spctl_out="$(spctl -a -vv "$BIN_PATH" 2>&1)"
+          echo "=== spctl -a -vv -t install ==="
+          spctl_out="$(spctl -a -vv -t install "$BIN_PATH" 2>&1)"
           spctl_status=$?
           printf '%s\n' "$spctl_out"
 
@@ -1055,10 +1074,12 @@ jobs:
           fi
           if [ "$spctl_status" -ne 0 ]; then
             problems="${problems}spctl rejected this binary (exit $spctl_status) — Gatekeeper will block it once quarantined; "
+          elif ! printf '%s\n' "$spctl_out" | grep -q 'source=Notarized Developer ID'; then
+            problems="${problems}spctl accepted the binary (exit 0) but it is not notarized — no 'source=Notarized Developer ID' in its output, meaning it was signed with a Developer ID but never submitted for/granted notarization; "
           fi
 
           if [ -z "$problems" ]; then
-            echo "OK: ${{ matrix.goos }}/${{ matrix.goarch }} artifact is signed with a real Developer ID and passes spctl assessment."
+            echo "OK: ${{ matrix.goos }}/${{ matrix.goarch }} artifact is signed with a real Developer ID and is notarized (spctl -t install: source=Notarized Developer ID)."
             exit 0
           fi
 

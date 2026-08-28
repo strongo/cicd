@@ -256,8 +256,17 @@ jobs:
         run: |
           set -uo pipefail
           set +e
+          # See release.yml's "Layer 2" step for why `-t install` (not the
+          # default `execute`/`exec` type) is required here: a bare CLI
+          # binary is not an app bundle, so the default assessment rejects
+          # even a genuinely notarized binary. Measured directly against the
+          # real, published, Developer-ID-signed and notarized
+          # `ingitdb/ingitdb-cli` v0.65.10 darwin/arm64 binary on macOS 15:
+          # `spctl -a -vv` and `-t exec` both reject it (exit 3); only
+          # `-t install` returns Apple's real verdict (exit 0,
+          # `source=Notarized Developer ID`).
           codesign_out="$(codesign -dv --verbose=4 "$BIN_PATH" 2>&1)"
-          spctl_out="$(spctl -a -vv "$BIN_PATH" 2>&1)"
+          spctl_out="$(spctl -a -vv -t install "$BIN_PATH" 2>&1)"
           spctl_status=$?
           printf '%s\n%s\n' "$codesign_out" "$spctl_out"
           team_id="$(printf '%s\n' "$codesign_out" | grep '^TeamIdentifier=' | cut -d= -f2-)"
@@ -267,9 +276,11 @@ jobs:
           fi
           if [ "$spctl_status" -ne 0 ]; then
             problems="${problems}spctl rejected the binary; "
+          elif ! printf '%s\n' "$spctl_out" | grep -q 'source=Notarized Developer ID'; then
+            problems="${problems}spctl accepted the binary but it is not notarized (no 'source=Notarized Developer ID' in its output); "
           fi
           if [ -z "$problems" ]; then
-            echo "OK: exact $RELEASE_TAG macOS artifact is signed and passes spctl."
+            echo "OK: exact $RELEASE_TAG macOS artifact is signed and notarized (spctl -t install: source=Notarized Developer ID)."
           elif [ "$REQUIRE_NOTARIZED" = "true" ]; then
             echo "::error::Exact $RELEASE_TAG macOS artifact is not properly signed/notarized: $problems"
             exit 1

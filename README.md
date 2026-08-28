@@ -172,9 +172,16 @@ layers, all under `artifact_smoke_test` (default **on**):
    `com.apple.quarantine` attribute, so this layer alone passed for
    v0.24.0.
 2. **Assert macOS code signing / notarization** (`codesign -dv`,
-   `spctl -a -vv`) against the same darwin binary — static inspection, no
-   execution, no Gatekeeper risk in the check itself. This is what actually
-   would have caught v0.24.0: an ad-hoc signature with no Developer ID.
+   `spctl -a -vv -t install`) against the same darwin binary — static
+   inspection, no execution, no Gatekeeper risk in the check itself. Uses
+   assessment type `install`, not the default `execute`/`exec`: a bare CLI
+   binary is not an app bundle, so the default type rejects even a
+   genuinely notarized one (measured directly against a real notarized
+   `ingitdb-cli` binary — see the "macOS notarization" section below). It
+   also checks the output for `source=Notarized Developer ID`, since exit 0
+   alone only proves Developer ID signing, not notarization. This is what
+   actually would have caught v0.24.0: an ad-hoc signature with no
+   Developer ID.
 3. **`brew install --cask` and run the installed binary**
    (`artifact_smoke_test_homebrew_cask`, default on) — auto-detected from
    this repo's own `homebrew_casks:` config, no-op otherwise. The only layer
@@ -342,7 +349,10 @@ Apple credentials are current, wire the five secrets above into the calling
 workflow's `secrets:` block (see `ingitdb-cli`'s `release.yml` for a worked
 example), then flip that repo's `require_notarized_macos` input (see
 "Post-release artifact smoke test" above) to true once its darwin artifacts
-actually pass `spctl -a -vv`.
+actually pass `spctl -a -vv -t install` and show `source=Notarized Developer ID`
+in the output — exit 0 alone is not sufficient evidence of notarization, and
+the default `spctl -a -vv` (type `execute`) assessment rejects any bare CLI
+binary regardless of signing state, so it cannot be used to verify this.
 
 ## Keep the pin fresh with Renovate
 
