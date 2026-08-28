@@ -254,7 +254,7 @@ jobs:
           # A release candidate analyzer is not a thing to gate every merge on.
           # Bump this deliberately once v2.13.x ships a stable staticcheck, and
           # expect to fix the SA4023 findings as part of that bump.
-          version: v2.13.1
+          version: v2.13.2
 
           args: --timeout=${{ inputs.lint-timeout }}
 
