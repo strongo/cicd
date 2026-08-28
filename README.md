@@ -212,16 +212,15 @@ timeout too (120s / 300s respectively), plus each smoke-test job has a
 "a hang must fail fast and legibly, never eventually" rationale extended to
 every step that talks to a network, not just the binary invocation itself.
 
-**Layers 2 and 3 currently only warn, by design.** As of this writing,
-*nothing this org publishes is notarized* — Developer ID signing and App
-Store Connect notarization aren't wired into the shared pipeline yet. A
-default hard-fail here would red every CLI's release on day one and just get
-disabled fleet-wide instead of fixed. They log a `::warning::` naming
-exactly what's missing (e.g. ad-hoc signature, `TeamIdentifier: not set`,
-`spctl` rejection) on every release so the gap stays visible. Set
-`require_notarized_macos: true` per repo the moment its macOS build is
-genuinely signed + notarized, to make that guarantee binding. This is the
-intended end state, not an optional extra.
+**Layers 2 and 3 currently only warn, by design.** No org consumer currently
+has a verified notarized release path. A default hard-fail would red every
+unsigned CLI release on day one and just get disabled fleet-wide instead of
+fixed. These layers log a `::warning::` naming exactly what's missing (for
+example, an ad-hoc signature, `TeamIdentifier: not set`, or `spctl` rejection)
+so the gap stays visible. Set `require_notarized_macos: true` per repository
+only after the exact published path has passed the proof gate below. A valid
+Developer ID signature and Apple notarization remain the intended end state,
+not an optional extra.
 
 ```yaml
 jobs:
@@ -334,58 +333,63 @@ Decided 2026-07-17; applied to `ingitdb-cli` and `specscore-cli`.
   Silicon casks live under `/opt/homebrew/Caskroom/…` but Intel casks under
   `/usr/local/Caskroom/…`, which matches no other Homebrew marker.
 
-### macOS notarization: opt-in, dormant by default
+### macOS signing and notarization ownership
 
-Ship unsigned macOS binaries by default. Wire notarization as a `notarize.macos`
-block whose `enabled` is gated on the signing secret
-(`{{ isEnvSet "MACOS_SIGN_P12" }}`), so with the secret unset it is skipped and
-can never break a release. `release.yml` forwards five optional secrets into
-GoReleaser's env for exactly this: `MACOS_SIGN_P12`, `MACOS_SIGN_PASSWORD`
-(Developer ID Application cert + password), and `NOTARIZE_ISSUER_ID`,
-`NOTARIZE_KEY_ID`, `NOTARIZE_KEY` (App Store Connect API key). GoReleaser's
-notarize publisher is pure Go (quill), so it runs on this same ubuntu job —
-no macOS runner needed. Enabling it is a deliberate per-repo step: verify the
-Apple credentials are current, wire the five secrets above into the calling
-workflow's `secrets:` block (see `ingitdb-cli`'s `release.yml` for a worked
-example), then flip that repo's `require_notarized_macos` input (see
-"Post-release artifact smoke test" above) to true once its darwin artifacts
-actually pass `spctl -a -vv -t install` and show `source=Notarized Developer ID`
-in the output — exit 0 alone is not sufficient evidence of notarization, and
-the default `spctl -a -vv` (type `execute`) assessment rejects any bare CLI
-binary regardless of signing state, so it cannot be used to verify this.
+strongo/cicd owns the reusable signing orchestration: the GoReleaser and
+signer version pins, optional Apple-secret forwarding, the pre-publication
+proof gate, retained signing evidence, and the rule that decides when public
+release mutation may begin. The consumer repository owns its product-specific
+`.goreleaser.yml`, binary/build IDs, cask metadata, repository secret mapping,
+and the decision to opt into the proven signing mode.
 
-### Go 1.27 and Darwin signing
+The cross-platform path uses quill inside GoReleaser: it reads a Developer ID
+Application `.p12`, embeds a signature in each Mach-O binary, and submits that
+binary to Apple's notarization service while the main release job remains on
+Ubuntu. This is the desired architecture; quill is still the intended
+destination once its exact output is proven runnable. Native `codesign` and
+`notarytool` on a macOS runner remain the fallback architecture if the
+cross-platform signer cannot satisfy the same contract.
 
-Go 1.27 requires macOS 13 or newer and its Darwin linker defaults to `minos
-13.0` with SDK `26.2`. With cross-platform Quill signing, that output can pass
-shallow signature inspection but be killed by macOS 26's AMFI at exec time
-(status 137, no stdout/stderr). The layer 1 smoke test now runs deep strict
-signature verification after a Darwin execution failure, so the release log
-identifies signature corruption rather than presenting only an opaque 137.
-For Quill compatibility, this example encodes minOS `13.0` and SDK `13.0` for
-Go 1.27 builds. SDK `13.0` is signing metadata, not a runtime support floor;
-treat this encoding as pending real published artifact proof. GoReleaser
-supports target-specific overrides, for example:
+Until the proof exists, consumers ship the existing ad-hoc-signed cask path
+and may retain GoReleaser's documented post-install quarantine-removal hook.
+A dormant `notarize.macos` example is not release evidence and must not be
+copied into a production consumer as though it were a verified reference.
 
-```yaml
-builds:
-  - id: cli
-    goos: [linux, darwin]
-    goarch: [amd64, arm64]
-    overrides:
-      - goos: darwin
-        goarch: amd64
-        ldflags:
-          - -s -w -macos=13.0 -macsdk=13.0
-      - goos: darwin
-        goarch: arm64
-        ldflags:
-          - -s -w -macos=13.0 -macsdk=13.0
-```
+### Go 1.27 quill incident and current containment
 
-Do not add Darwin-only linker flags to the shared `ldflags` list: Go passes
-those flags to Linux and other targets too. A real published Darwin artifact
-launch test remains required before treating a signed release as healthy.
+WB CLI v0.66.1 exposed the failure tracked by
+[issue #66](https://github.com/strongo/cicd/issues/66). GoReleaser v2.18.0
+reported both signing and successful notarization for its Go 1.27 darwin/arm64
+binary, but the published executable failed
+`codesign --verify --deep --strict --verbose=4` with an invalid embedded
+signature and macOS killed every invocation with status 137.
+
+Do not attribute that incident to Go 1.27's Darwin deployment metadata. The
+working WB CLI v0.66.0 control was also built with Go 1.27 and carried the same
+`LC_BUILD_VERSION` values (`minos 13.0`, SDK `26.2`); its linker-provided ad-hoc
+signature verified and it executed normally. The discriminating change was
+enabling the quill signing path. The defect has not yet been isolated to a
+specific line inside quill, so linker overrides are not an approved remedy.
+
+WB temporarily disables that signing path and retains its proven cask
+quarantine-removal fallback. Re-enable it only after issue #66 closes with all
+of this evidence against one exact candidate:
+
+1. A non-public Go 1.27 pilot uses the same certificate, notary credentials,
+   GoReleaser version, quill version, and workflow route as production.
+2. Before any tag, GitHub Release, or cask mutation, a clean macOS runner runs
+   deep strict `codesign`, `spctl -a -t install -vv` and checks for
+   `source=Notarized Developer ID`, then executes `<binary> --version` and
+   requires exit 0 with non-empty output.
+3. The receipt retains the exact candidate digest, toolchain and signer
+   versions, certificate identity metadata, notarization result, and macOS
+   verification output.
+4. Only after that gate passes may the consumer enable the signer and set
+   `require_notarized_macos: true`.
+
+The existing post-release layers remain valuable defense in depth, but they
+cannot substitute for this gate: once publication has happened, they are an
+alarm rather than a fence.
 
 ## Keep the pin fresh with Renovate
 

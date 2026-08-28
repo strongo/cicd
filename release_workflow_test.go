@@ -692,30 +692,26 @@ func TestReleaseWorkflowReportsInvalidDarwinSignatureAfterExecutionFailure(t *te
 	}
 }
 
-func TestREADMEGo127DarwinGuidanceUsesMacOS13Floor(t *testing.T) {
+func TestReadmeKeepsQuillSigningIncidentAndOwnershipVisible(t *testing.T) {
 	contents, err := os.ReadFile("README.md")
 	if err != nil {
 		t.Fatal(err)
 	}
 	readme := string(contents)
-	start := strings.Index(readme, "### Go 1.27 and Darwin signing")
-	if start < 0 {
-		t.Fatal("README has no Go 1.27 Darwin signing guidance")
-	}
-	section := readme[start:]
-	if end := strings.Index(section, "## Keep the pin fresh with Renovate"); end >= 0 {
-		section = section[:end]
-	}
-	if !strings.Contains(section, "macOS 13 or newer") {
-		t.Fatal("Go 1.27 Darwin guidance must state the macOS 13 minimum")
-	}
-	if !strings.Contains(section, "-macos=13.0 -macsdk=13.0") {
-		t.Fatal("Go 1.27 Darwin example must use macOS 13 deployment target and SDK")
-	}
-	for _, forbidden := range []string{"-macos=12.0", "-macsdk=12.1", "macOS 12"} {
-		if strings.Contains(section, forbidden) {
-			t.Fatalf("Go 1.27 Darwin guidance contains unsupported compatibility value %q", forbidden)
+	for _, required := range []string{
+		"https://github.com/strongo/cicd/issues/66",
+		"quill is still the intended",
+		"pre-publication",
+		"codesign --verify --deep --strict --verbose=4",
+		"consumer repository owns",
+		"strongo/cicd owns",
+	} {
+		if !strings.Contains(readme, required) {
+			t.Errorf("README.md does not keep quill-signing contract %q visible", required)
 		}
+	}
+	if strings.Contains(readme, "Keep the release on Go 1.26, or override the Darwin build's linker flags") {
+		t.Error("README.md still recommends the falsified Darwin linker workaround")
 	}
 }
 
