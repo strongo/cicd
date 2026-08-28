@@ -638,6 +638,60 @@ func TestReleaseWorkflowKeepsWarningSkipBehaviorForUntestableArtifacts(t *testin
 	}
 }
 
+func TestReleaseWorkflowReportsInvalidDarwinSignatureAfterExecutionFailure(t *testing.T) {
+	script := releaseWorkflowRunBlock(t, "'Layer 1: run the published binary (must exit within timeout)'")
+	script = strings.ReplaceAll(script, "${{ matrix.goos }}", "darwin")
+	script = strings.ReplaceAll(script, "${{ matrix.goarch }}", "arm64")
+	workspace := t.TempDir()
+	fakeBin := filepath.Join(workspace, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(fakeBin, "broken"), "#!/usr/bin/env bash\nexit 137\n")
+	writeExecutable(t, filepath.Join(fakeBin, "codesign"), "#!/usr/bin/env bash\nprintf '%s\\n' invoked > \"$CODESIGN_MARKER\"\nprintf '%s\\n' 'code object is not signed at all'\nexit 1\n")
+	marker := filepath.Join(workspace, "codesign-invoked")
+
+	darwinOutput, err := runBash(workspace, script, map[string]string{
+		"BIN_PATH":        filepath.Join(fakeBin, "broken"),
+		"SMOKE_CMD":       "--version",
+		"TIMEOUT_SECONDS": "2",
+		"PATH":            fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"CODESIGN_MARKER": marker,
+	})
+	if err == nil {
+		t.Fatalf("broken darwin artifact unexpectedly passed:\n%s", darwinOutput)
+	}
+	if !strings.Contains(string(darwinOutput), "invalid macOS code signature") || !strings.Contains(string(darwinOutput), "exited 137") {
+		t.Fatalf("Darwin execution failure did not preserve the original status and add code-signature diagnostics:\n%s", darwinOutput)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("Darwin execution failure did not invoke deep strict codesign: %v\n%s", err, darwinOutput)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+
+	linuxScript := releaseWorkflowRunBlock(t, "'Layer 1: run the published binary (must exit within timeout)'")
+	linuxScript = strings.ReplaceAll(linuxScript, "${{ matrix.goos }}", "linux")
+	linuxScript = strings.ReplaceAll(linuxScript, "${{ matrix.goarch }}", "arm64")
+	linuxOutput, err := runBash(workspace, linuxScript, map[string]string{
+		"BIN_PATH":        filepath.Join(fakeBin, "broken"),
+		"SMOKE_CMD":       "--version",
+		"TIMEOUT_SECONDS": "2",
+		"PATH":            fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"CODESIGN_MARKER": marker,
+	})
+	if err == nil {
+		t.Fatalf("broken Linux artifact unexpectedly passed:\n%s", linuxOutput)
+	}
+	if strings.Contains(string(linuxOutput), "invalid macOS code signature") {
+		t.Fatalf("Linux execution failure ran the Darwin-only diagnostic:\n%s", linuxOutput)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("Linux execution failure unexpectedly invoked codesign, stat error=%v\n%s", err, linuxOutput)
+	}
+}
+
 func assertWorkflowFailure(t *testing.T, workspace, script string, variables map[string]string) {
 	t.Helper()
 	output, err := runBash(workspace, script, variables)

@@ -1006,6 +1006,16 @@ jobs:
             exit 1
           fi
           if [ "$status" -ne 0 ]; then
+            if [ "${{ matrix.goos }}" = "darwin" ] && command -v codesign >/dev/null 2>&1; then
+              signature_output="$(codesign --verify --deep --strict --verbose=4 "$BIN_PATH" 2>&1)"
+              signature_status=$?
+              echo "----- macOS code-signature verification -----"
+              printf '%s\n' "$signature_output"
+              echo "----------------------------------------------"
+              if [ "$signature_status" -ne 0 ]; then
+                echo "::error::Published darwin/${{ matrix.goarch }} artifact has an invalid macOS code signature (codesign --verify --deep --strict exited $signature_status). macOS may kill it with SIGKILL/137 before the program can print diagnostics. Re-sign the artifact from a clean Mach-O linker output before publishing."
+              fi
+            fi
             echo "::error::Published artifact for ${{ matrix.goos }}/${{ matrix.goarch }} exited $status running '$BIN_PATH $SMOKE_CMD'."
             exit 1
           fi
