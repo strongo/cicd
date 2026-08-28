@@ -356,16 +356,15 @@ binary regardless of signing state, so it cannot be used to verify this.
 
 ### Go 1.27 and Darwin signing
 
-Go 1.27 requires macOS 13 or newer and its Darwin linker defaults to `minos
-13.0` with SDK `26.2`. With cross-platform Quill signing, that output can pass
-shallow signature inspection but be killed by macOS 26's AMFI at exec time
-(status 137, no stdout/stderr). The layer 1 smoke test now runs deep strict
-signature verification after a Darwin execution failure, so the release log
-identifies signature corruption rather than presenting only an opaque 137.
-For Quill compatibility, this example encodes minOS `13.0` and SDK `13.0` for
-Go 1.27 builds. SDK `13.0` is signing metadata, not a runtime support floor;
-treat this encoding as pending real published artifact proof. GoReleaser
-supports target-specific overrides, for example:
+Go 1.27 changed the Darwin linker defaults to `minos 13.0` and SDK `26.2`.
+With cross-platform Quill signing, that output can pass shallow signature
+inspection but be killed by macOS 26's AMFI at exec time (status 137, no
+stdout/stderr). The layer 1 smoke test now runs deep strict signature
+verification after a Darwin execution failure, so the release log identifies
+signature corruption rather than presenting only an opaque 137. Keep the
+release on Go 1.26, or override the Darwin build's linker flags after proving
+the result on macOS 26. GoReleaser supports target-specific overrides, for
+example:
 
 ```yaml
 builds:
@@ -374,13 +373,8 @@ builds:
     goarch: [amd64, arm64]
     overrides:
       - goos: darwin
-        goarch: amd64
         ldflags:
-          - -s -w -macos=13.0 -macsdk=13.0
-      - goos: darwin
-        goarch: arm64
-        ldflags:
-          - -s -w -macos=13.0 -macsdk=13.0
+          - -s -w -macos=12.0 -macsdk=12.1
 ```
 
 Do not add Darwin-only linker flags to the shared `ldflags` list: Go passes

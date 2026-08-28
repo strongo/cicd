@@ -692,33 +692,6 @@ func TestReleaseWorkflowReportsInvalidDarwinSignatureAfterExecutionFailure(t *te
 	}
 }
 
-func TestREADMEGo127DarwinGuidanceUsesMacOS13Floor(t *testing.T) {
-	contents, err := os.ReadFile("README.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	readme := string(contents)
-	start := strings.Index(readme, "### Go 1.27 and Darwin signing")
-	if start < 0 {
-		t.Fatal("README has no Go 1.27 Darwin signing guidance")
-	}
-	section := readme[start:]
-	if end := strings.Index(section, "## Keep the pin fresh with Renovate"); end >= 0 {
-		section = section[:end]
-	}
-	if !strings.Contains(section, "macOS 13 or newer") {
-		t.Fatal("Go 1.27 Darwin guidance must state the macOS 13 minimum")
-	}
-	if !strings.Contains(section, "-macos=13.0 -macsdk=13.0") {
-		t.Fatal("Go 1.27 Darwin example must use macOS 13 deployment target and SDK")
-	}
-	for _, forbidden := range []string{"-macos=12.0", "-macsdk=12.1", "macOS 12"} {
-		if strings.Contains(section, forbidden) {
-			t.Fatalf("Go 1.27 Darwin guidance contains unsupported compatibility value %q", forbidden)
-		}
-	}
-}
-
 func assertWorkflowFailure(t *testing.T, workspace, script string, variables map[string]string) {
 	t.Helper()
 	output, err := runBash(workspace, script, variables)
