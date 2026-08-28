@@ -692,6 +692,29 @@ func TestReleaseWorkflowReportsInvalidDarwinSignatureAfterExecutionFailure(t *te
 	}
 }
 
+func TestReadmeKeepsQuillSigningIncidentAndOwnershipVisible(t *testing.T) {
+	contents, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(contents)
+	for _, required := range []string{
+		"https://github.com/strongo/cicd/issues/66",
+		"quill is still the intended",
+		"pre-publication",
+		"codesign --verify --deep --strict --verbose=4",
+		"consumer repository owns",
+		"strongo/cicd owns",
+	} {
+		if !strings.Contains(readme, required) {
+			t.Errorf("README.md does not keep quill-signing contract %q visible", required)
+		}
+	}
+	if strings.Contains(readme, "Keep the release on Go 1.26, or override the Darwin build's linker flags") {
+		t.Error("README.md still recommends the falsified Darwin linker workaround")
+	}
+}
+
 func assertWorkflowFailure(t *testing.T, workspace, script string, variables map[string]string) {
 	t.Helper()
 	output, err := runBash(workspace, script, variables)
