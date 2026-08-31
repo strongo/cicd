@@ -13,6 +13,10 @@ on:
       - 'go.*'
       - '*.go'
       - 'action.yml'
+      # Docs too: branch protection requires this workflow's checks, so a
+      # docs-only PR that never triggers it can never satisfy them and is
+      # unmergeable. Cheap to run; the alternative is docs that cannot land.
+      - '**.md'
   pull_request:
     branches:
       - '**'
@@ -23,6 +27,10 @@ on:
       - 'go.*'
       - '*.go'
       - 'action.yml'
+      # Docs too: branch protection requires this workflow's checks, so a
+      # docs-only PR that never triggers it can never satisfy them and is
+      # unmergeable. Cheap to run; the alternative is docs that cannot land.
+      - '**.md'
 
 jobs:
 
