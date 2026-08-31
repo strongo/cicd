@@ -558,22 +558,24 @@ jobs:
           echo "new_tag=$tag" >> "$GITHUB_OUTPUT"
 
       # Enumerates the git-hosted package-manager repos this release will
-      # push to (Homebrew tap/cask, Scoop bucket, Nix repo -- the publishers
-      # GoReleaser pushes to directly via a plain git ref update, using
-      # GORELEASER_GITHUB_TOKEN) and captures each one's current HEAD SHA
+      # push to -- Homebrew tap/cask, Scoop bucket, Nix repo (via
+      # GORELEASER_GITHUB_TOKEN over the GitHub API), and AUR (a plain git
+      # repo at ssh://aur@aur.archlinux.org/<pkg>.git, over
+      # AUR_SSH_PRIVATE_KEY) -- and captures each one's current HEAD SHA
       # BEFORE GoReleaser runs. macos_verify_and_promote below uses this to
       # roll each repo back to this exact commit if macOS verification
       # fails, restoring the old all-or-nothing release semantics instead of
-      # leaving a formula/manifest live pointing at a release that will
-      # never be promoted.
+      # leaving a formula/manifest/PKGBUILD live pointing at a release that
+      # will never be promoted.
       #
-      # Scoped to brews/homebrew_casks/scoops/nix only. WinGet publishes via
-      # a cross-fork PR against a THIRD-PARTY repo (microsoft/winget-pkgs)
-      # that reverting our own fork's branch would not retract; AUR pushes
-      # over SSH to a non-GitHub git host this GitHub-API-based mechanism
-      # cannot reach. Both are out of scope for automatic rollback -- a
-      # verification failure while either is configured still needs manual
-      # cleanup, and this step says so explicitly if it finds one.
+      # WinGet and Chocolatey remain explicitly out of scope: WinGet opens a
+      # cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs repo --
+      # not a publish, so there is nothing here to force-reset, and a human
+      # closes the PR by hand (it would fail winget-pkgs' own validation
+      # against a rolled-back release anyway); Chocolatey pushes a .nupkg
+      # directly to chocolatey.org via API key, not to any git ref at all --
+      # there is no commit to snapshot or restore. Both warn by name below
+      # if configured, so the gap is visible rather than silent.
       #
       # Only runs when GoReleaser is actually about to run (same condition
       # as the step below): a no-op merge with no tag to cut has nothing to
@@ -584,10 +586,12 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
           cat > "${RUNNER_TEMP}/capture_pre_release_shas.py" <<'PYEOF'
           import json
           import os
+          import stat
           import subprocess
 
           config = {}
@@ -598,11 +602,49 @@ jobs:
                       config = json.loads(proc.stdout)
                   break
 
+          # Non-interactive, bounded SSH for every AUR git operation in this
+          # workflow: BatchMode=yes and ConnectTimeout make a hung or
+          # prompting SSH connection impossible on git's side; every
+          # subprocess call below also passes an explicit `timeout=` so a
+          # stalled network op cannot block this job on Python's side
+          # either. accept-new (not full host-key pinning) trusts a
+          # first-seen host key non-interactively -- simple, and consistent
+          # with what a from-scratch CI runner can verify with no prior
+          # state; not a materially weaker guarantee than what GoReleaser's
+          # own aurs publisher already relies on to push today.
+          def aur_ssh_env(key_path):
+              env = dict(os.environ)
+              env["GIT_SSH_COMMAND"] = (
+                  "ssh -i " + key_path
+                  + " -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10"
+                  + " -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="
+                  + os.path.join(os.path.dirname(key_path), "known_hosts")
+              )
+              return env
+
+          def aur_head(git_url, env):
+              try:
+                  proc = subprocess.run(
+                      ["git", "ls-remote", "--symref", git_url, "HEAD"],
+                      capture_output=True, text=True, env=env, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  return None, None, "timed out reaching " + git_url
+              if proc.returncode != 0:
+                  return None, None, "git ls-remote failed: " + proc.stderr.strip()
+              branch, sha = "", ""
+              for line in proc.stdout.splitlines():
+                  if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                      branch = line[len("ref: refs/heads/"):-len("\tHEAD")]
+                  elif line.endswith("\tHEAD"):
+                      sha = line.split("\t", 1)[0]
+              if not branch or not sha:
+                  return None, None, "could not parse HEAD from ls-remote output"
+              return branch, sha, None
+
           UNCOVERED = {
-              "winget": "it opens a cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs repo; reverting our own fork's branch would not retract an already-filed PR there",
-              "wingets": "it opens a cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs repo; reverting our own fork's branch would not retract an already-filed PR there",
-              "aur": "it pushes over SSH to a non-GitHub git host (aur.archlinux.org); this GitHub-API-based rollback mechanism cannot reach it",
-              "aurs": "it pushes over SSH to a non-GitHub git host (aur.archlinux.org); this GitHub-API-based rollback mechanism cannot reach it",
+              "winget": "it opens a cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs repo, not a publish -- nothing here to force-reset, and a human closes the PR by hand",
+              "wingets": "it opens a cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs repo, not a publish -- nothing here to force-reset, and a human closes the PR by hand",
               "chocolateys": "it pushes a .nupkg directly to chocolatey.org via API key, not to any git ref -- there is no commit to snapshot or restore at all",
           }
           for key, reason in UNCOVERED.items():
@@ -619,11 +661,11 @@ jobs:
                   if not owner or not name:
                       continue
                   branch = repo.get("branch") or ""
-                  ident = (owner, name, branch)
+                  ident = ("github", owner, name, branch)
                   if ident in seen:
                       continue
                   seen.add(ident)
-                  targets.append({"owner": owner, "name": name, "branch": branch})
+                  targets.append({"kind": "github", "owner": owner, "name": name, "branch": branch})
 
           gh_token = os.environ.get("GH_TOKEN", "")
           resolved = []
@@ -644,7 +686,32 @@ jobs:
                       print("::warning::Could not read the current HEAD of " + owner + "/" + name + "@" + branch + " (missing repo/branch, or GORELEASER_GITHUB_TOKEN lacks access); skipping rollback capture for it.")
                       continue
                   print("Captured pre-release SHA for " + owner + "/" + name + "@" + branch + ": " + sha)
-                  resolved.append({"owner": owner, "name": name, "branch": branch, "pre_sha": sha})
+                  resolved.append({"kind": "github", "owner": owner, "name": name, "branch": branch, "pre_sha": sha})
+
+          aur_entries = config.get("aurs") or config.get("aur") or []
+          aur_key = os.environ.get("AUR_SSH_PRIVATE_KEY", "")
+          if aur_entries and not aur_key:
+              print("::warning::This repo configures aurs but AUR_SSH_PRIVATE_KEY is not set; automatic rollback cannot read or restore its AUR package on a failed verification.")
+          elif aur_entries:
+              key_dir = os.path.join(os.environ.get("RUNNER_TEMP", "."), "aur-ssh")
+              os.makedirs(key_dir, exist_ok=True)
+              key_path = os.path.join(key_dir, "id_aur")
+              with open(key_path, "w") as f:
+                  f.write(aur_key if aur_key.endswith("\n") else aur_key + "\n")
+              os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+              env = aur_ssh_env(key_path)
+              seen_urls = set()
+              for entry in aur_entries:
+                  git_url = (entry or {}).get("git_url")
+                  if not git_url or git_url in seen_urls:
+                      continue
+                  seen_urls.add(git_url)
+                  branch, sha, error = aur_head(git_url, env)
+                  if error:
+                      print("::warning::Could not read the current HEAD of AUR repo " + git_url + " (" + error + "); skipping rollback capture for it.")
+                      continue
+                  print("Captured pre-release SHA for AUR " + git_url + "@" + branch + ": " + sha)
+                  resolved.append({"kind": "aur", "git_url": git_url, "branch": branch, "pre_sha": sha})
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("targets=" + json.dumps(resolved) + "\n")
@@ -723,29 +790,81 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           PRE_TARGETS: ${{ steps.capture_pre.outputs.targets }}
         run: |
           cat > "${RUNNER_TEMP}/capture_post_release_shas.py" <<'PYEOF'
           import json
           import os
+          import stat
           import subprocess
+
+          def aur_ssh_env(key_path):
+              env = dict(os.environ)
+              env["GIT_SSH_COMMAND"] = (
+                  "ssh -i " + key_path
+                  + " -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10"
+                  + " -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="
+                  + os.path.join(os.path.dirname(key_path), "known_hosts")
+              )
+              return env
+
+          def aur_head(git_url, env):
+              try:
+                  proc = subprocess.run(
+                      ["git", "ls-remote", "--symref", git_url, "HEAD"],
+                      capture_output=True, text=True, env=env, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  return None, "timed out reaching " + git_url
+              if proc.returncode != 0:
+                  return None, "git ls-remote failed: " + proc.stderr.strip()
+              sha = ""
+              for line in proc.stdout.splitlines():
+                  if line.endswith("\tHEAD") and not line.startswith("ref: "):
+                      sha = line.split("\t", 1)[0]
+              if not sha:
+                  return None, "could not parse HEAD from ls-remote output"
+              return sha, None
 
           pre_targets = json.loads(os.environ.get("PRE_TARGETS") or "[]")
           gh_token = os.environ.get("GH_TOKEN", "")
+          aur_key = os.environ.get("AUR_SSH_PRIVATE_KEY", "")
+          aur_env = None
+          if aur_key and any(t.get("kind") == "aur" for t in pre_targets):
+              key_dir = os.path.join(os.environ.get("RUNNER_TEMP", "."), "aur-ssh")
+              os.makedirs(key_dir, exist_ok=True)
+              key_path = os.path.join(key_dir, "id_aur")
+              with open(key_path, "w") as f:
+                  f.write(aur_key if aur_key.endswith("\n") else aur_key + "\n")
+              os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+              aur_env = aur_ssh_env(key_path)
+
           resolved = []
           for t in pre_targets:
-              owner, name, branch = t["owner"], t["name"], t["branch"]
-              if not gh_token:
-                  continue
-              proc = subprocess.run(
-                  ["gh", "api", "repos/" + owner + "/" + name + "/branches/" + branch, "--jq", ".commit.sha"],
-                  capture_output=True, text=True,
-              )
-              sha = proc.stdout.strip()
-              if proc.returncode != 0 or not sha:
-                  print("::warning::Could not read the post-release HEAD of " + owner + "/" + name + "@" + branch + " right after GoReleaser ran; rollback will not be able to verify or restore this repo if the macOS check later fails.")
-                  continue
-              print("Captured post-release SHA for " + owner + "/" + name + "@" + branch + ": " + sha)
+              if t.get("kind") == "aur":
+                  label = t["git_url"]
+                  if not aur_env:
+                      print("::warning::AUR_SSH_PRIVATE_KEY is not set; rollback will not be able to verify or restore " + label + " if the macOS check later fails.")
+                      continue
+                  sha, error = aur_head(t["git_url"], aur_env)
+                  if error:
+                      print("::warning::Could not read the post-release HEAD of AUR repo " + label + " right after GoReleaser ran (" + error + "); rollback will not be able to verify or restore it if the macOS check later fails.")
+                      continue
+              else:
+                  owner, name, branch = t["owner"], t["name"], t["branch"]
+                  label = owner + "/" + name + "@" + branch
+                  if not gh_token:
+                      continue
+                  proc = subprocess.run(
+                      ["gh", "api", "repos/" + owner + "/" + name + "/branches/" + branch, "--jq", ".commit.sha"],
+                      capture_output=True, text=True,
+                  )
+                  sha = proc.stdout.strip()
+                  if proc.returncode != 0 or not sha:
+                      print("::warning::Could not read the post-release HEAD of " + label + " right after GoReleaser ran; rollback will not be able to verify or restore this repo if the macOS check later fails.")
+                      continue
+              print("Captured post-release SHA for " + label + ": " + sha)
               merged = dict(t)
               merged["post_sha"] = sha
               resolved.append(merged)
@@ -781,19 +900,20 @@ jobs:
   # does not list a draft release or serve its assets to anyone without
   # write access to the repo, so nothing reaches a real user.
   #
-  # KNOWN RESIDUAL RISK, partially closed by the "Roll back publisher
-  # repos" step at the end of this job: `goreleaser release --draft` still
-  # runs this repo's Homebrew/Scoop/Nix/AUR/Chocolatey/WinGet publishers
-  # (when configured) in the SAME invocation as the draft release, because
+  # KNOWN RESIDUAL RISK, mostly closed by the "Roll back publisher repos"
+  # step at the end of this job: `goreleaser release --draft` still runs
+  # this repo's Homebrew/Scoop/Nix/AUR/Chocolatey/WinGet publishers (when
+  # configured) in the SAME invocation as the draft release, because
   # GoReleaser OSS has no supported way to build+sign+notarize+create-the-
   # release once and defer JUST those publishers to a later invocation
   # without rebuilding -- that split/merge (`release --split` + `continue`,
   # or `publish --merge`) is GoReleaser PRO-only (confirmed against the OSS
   # v2.18.0 source this workflow pins: its `cmd/` package has no `publish`
-  # or `continue` subcommand at all). So those publishers push
-  # formula/manifest updates pointing at the draft release's asset URLs
-  # before this job has verified anything. Consequences, and what is and
-  # isn't covered:
+  # or `continue` subcommand at all; separately confirmed neither the brew,
+  # cask, nor aur publisher pipes gate on `draft` -- only `skip_upload`).
+  # So those publishers push formula/manifest/PKGBUILD updates pointing at
+  # the draft release's asset URLs before this job has verified anything.
+  # Consequences, and what is and isn't covered:
   #
   # (1) A brief window (this job's runtime, typically a few minutes) where
   #     a freshly-tapped/pushed formula 404s until promotion -- narrow, not
@@ -805,21 +925,29 @@ jobs:
   #     split/merge; it is accepted as-is.
   #
   # (2) If verification then FAILS, "Roll back publisher repos and delete
-  #     the draft release" below restores Homebrew (brews/homebrew_casks),
-  #     Scoop, and Nix repos to their pre-release commit (compare-and-swap
-  #     guarded: it refuses to touch a repo that has been pushed to again
-  #     since GoReleaser's push, naming both SHAs instead) and deletes the
-  #     unpromoted draft release -- recovering the old preflight's
-  #     all-or-nothing guarantee for those publishers. WinGet (a cross-fork
-  #     PR against the THIRD-PARTY microsoft/winget-pkgs repo -- reverting
-  #     our own fork's branch would not retract an already-filed PR there),
-  #     AUR (pushed over SSH to a non-GitHub git host this GitHub-API-based
-  #     mechanism cannot reach), and Chocolatey (pushed directly to
-  #     chocolatey.org via API key, not to any git ref -- nothing to
-  #     snapshot at all) remain genuinely unrecoverable: a failure while any
-  #     of those is configured still needs manual cleanup, and the capture
-  #     step below emits an explicit `::warning::` naming which one and why.
-  #     ingitdb-cli is the one current consumer configuring WinGet.
+  #     the draft release" below restores every publisher that pushes to a
+  #     git ref this workflow can reach -- Homebrew (brews/homebrew_casks),
+  #     Scoop, and Nix over the GitHub API (GORELEASER_GITHUB_TOKEN), and
+  #     AUR over SSH (AUR_SSH_PRIVATE_KEY, a plain `git push --force` to
+  #     ssh://aur@aur.archlinux.org/<pkg>.git) -- to its pre-release commit.
+  #     Every restore is compare-and-swap guarded: it refuses to touch a
+  #     repo that has been pushed to again since GoReleaser's push, naming
+  #     both SHAs instead of clobbering that push. It also deletes the
+  #     unpromoted draft release. This recovers the old preflight's
+  #     all-or-nothing guarantee for all four publisher kinds.
+  #
+  #     COVERED BY ROLLBACK: brews, homebrew_casks, scoops, nix, aurs.
+  #     NOT COVERED, genuinely unrecoverable by this mechanism: WinGet
+  #     (opens a cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs
+  #     repo -- not a publish, so there is nothing to force-reset; a human
+  #     closes the PR by hand, and it would fail winget-pkgs' own validation
+  #     against a rolled-back release anyway) and Chocolatey (pushes a
+  #     .nupkg directly to chocolatey.org via API key, not to any git ref --
+  #     there is no commit to snapshot or restore at all). A failure while
+  #     either is configured still needs manual cleanup; the capture step
+  #     below emits an explicit `::warning::` naming which one and why.
+  #     ingitdb-cli is the one current consumer configuring WinGet (and the
+  #     only one configuring AUR, which IS now covered).
   macos_verify_and_promote:
     name: Verify and promote macOS release
     needs: release
@@ -1086,9 +1214,11 @@ jobs:
       # macos_signing_preflight job provided for free (a failed preflight
       # blocked the tag, the release, AND every publisher from running at
       # all): rolls each publisher repo GoReleaser just pushed to back to
-      # its pre-release commit, and deletes the unpromoted draft release so
-      # neither an orphan draft nor a stale formula/manifest is left behind
-      # pointing at a release that will never go public.
+      # its pre-release commit -- GitHub-hosted (Homebrew/Scoop/Nix) via
+      # the GitHub API, AUR over SSH via a plain force-push -- and deletes
+      # the unpromoted draft release so neither an orphan draft nor a stale
+      # formula/manifest/PKGBUILD is left behind pointing at a release that
+      # will never go public.
       #
       # Best-effort and loud, by design: every target is attempted
       # independently even if an earlier one fails, and this step always
@@ -1105,13 +1235,16 @@ jobs:
       # repo/branch since, that is a real concurrent write and
       # force-resetting would destroy it -- so this refuses to touch that
       # repo, names both SHAs, and requires a human to reconcile it by hand
-      # instead.
+      # instead. Every SSH call carries its own timeout, and SSH itself
+      # runs BatchMode + ConnectTimeout, so this step cannot hang waiting on
+      # a prompt or a stalled connection.
       - name: Roll back publisher repos and delete the draft release
         if: failure()
         shell: bash
         env:
           RELEASE_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAP_GH_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           ROLLBACK_TARGETS: ${{ needs.release.outputs.rollback_targets }}
           TAG: ${{ steps.release_tag.outputs.tag }}
           REPO: ${{ github.repository }}
@@ -1119,60 +1252,142 @@ jobs:
           cat > "${RUNNER_TEMP}/rollback.py" <<'PYEOF'
           import json
           import os
+          import stat
           import subprocess
           import sys
+          import tempfile
+
+          def aur_ssh_env(key_path):
+              env = dict(os.environ)
+              env["GIT_SSH_COMMAND"] = (
+                  "ssh -i " + key_path
+                  + " -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10"
+                  + " -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="
+                  + os.path.join(os.path.dirname(key_path), "known_hosts")
+              )
+              return env
+
+          def aur_head(git_url, env):
+              try:
+                  proc = subprocess.run(
+                      ["git", "ls-remote", "--symref", git_url, "HEAD"],
+                      capture_output=True, text=True, env=env, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  return None, "timed out reaching " + git_url
+              if proc.returncode != 0:
+                  return None, "git ls-remote failed: " + proc.stderr.strip()
+              sha = ""
+              for line in proc.stdout.splitlines():
+                  if line.endswith("\tHEAD") and not line.startswith("ref: "):
+                      sha = line.split("\t", 1)[0]
+              if not sha:
+                  return None, "could not parse HEAD from ls-remote output"
+              return sha, None
+
+          def aur_force_push(git_url, branch, pre_sha, env):
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  try:
+                      clone = subprocess.run(
+                          ["git", "clone", "--bare", "--quiet", git_url, tmpdir],
+                          capture_output=True, text=True, env=env, timeout=60,
+                      )
+                  except subprocess.TimeoutExpired:
+                      return "timed out cloning " + git_url
+                  if clone.returncode != 0:
+                      return "git clone failed: " + clone.stderr.strip()
+                  try:
+                      push = subprocess.run(
+                          ["git", "push", "--force", git_url, pre_sha + ":refs/heads/" + branch],
+                          capture_output=True, text=True, env=env, cwd=tmpdir, timeout=60,
+                      )
+                  except subprocess.TimeoutExpired:
+                      return "timed out force-pushing to " + git_url
+                  if push.returncode != 0:
+                      return "git push --force failed: " + push.stderr.strip()
+              return None
 
           tap_token = os.environ.get("TAP_GH_TOKEN", "")
+          tap_env = None
+          if tap_token:
+              tap_env = dict(os.environ)
+              tap_env["GH_TOKEN"] = tap_token
+
+          aur_key = os.environ.get("AUR_SSH_PRIVATE_KEY", "")
           targets = json.loads(os.environ.get("ROLLBACK_TARGETS") or "[]")
+          aur_env = None
+          if aur_key and any(t.get("kind") == "aur" for t in targets):
+              key_dir = os.path.join(os.environ.get("RUNNER_TEMP", "."), "aur-ssh-rollback")
+              os.makedirs(key_dir, exist_ok=True)
+              key_path = os.path.join(key_dir, "id_aur")
+              with open(key_path, "w") as f:
+                  f.write(aur_key if aur_key.endswith("\n") else aur_key + "\n")
+              os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+              aur_env = aur_ssh_env(key_path)
 
           restored = []
           refused = []
           errored = []
 
-          if targets and not tap_token:
-              print("::error::GORELEASER_GITHUB_TOKEN is not set; cannot verify or restore " + str(len(targets)) + " publisher repo(s) GoReleaser may have already pushed to. Restore them by hand.")
-              errored = [t["owner"] + "/" + t["name"] + "@" + t["branch"] for t in targets]
-              targets = []
-
           for t in targets:
-              owner, name, branch = t["owner"], t["name"], t["branch"]
+              kind = t.get("kind", "github")
+              label = t["git_url"] if kind == "aur" else t["owner"] + "/" + t["name"] + "@" + t["branch"]
               pre_sha, post_sha = t.get("pre_sha"), t.get("post_sha")
-              label = owner + "/" + name + "@" + branch
               if not pre_sha or not post_sha:
                   print("::error::No pre/post SHA recorded for " + label + "; cannot safely restore it. Check it by hand.")
                   errored.append(label)
                   continue
 
-              env = dict(os.environ)
-              env["GH_TOKEN"] = tap_token
-              proc = subprocess.run(
-                  ["gh", "api", "repos/" + owner + "/" + name + "/branches/" + branch, "--jq", ".commit.sha"],
-                  capture_output=True, text=True, env=env,
-              )
-              current_sha = proc.stdout.strip()
-              if proc.returncode != 0 or not current_sha:
-                  print("::error::Could not re-read the current HEAD of " + label + " to check it is safe to restore. Check it by hand.")
-                  errored.append(label)
-                  continue
+              if kind == "aur":
+                  if not aur_env:
+                      print("::error::AUR_SSH_PRIVATE_KEY is not set; cannot verify or restore " + label + ". Restore it by hand.")
+                      errored.append(label)
+                      continue
+                  current_sha, error = aur_head(t["git_url"], aur_env)
+                  if error:
+                      print("::error::Could not re-read the current HEAD of " + label + " to check it is safe to restore (" + error + "). Check it by hand.")
+                      errored.append(label)
+                      continue
+              else:
+                  if not tap_env:
+                      print("::error::GORELEASER_GITHUB_TOKEN is not set; cannot verify or restore " + label + ". Restore it by hand.")
+                      errored.append(label)
+                      continue
+                  proc = subprocess.run(
+                      ["gh", "api", "repos/" + t["owner"] + "/" + t["name"] + "/branches/" + t["branch"], "--jq", ".commit.sha"],
+                      capture_output=True, text=True, env=tap_env,
+                  )
+                  current_sha = proc.stdout.strip()
+                  if proc.returncode != 0 or not current_sha:
+                      print("::error::Could not re-read the current HEAD of " + label + " to check it is safe to restore. Check it by hand.")
+                      errored.append(label)
+                      continue
 
               if current_sha != post_sha:
                   print("::error::Refusing to restore " + label + ": expected it to still be at the SHA GoReleaser just pushed (" + post_sha + "), but it is now at " + current_sha + ". Someone else has pushed to it since -- restoring would destroy that push. Reconcile it by hand; it currently points at unpublished/unverified content.")
                   refused.append(label + " (expected " + post_sha + ", found " + current_sha + ")")
                   continue
 
-              proc = subprocess.run(
-                  [
-                      "gh", "api", "-X", "PATCH",
-                      "repos/" + owner + "/" + name + "/git/refs/heads/" + branch,
-                      "-f", "sha=" + pre_sha,
-                      "-F", "force=true",
-                  ],
-                  capture_output=True, text=True, env=env,
-              )
-              if proc.returncode != 0:
-                  print("::error::Failed to restore " + label + " to its pre-release SHA " + pre_sha + ": " + proc.stderr.strip())
-                  errored.append(label)
-                  continue
+              if kind == "aur":
+                  error = aur_force_push(t["git_url"], t["branch"], pre_sha, aur_env)
+                  if error:
+                      print("::error::Failed to restore " + label + " to its pre-release SHA " + pre_sha + " (" + error + ").")
+                      errored.append(label)
+                      continue
+              else:
+                  proc = subprocess.run(
+                      [
+                          "gh", "api", "-X", "PATCH",
+                          "repos/" + t["owner"] + "/" + t["name"] + "/git/refs/heads/" + t["branch"],
+                          "-f", "sha=" + pre_sha,
+                          "-F", "force=true",
+                      ],
+                      capture_output=True, text=True, env=tap_env,
+                  )
+                  if proc.returncode != 0:
+                      print("::error::Failed to restore " + label + " to its pre-release SHA " + pre_sha + ": " + proc.stderr.strip())
+                      errored.append(label)
+                      continue
 
               print("Restored " + label + " to its pre-release SHA " + pre_sha + ".")
               restored.append(label)

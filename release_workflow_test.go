@@ -189,13 +189,20 @@ func TestReleaseWorkflowVerifiesRealPublishedArtifactBeforePromotion(t *testing.
 	// This job must never mutate anything by tagging directly, nor take
 	// the Homebrew-cask-install path (that is layer 3's job, further
 	// below, against the PROMOTED release). It legitimately DOES mutate
-	// the release now (promote, and on failure roll back/delete) --
-	// unlike the removed preflight, which was read-only by design -- so
-	// only the specific unrelated mutations remain forbidden.
-	for _, forbidden := range []string{"git tag ", "git push ", "brew install", "brew tap"} {
+	// things now -- promote or roll back the release, and (only on the
+	// AUR rollback path) a scoped `git push --force` to restore a
+	// captured pre-release SHA -- unlike the removed preflight, which was
+	// read-only by design, so only the specific unrelated/unscoped
+	// mutations remain forbidden.
+	for _, forbidden := range []string{"git tag ", "brew install", "brew tap"} {
 		if strings.Contains(verify, forbidden) {
 			t.Fatalf("macos_verify_and_promote must not mutate release tags or install via Homebrew, found %q", forbidden)
 		}
+	}
+	// The only git push in this job must be the deliberate, guarded AUR
+	// rollback restore -- never a bare/unscoped push.
+	if strings.Contains(verify, "git push ") && !strings.Contains(verify, `"git", "push", "--force", git_url, pre_sha`) {
+		t.Fatal("macos_verify_and_promote must not contain an unscoped git push outside the guarded AUR rollback restore")
 	}
 	if strings.Contains(verify, "output=\\\"( \\\"$BIN_PATH\\\" $SMOKE_CMD") {
 		t.Fatal("macOS verification execution must use the bounded process-group watchdog")
@@ -856,18 +863,21 @@ func TestReleaseWorkflowCapturePreReleaseSHAsDerivesTargetsFromConsumerConfig(t 
 	script := releaseWorkflowRunBlock(t, "Capture pre-release publisher repo SHAs")
 
 	workspace := t.TempDir()
-	goreleaserConfig := `project_name: widget
-homebrew_casks:
-  - name: widget
-    repository:
-      owner: acme
-      name: homebrew-tap
-      branch: main
-winget:
-  - repository:
-      owner: acme
-      name: winget-pkgs
-`
+	goreleaserConfig := "project_name: widget\n" +
+		"homebrew_casks:\n" +
+		"  - name: widget\n" +
+		"    repository:\n" +
+		"      owner: acme\n" +
+		"      name: homebrew-tap\n" +
+		"      branch: main\n" +
+		"aurs:\n" +
+		"  - name: widget-bin\n" +
+		"    git_url: \"ssh://aur@aur.archlinux.org/widget-bin.git\"\n" +
+		"    private_key: \"{{ .Env.AUR_SSH_PRIVATE_KEY }}\"\n" +
+		"winget:\n" +
+		"  - repository:\n" +
+		"      owner: acme\n" +
+		"      name: winget-pkgs\n"
 	if err := os.WriteFile(filepath.Join(workspace, ".goreleaser.yaml"), []byte(goreleaserConfig), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -877,22 +887,33 @@ winget:
 		t.Fatal(err)
 	}
 	const headSHA = "dddddddddddddddddddddddddddddddddddddddd"
-	writeExecutable(t, filepath.Join(fakeBinDir, "gh"), `#!/usr/bin/env bash
-set -euo pipefail
-if [ "$1" = "api" ]; then
-  printf '%s\n' "`+"`"+`echo $CICD_HEAD_SHA`+"`"+`"
-  exit 0
-fi
-exit 1
-`)
+	writeExecutable(t, filepath.Join(fakeBinDir, "gh"), "#!/usr/bin/env bash\n"+
+		"set -euo pipefail\n"+
+		"if [ \"$1\" = \"api\" ]; then\n"+
+		"  printf '%s\\n' \"$CICD_HEAD_SHA\"\n"+
+		"  exit 0\n"+
+		"fi\n"+
+		"exit 1\n")
+
+	const aurHeadSHA = "5555555555555555555555555555555555555555"
+	writeExecutable(t, filepath.Join(fakeBinDir, "git"), "#!/usr/bin/env bash\n"+
+		"set -euo pipefail\n"+
+		"if [ \"$1\" = \"ls-remote\" ]; then\n"+
+		"  printf 'ref: refs/heads/master\\tHEAD\\n'\n"+
+		"  printf '%s\\tHEAD\\n' \"$CICD_AUR_HEAD_SHA\"\n"+
+		"  exit 0\n"+
+		"fi\n"+
+		"exit 1\n")
 
 	outputFile := filepath.Join(workspace, "github-output")
 	output, err := runBash(workspace, script, map[string]string{
-		"PATH":          fakeBinDir + string(os.PathListSeparator) + os.Getenv("PATH"),
-		"GH_TOKEN":      "tap-token",
-		"GITHUB_OUTPUT": outputFile,
-		"RUNNER_TEMP":   workspace,
-		"CICD_HEAD_SHA": headSHA,
+		"PATH":                fakeBinDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"GH_TOKEN":            "tap-token",
+		"AUR_SSH_PRIVATE_KEY": "fake-private-key-contents",
+		"GITHUB_OUTPUT":       outputFile,
+		"RUNNER_TEMP":         workspace,
+		"CICD_HEAD_SHA":       headSHA,
+		"CICD_AUR_HEAD_SHA":   aurHeadSHA,
 	})
 	if err != nil {
 		t.Fatalf("capture pre-release SHAs: %v\n%s", err, output)
@@ -904,6 +925,11 @@ exit 1
 	for _, want := range []string{`"owner": "acme"`, `"name": "homebrew-tap"`, `"branch": "main"`, `"pre_sha": "` + headSHA + `"`} {
 		if !strings.Contains(targets, want) {
 			t.Fatalf("targets = %q, missing %q", targets, want)
+		}
+	}
+	for _, want := range []string{`"kind": "aur"`, `"git_url": "ssh://aur@aur.archlinux.org/widget-bin.git"`, `"branch": "master"`, `"pre_sha": "` + aurHeadSHA + `"`} {
+		if !strings.Contains(targets, want) {
+			t.Fatalf("targets = %q, missing AUR target %q", targets, want)
 		}
 	}
 	if strings.Contains(targets, "winget-pkgs") {
@@ -1037,6 +1063,156 @@ exit 1
 		}
 		if !strings.Contains(string(calls), "release delete v1.2.3 --repo acme/widget --yes") {
 			t.Fatalf("rollback did not delete the unpromoted draft release:\n%s", calls)
+		}
+	})
+
+	// AUR is reachable only via SSH to a non-GitHub host
+	// (ssh://aur@aur.archlinux.org/<pkg>.git), so it needs its own fake
+	// `git` (intercepting ls-remote/clone/push) alongside the fake `gh`
+	// used for the draft-release delete that always runs. No real SSH is
+	// ever invoked: the fake `git` handles every subcommand the rollback
+	// script calls directly, so GIT_SSH_COMMAND is set but never exercised
+	// here -- this test is about the orchestration logic (compare-and-swap,
+	// which calls run, in what order), not git/SSH plumbing itself.
+	newFakeGitAndGH := func(t *testing.T, workspace, ghCurrentSHA, aurBranch, aurCurrentSHA string) (fakeBinDir string, ghCallsFile, gitCallsFile, gitPushCallsFile string) {
+		t.Helper()
+		fakeBinDir = filepath.Join(workspace, "fake-bin")
+		if err := os.MkdirAll(fakeBinDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		ghCallsFile = filepath.Join(workspace, "gh-calls")
+		writeExecutable(t, filepath.Join(fakeBinDir, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s
+' "$*" >> "$CICD_GH_CALLS"
+if [ "$1" = "release" ] && [ "$2" = "delete" ]; then
+  exit 0
+fi
+exit 1
+`)
+		gitCallsFile = filepath.Join(workspace, "git-calls")
+		gitPushCallsFile = filepath.Join(workspace, "git-push-calls")
+		writeExecutable(t, filepath.Join(fakeBinDir, "git"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s
+' "$*" >> "${CICD_GIT_CALLS:-/dev/null}"
+if [ "$1" = "ls-remote" ]; then
+  printf 'ref: refs/heads/%s	HEAD
+' "$CICD_AUR_BRANCH"
+  printf '%s	HEAD
+' "$CICD_AUR_CURRENT_SHA"
+  exit 0
+fi
+if [ "$1" = "clone" ]; then
+  mkdir -p "${!#}"
+  exit 0
+fi
+if [ "$1" = "push" ]; then
+  printf '%s
+' "$*" >> "$CICD_GIT_PUSH_CALLS"
+  exit 0
+fi
+exit 1
+`)
+		return fakeBinDir, ghCallsFile, gitCallsFile, gitPushCallsFile
+	}
+
+	const aurGitURL = "ssh://aur@aur.archlinux.org/widget-bin.git"
+	const aurBranch = "master"
+	const aurPreSHA, aurPostSHA = "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"
+	aurRollbackTargets := `[{"kind":"aur","git_url":"` + aurGitURL + `","branch":"` + aurBranch + `","pre_sha":"` + aurPreSHA + `","post_sha":"` + aurPostSHA + `"}]`
+
+	t.Run("aur safe: current HEAD matches GoReleaser's push, force-pushes the pre-release SHA", func(t *testing.T) {
+		workspace := t.TempDir()
+		fakeBinDir, ghCallsFile, _, gitPushCallsFile := newFakeGitAndGH(t, workspace, "", aurBranch, aurPostSHA)
+		output, err := runBash(workspace, script, map[string]string{
+			"PATH":                 fakeBinDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"RUNNER_TEMP":          workspace,
+			"RELEASE_GH_TOKEN":     "release-token",
+			"TAP_GH_TOKEN":         "tap-token",
+			"AUR_SSH_PRIVATE_KEY":  "fake-private-key-contents",
+			"ROLLBACK_TARGETS":     aurRollbackTargets,
+			"TAG":                  "v1.2.3",
+			"REPO":                 "acme/widget",
+			"CICD_GH_CALLS":        ghCallsFile,
+			"CICD_GIT_PUSH_CALLS":  gitPushCallsFile,
+			"CICD_AUR_BRANCH":      aurBranch,
+			"CICD_AUR_CURRENT_SHA": aurPostSHA,
+		})
+		if err != nil {
+			t.Fatalf("AUR rollback with a safe compare-and-swap must succeed: %v\n%s", err, output)
+		}
+		pushCalls, err := os.ReadFile(gitPushCallsFile)
+		if err != nil {
+			t.Fatalf("expected the force-push restore call to run: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(pushCalls), "push --force "+aurGitURL+" "+aurPreSHA+":refs/heads/"+aurBranch) {
+			t.Fatalf("force-push did not restore the expected AUR ref: %s", pushCalls)
+		}
+		if !strings.Contains(string(output), "Restored "+aurGitURL) {
+			t.Fatalf("rollback did not report the restored AUR repo:\n%s", output)
+		}
+	})
+
+	t.Run("aur unsafe: concurrent push since GoReleaser's push, refuses to force-push", func(t *testing.T) {
+		workspace := t.TempDir()
+		const aurConcurrentSHA = "3333333333333333333333333333333333333333"
+		fakeBinDir, ghCallsFile, _, gitPushCallsFile := newFakeGitAndGH(t, workspace, "", aurBranch, aurConcurrentSHA)
+		output, err := runBash(workspace, script, map[string]string{
+			"PATH":                 fakeBinDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"RUNNER_TEMP":          workspace,
+			"RELEASE_GH_TOKEN":     "release-token",
+			"TAP_GH_TOKEN":         "tap-token",
+			"AUR_SSH_PRIVATE_KEY":  "fake-private-key-contents",
+			"ROLLBACK_TARGETS":     aurRollbackTargets,
+			"TAG":                  "v1.2.3",
+			"REPO":                 "acme/widget",
+			"CICD_GH_CALLS":        ghCallsFile,
+			"CICD_GIT_PUSH_CALLS":  gitPushCallsFile,
+			"CICD_AUR_BRANCH":      aurBranch,
+			"CICD_AUR_CURRENT_SHA": aurConcurrentSHA,
+		})
+		if err == nil {
+			t.Fatalf("AUR rollback must exit non-zero when it refuses a repo, to stay visibly red:\n%s", output)
+		}
+		if _, statErr := os.Stat(gitPushCallsFile); statErr == nil {
+			pushCalls, _ := os.ReadFile(gitPushCallsFile)
+			t.Fatalf("AUR rollback must NOT force-push a repo with a concurrent push, but called git push: %s", pushCalls)
+		}
+		if !strings.Contains(string(output), "::error::") {
+			t.Fatalf("AUR rollback must report a concurrent-push refusal as an error:\n%s", output)
+		}
+		if !strings.Contains(string(output), aurPostSHA) || !strings.Contains(string(output), aurConcurrentSHA) {
+			t.Fatalf("AUR rollback refusal must name both the expected and actual SHA so a human can reconcile it:\n%s", output)
+		}
+	})
+
+	t.Run("aur: missing AUR_SSH_PRIVATE_KEY warns and errors without attempting SSH", func(t *testing.T) {
+		workspace := t.TempDir()
+		fakeBinDir, ghCallsFile, gitCallsFile, gitPushCallsFile := newFakeGitAndGH(t, workspace, "", aurBranch, aurPostSHA)
+		output, err := runBash(workspace, script, map[string]string{
+			"PATH":                 fakeBinDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"RUNNER_TEMP":          workspace,
+			"RELEASE_GH_TOKEN":     "release-token",
+			"TAP_GH_TOKEN":         "tap-token",
+			"AUR_SSH_PRIVATE_KEY":  "",
+			"ROLLBACK_TARGETS":     aurRollbackTargets,
+			"TAG":                  "v1.2.3",
+			"REPO":                 "acme/widget",
+			"CICD_GH_CALLS":        ghCallsFile,
+			"CICD_GIT_PUSH_CALLS":  gitPushCallsFile,
+			"CICD_AUR_BRANCH":      aurBranch,
+			"CICD_AUR_CURRENT_SHA": aurPostSHA,
+		})
+		if err == nil {
+			t.Fatalf("AUR rollback without a key must exit non-zero (nothing was restored):\n%s", output)
+		}
+		if _, statErr := os.Stat(gitCallsFile); statErr == nil {
+			calls, _ := os.ReadFile(gitCallsFile)
+			t.Fatalf("AUR rollback must not invoke git at all without a key, but got: %s", calls)
+		}
+		if !strings.Contains(string(output), "::error::") || !strings.Contains(string(output), aurGitURL) {
+			t.Fatalf("AUR rollback must name the repo it could not restore for lack of a key:\n%s", output)
 		}
 	})
 }
