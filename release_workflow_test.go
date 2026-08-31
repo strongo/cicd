@@ -80,10 +80,30 @@ func TestReleaseWorkflowExtractsAnAbsoluteRunnableBinaryPath(t *testing.T) {
 	}
 }
 
-func TestReleaseWorkflowUsesConsumerGoReleaserSnapshotPreflight(t *testing.T) {
+// TestReleaseWorkflowVerifiesRealPublishedArtifactBeforePromotion supersedes
+// the removed TestReleaseWorkflowUsesConsumerGoReleaserSnapshotPreflight:
+// strongo/cicd#70 replaced macos_signing_preflight (a full binary matrix
+// SNAPSHOT built and verified on macos-latest, discarded, while `release`
+// separately rebuilt and published the real matrix on ubuntu-latest -- two
+// full matrix builds per release, verifying bytes that were never shipped)
+// with a single build. `release` (ubuntu-latest) now builds the matrix
+// once and, when require_notarized_macos, publishes a DRAFT; a new
+// macos_verify_and_promote job downloads THAT EXACT published darwin/arm64
+// asset, runs the same codesign/spctl/execute checks the old preflight ran
+// against a throwaway snapshot, and promotes the draft to public only on
+// success. This test asserts the new contract with the same rigor the old
+// one asserted the removed one, plus the one-matrix-build property the
+// whole change exists to deliver.
+func TestReleaseWorkflowVerifiesRealPublishedArtifactBeforePromotion(t *testing.T) {
 	workflow := readReleaseWorkflow(t)
+
+	// Still true regardless of implementation shape: this job must verify
+	// the CONSUMER's own artifact, never a custom quill-based helper. This
+	// guards the same incident the removed test guarded, now against a
+	// stronger implementation that doesn't even invoke GoReleaser at all in
+	// this job (it downloads a published asset instead of building one).
 	if strings.Contains(workflow, "anchore/quill") {
-		t.Fatal("macOS signing preflight must not download the unrelated anchore/quill tool")
+		t.Fatal("macOS verification must not download the unrelated anchore/quill tool")
 	}
 	for _, forbidden := range []string{
 		"go mod init cicd-macos-signing-preflight",
@@ -94,75 +114,107 @@ func TestReleaseWorkflowUsesConsumerGoReleaserSnapshotPreflight(t *testing.T) {
 		"cicd-macos-signing-preflight",
 	} {
 		if strings.Contains(workflow, forbidden) {
-			t.Fatalf("macOS signing preflight must run the consumer's GoReleaser config, not a custom helper containing %q", forbidden)
+			t.Fatalf("macOS verification must check the consumer's real published artifact, not a custom helper containing %q", forbidden)
 		}
 	}
+
+	// The removed job's exact job-declaration line must be gone -- not just
+	// unmentioned in prose (this file's comments deliberately still name
+	// macos_signing_preflight when explaining what it replaced).
+	if strings.Contains(workflow, "  macos_signing_preflight:\n") {
+		t.Fatal("release workflow must not redeclare the removed macos_signing_preflight job")
+	}
+	if strings.Contains(workflow, "needs: macos_signing_preflight") {
+		t.Fatal("release job must not depend on the removed macos_signing_preflight job")
+	}
+
+	// The core deliverable of strongo/cicd#70: exactly ONE matrix build per
+	// release, not two. macos_verify_and_promote downloads a published
+	// asset; it must never invoke goreleaser-action itself.
+	if got := strings.Count(workflow, "uses: goreleaser/goreleaser-action@v7"); got != 1 {
+		t.Fatalf("goreleaser-action must run exactly once (one matrix build), found %d", got)
+	}
+
 	for _, required := range []string{
-		"  macos_signing_preflight:\n",
-		"if: ${{ inputs.require_notarized_macos }}",
+		"  macos_verify_and_promote:\n",
+		"if: ${{ inputs.require_notarized_macos && !failure() && !cancelled() && (needs.release.outputs.tag != '' || github.ref_type == 'tag') }}",
 		"runs-on: macos-latest",
-		"uses: goreleaser/goreleaser-action@v7",
-		"go-version: ${{ inputs.go_version }}",
-		"version: v2.18.0",
-		"args: release --snapshot --clean --skip=publish",
 		"BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}",
 		"TAG_PREFIX: ${{ inputs.tag_prefix }}",
-		"artifact_smoke_test_command",
-		"find dist -type f -name \"$binary\"",
 		"TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}",
 		"run_with_timeout \"$TIMEOUT_SECONDS\"",
 		"process_group_exists",
 		"os.killpg",
-		".preflight_timed_out",
+		".macos_verify_timed_out",
 		"codesign --verify --deep --strict --verbose=4",
 		"spctl -a -t install -vv",
 		"source=Notarized Developer ID",
-		"SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}",
-		"needs: macos_signing_preflight",
+		`gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false`,
+		// --draft is the mechanism that gates public visibility on
+		// verification: GoReleaser OSS has no build/publish split
+		// (confirmed: no publish/continue subcommand at the pinned
+		// v2.18.0), so the release is published as a draft and only
+		// promoted after this job verifies it.
+		"${{ inputs.require_notarized_macos && '--draft' || '' }}",
 	} {
 		if !strings.Contains(workflow, required) {
-			t.Fatalf("release workflow is missing exact consumer snapshot preflight contract %q", required)
+			t.Fatalf("release workflow is missing exact macOS verification contract %q", required)
 		}
 	}
-	preflightIndex := strings.Index(workflow, "  macos_signing_preflight:\n")
+
+	// Signing secret guard must still run before any tag is cut -- this
+	// invariant is unaffected by strongo/cicd#70 and lives entirely inside
+	// the release job.
 	tagGuardIndex := strings.Index(workflow, "Guard signing secret policy before tagging")
 	tagIndex := strings.Index(workflow, "Determine and push guarded tag")
 	if tagGuardIndex < 0 || tagIndex < 0 || tagGuardIndex > tagIndex {
 		t.Fatal("signing secret guard must run before the guarded tag step")
 	}
-	if preflightIndex > tagIndex {
-		t.Fatal("macOS signing preflight must be declared before the guarded tag step")
+
+	// The REAL sequencing guarantee now comes from the needs:/if: graph,
+	// not file position (unlike the removed job, which had to be declared
+	// before the tag step to visibly gate it). Assert the graph edge
+	// directly: macos_verify_and_promote must declare release as its
+	// needs -- checked above via its `if:` referencing needs.release.
+	verifyStart := strings.Index(workflow, "\n  macos_verify_and_promote:\n")
+	verifyEnd := strings.Index(workflow, "\n  finalize_release:\n")
+	if verifyStart < 0 || verifyEnd < 0 || verifyStart >= verifyEnd {
+		t.Fatal("release workflow must contain an inspectable macos_verify_and_promote job")
 	}
-	if !strings.Contains(workflow, "release --snapshot --clean --skip=publish") {
-		t.Fatal("macOS signing preflight must use GoReleaser snapshot mode without publication")
+	verify := workflow[verifyStart:verifyEnd]
+	if !strings.Contains(verify, "needs: release") {
+		t.Fatal("macos_verify_and_promote must declare release as its needs")
 	}
-	preflightStart := strings.Index(workflow, "\njobs:\n")
-	preflightEnd := strings.Index(workflow, "\n  release:")
-	if preflightStart < 0 || preflightEnd < 0 || preflightStart >= preflightEnd {
-		t.Fatal("release workflow must contain an inspectable macOS preflight job")
-	}
-	preflight := workflow[preflightStart:preflightEnd]
-	for _, forbidden := range []string{"git tag ", "gh release ", "brew install", "brew tap"} {
-		if strings.Contains(preflight, forbidden) {
-			t.Fatalf("macOS signing preflight must not mutate release tags, GitHub releases, or casks via %q", forbidden)
+
+	// This job must never mutate anything by tagging directly, nor take
+	// the Homebrew-cask-install path (that is layer 3's job, further
+	// below, against the PROMOTED release). It legitimately DOES mutate
+	// the release now (promote, and on failure roll back/delete) --
+	// unlike the removed preflight, which was read-only by design -- so
+	// only the specific unrelated mutations remain forbidden.
+	for _, forbidden := range []string{"git tag ", "git push ", "brew install", "brew tap"} {
+		if strings.Contains(verify, forbidden) {
+			t.Fatalf("macos_verify_and_promote must not mutate release tags or install via Homebrew, found %q", forbidden)
 		}
 	}
-	if strings.Contains(preflight, "output=\\\"( \\\"$BIN_PATH\\\" $SMOKE_CMD") {
-		t.Fatal("preflight smoke execution must use the bounded process-group watchdog")
+	if strings.Contains(verify, "output=\\\"( \\\"$BIN_PATH\\\" $SMOKE_CMD") {
+		t.Fatal("macOS verification execution must use the bounded process-group watchdog")
 	}
 	for _, required := range []string{`printf '%s\n' "$output"`, `if [ "$status" -ne 0 ]; then`, `if [ -z "$(printf '%s' "$output"`} {
-		if !strings.Contains(preflight, required) {
-			t.Fatalf("preflight smoke must preserve execution diagnostics %q", required)
+		if !strings.Contains(verify, required) {
+			t.Fatalf("macOS verification must preserve execution diagnostics %q", required)
 		}
 	}
-	for _, required := range []string{
-		"Set GitHub access token for GOPRIVATE",
-		"git config --global \"url.https://${PRIVATE_GIT_TOKEN}:x-oauth-basic@${prefix}/.insteadOf\"",
-	} {
-		if !strings.Contains(preflight, required) {
-			t.Fatalf("macOS preflight must preserve the production private-module setup %q", required)
-		}
+
+	// Deliberate simplification, not an oversight: this job downloads a
+	// published asset rather than building from source, so it needs none
+	// of the private-module (GOPRIVATE) build setup the removed preflight
+	// needed. Assert that setup step appears exactly once in the whole
+	// file now (in the release job's own build), not duplicated here.
+	if got := strings.Count(workflow, "Set GitHub access token for GOPRIVATE"); got != 1 {
+		t.Fatalf("GOPRIVATE setup should appear exactly once (release job only, macos_verify_and_promote does not build), found %d", got)
 	}
+
 	if !strings.Contains(workflow, `if [ -n "$SIGN_P12" ] && [ "${{ inputs.require_notarized_macos }}" != "true" ]; then`) {
 		t.Fatal("release workflow must reject a signing secret when notarization proof is disabled")
 	}
@@ -778,6 +830,215 @@ func TestReleaseWorkflowReportsInvalidDarwinSignatureAfterExecutionFailure(t *te
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("Linux execution failure unexpectedly invoked codesign, stat error=%v\n%s", err, linuxOutput)
 	}
+}
+
+// TestReleaseWorkflowRollbackRestoresPublisherRepoOnlyWhenSafe exercises the
+// compare-and-swap safety guard in "Roll back publisher repos and delete the
+// draft release" (added alongside macos_verify_and_promote to restore the
+// old macos_signing_preflight's all-or-nothing guarantee: a failed
+// verification must not leave a Homebrew/Scoop/Nix formula push live
+// pointing at a release that will never be promoted). The guard must reset
+// a publisher repo to its pre-release SHA when nothing has touched it since
+// GoReleaser's own push, and must REFUSE -- never force-reset -- when a
+// concurrent push has moved that repo's HEAD since, naming both SHAs
+// instead of silently clobbering someone else's commit.
+// TestReleaseWorkflowCapturePreReleaseSHAsDerivesTargetsFromConsumerConfig
+// exercises "Capture pre-release publisher repo SHAs" against the common
+// case named explicitly when this rollback mechanism was requested: a
+// consumer configuring only a Homebrew tap. Targets must come from the
+// consumer's own .goreleaser.yaml (never hardcoded), and a WinGet
+// publisher alongside it -- unrecoverable by this rollback -- must produce
+// an explicit warning rather than being silently ignored.
+func TestReleaseWorkflowCapturePreReleaseSHAsDerivesTargetsFromConsumerConfig(t *testing.T) {
+	if _, err := exec.LookPath("yq"); err != nil {
+		t.Skip("yq not installed; the real release runner image guarantees it, this dev machine may not")
+	}
+	script := releaseWorkflowRunBlock(t, "Capture pre-release publisher repo SHAs")
+
+	workspace := t.TempDir()
+	goreleaserConfig := `project_name: widget
+homebrew_casks:
+  - name: widget
+    repository:
+      owner: acme
+      name: homebrew-tap
+      branch: main
+winget:
+  - repository:
+      owner: acme
+      name: winget-pkgs
+`
+	if err := os.WriteFile(filepath.Join(workspace, ".goreleaser.yaml"), []byte(goreleaserConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBinDir := filepath.Join(workspace, "fake-bin")
+	if err := os.MkdirAll(fakeBinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const headSHA = "dddddddddddddddddddddddddddddddddddddddd"
+	writeExecutable(t, filepath.Join(fakeBinDir, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" = "api" ]; then
+  printf '%s\n' "`+"`"+`echo $CICD_HEAD_SHA`+"`"+`"
+  exit 0
+fi
+exit 1
+`)
+
+	outputFile := filepath.Join(workspace, "github-output")
+	output, err := runBash(workspace, script, map[string]string{
+		"PATH":          fakeBinDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"GH_TOKEN":      "tap-token",
+		"GITHUB_OUTPUT": outputFile,
+		"RUNNER_TEMP":   workspace,
+		"CICD_HEAD_SHA": headSHA,
+	})
+	if err != nil {
+		t.Fatalf("capture pre-release SHAs: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "::warning::") || !strings.Contains(string(output), "winget") {
+		t.Fatalf("capture must warn by name about the unrecoverable WinGet publisher:\n%s", output)
+	}
+	targets := githubOutput(t, outputFile, "targets")
+	for _, want := range []string{`"owner": "acme"`, `"name": "homebrew-tap"`, `"branch": "main"`, `"pre_sha": "` + headSHA + `"`} {
+		if !strings.Contains(targets, want) {
+			t.Fatalf("targets = %q, missing %q", targets, want)
+		}
+	}
+	if strings.Contains(targets, "winget-pkgs") {
+		t.Fatalf("targets must not include the unrecoverable WinGet repo: %q", targets)
+	}
+}
+
+func TestReleaseWorkflowRollbackRestoresPublisherRepoOnlyWhenSafe(t *testing.T) {
+	script := releaseWorkflowRunBlock(t, "Roll back publisher repos and delete the draft release")
+
+	const owner, repo, branch = "acme", "homebrew-tap", "main"
+	const preSHA, postSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	rollbackTargets := `[{"owner":"` + owner + `","name":"` + repo + `","branch":"` + branch + `","pre_sha":"` + preSHA + `","post_sha":"` + postSHA + `"}]`
+
+	newFakeGH := func(t *testing.T, workspace, currentSHA string) (fakeBinDir, callsFile string) {
+		t.Helper()
+		fakeBinDir = filepath.Join(workspace, "fake-bin")
+		if err := os.MkdirAll(fakeBinDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		callsFile = filepath.Join(workspace, "gh-calls")
+		writeExecutable(t, filepath.Join(fakeBinDir, "gh"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$CICD_GH_CALLS"
+if [ "$1" = "api" ] && [ "$2" = "-X" ] && [ "$3" = "PATCH" ]; then
+  printf '%s\n' "$*" >> "$CICD_PATCH_CALLS"
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  printf '%s\n' "`+"`"+`echo $CICD_CURRENT_SHA`+"`"+`"
+  exit 0
+fi
+if [ "$1" = "release" ] && [ "$2" = "delete" ]; then
+  exit 0
+fi
+exit 1
+`)
+		return fakeBinDir, callsFile
+	}
+
+	t.Run("safe: current HEAD matches GoReleaser's push, resets to pre-release SHA", func(t *testing.T) {
+		workspace := t.TempDir()
+		fakeBinDir, callsFile := newFakeGH(t, workspace, postSHA)
+		patchCallsFile := filepath.Join(workspace, "patch-calls")
+		output, err := runBash(workspace, script, map[string]string{
+			"PATH":             fakeBinDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"RUNNER_TEMP":      workspace,
+			"RELEASE_GH_TOKEN": "release-token",
+			"TAP_GH_TOKEN":     "tap-token",
+			"ROLLBACK_TARGETS": rollbackTargets,
+			"TAG":              "v1.2.3",
+			"REPO":             "acme/widget",
+			"CICD_GH_CALLS":    callsFile,
+			"CICD_PATCH_CALLS": patchCallsFile,
+			"CICD_CURRENT_SHA": postSHA,
+		})
+		if err != nil {
+			t.Fatalf("rollback with a safe compare-and-swap must succeed: %v\n%s", err, output)
+		}
+		patchCalls, err := os.ReadFile(patchCallsFile)
+		if err != nil {
+			t.Fatalf("expected the PATCH ref-update call to run: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(patchCalls), "repos/"+owner+"/"+repo+"/git/refs/heads/"+branch) {
+			t.Fatalf("PATCH call did not target the expected ref: %s", patchCalls)
+		}
+		if !strings.Contains(string(patchCalls), "sha="+preSHA) {
+			t.Fatalf("PATCH call did not reset to the pre-release SHA: %s", patchCalls)
+		}
+		if !strings.Contains(string(patchCalls), "force=true") {
+			t.Fatalf("PATCH call was not forced: %s", patchCalls)
+		}
+		if !strings.Contains(string(output), "Restored "+owner+"/"+repo+"@"+branch) {
+			t.Fatalf("rollback did not report the restored repo:\n%s", output)
+		}
+	})
+
+	t.Run("unsafe: concurrent push since GoReleaser's push, refuses to reset", func(t *testing.T) {
+		workspace := t.TempDir()
+		const concurrentSHA = "cccccccccccccccccccccccccccccccccccccccc"
+		fakeBinDir, callsFile := newFakeGH(t, workspace, concurrentSHA)
+		patchCallsFile := filepath.Join(workspace, "patch-calls")
+		output, err := runBash(workspace, script, map[string]string{
+			"PATH":             fakeBinDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"RUNNER_TEMP":      workspace,
+			"RELEASE_GH_TOKEN": "release-token",
+			"TAP_GH_TOKEN":     "tap-token",
+			"ROLLBACK_TARGETS": rollbackTargets,
+			"TAG":              "v1.2.3",
+			"REPO":             "acme/widget",
+			"CICD_GH_CALLS":    callsFile,
+			"CICD_PATCH_CALLS": patchCallsFile,
+			"CICD_CURRENT_SHA": concurrentSHA,
+		})
+		if err == nil {
+			t.Fatalf("rollback must exit non-zero when it refuses a repo, to stay visibly red:\n%s", output)
+		}
+		if _, statErr := os.Stat(patchCallsFile); statErr == nil {
+			patchCalls, _ := os.ReadFile(patchCallsFile)
+			t.Fatalf("rollback must NOT force-reset a repo with a concurrent push, but called PATCH: %s", patchCalls)
+		}
+		if !strings.Contains(string(output), "::error::") {
+			t.Fatalf("rollback must report a concurrent-push refusal as an error:\n%s", output)
+		}
+		if !strings.Contains(string(output), postSHA) || !strings.Contains(string(output), concurrentSHA) {
+			t.Fatalf("rollback refusal must name both the expected and actual SHA so a human can reconcile it:\n%s", output)
+		}
+	})
+
+	t.Run("no targets: still deletes the unpromoted draft release", func(t *testing.T) {
+		workspace := t.TempDir()
+		fakeBinDir, callsFile := newFakeGH(t, workspace, "")
+		output, err := runBash(workspace, script, map[string]string{
+			"PATH":             fakeBinDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"RUNNER_TEMP":      workspace,
+			"RELEASE_GH_TOKEN": "release-token",
+			"TAP_GH_TOKEN":     "tap-token",
+			"ROLLBACK_TARGETS": "[]",
+			"TAG":              "v1.2.3",
+			"REPO":             "acme/widget",
+			"CICD_GH_CALLS":    callsFile,
+			"CICD_PATCH_CALLS": filepath.Join(workspace, "patch-calls"),
+			"CICD_CURRENT_SHA": "",
+		})
+		if err != nil {
+			t.Fatalf("rollback with no publisher targets must still succeed and delete the draft: %v\n%s", err, output)
+		}
+		calls, err := os.ReadFile(callsFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(calls), "release delete v1.2.3 --repo acme/widget --yes") {
+			t.Fatalf("rollback did not delete the unpromoted draft release:\n%s", calls)
+		}
+	})
 }
 
 func TestReadmeKeepsQuillSigningIncidentAndOwnershipVisible(t *testing.T) {

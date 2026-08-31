@@ -937,7 +937,7 @@ jobs:
           fi
           ls -la "${RUNNER_TEMP}/macos-verify"
 
-      - name: Extract published archive
+      - name: Extract archive for macOS verification
         id: extract
         shell: bash
         working-directory: ${{ runner.temp }}/macos-verify
