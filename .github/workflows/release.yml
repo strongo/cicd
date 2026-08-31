@@ -431,6 +431,48 @@ jobs:
       # Passing that explicit range closes the gap; squash-merge and
       # direct-push landings are single-parent-only and unaffected either
       # way.
+      # COLD START ("a repo with no prior tag can never release"): a repo
+      # with NO matching tag anywhere in history used to
+      # leave `range` empty here so git-cliff would fall back to processing
+      # full history unranged. That fallback is the bug: git-cliff's
+      # `--bumped-version` has no notion of "current version" without some
+      # tag to diff against, and with an empty range it does not compute a
+      # bump from the parsed commits at all -- it silently returns
+      # [bump].initial_tag verbatim ("${PREFIX}0.0.0") EVEN WHEN THE HISTORY
+      # CONTAINS feat:/fix: COMMITS. Empirically verified against a scratch
+      # repo (see this PR's description for the four-case table) and against
+      # the real incident: openvaultdb/ovdb had six feat: commits on main and
+      # still proposed v0.0.0. "0.0.0" is then never greater than the
+      # "0.0.0" baseline in "Resolve configured default bump" below, so a
+      # never-tagged repo could never bootstrap its first release --
+      # sneat-cli hit the same thing and both needed a hand-seeded tag.
+      #
+      # Fix: give git-cliff a real (but synthetic, local-only, NEVER pushed)
+      # baseline tag to diff against, gated on the exact same
+      # feat:/fix:-vs-chore:/ci:/docs:/refactor: classification every other
+      # release uses -- see the "Resolve configured default bump" step,
+      # unchanged, which still requires the resulting proposed version to be
+      # numerically greater than 0.0.0 before it will cut a tag. A repo
+      # whose entire history is chore:/ci:/docs:/refactor: (or has no
+      # commits at all) still proposes 0.0.0 and still publishes nothing.
+      #
+      # The synthetic tag MUST be an ORPHAN commit -- NOT an ancestor of
+      # HEAD -- rather than a tag on the actual first commit in history.
+      # git-cliff's `<tag>..HEAD` range is EXCLUSIVE of the tagged commit
+      # itself, so tagging the real first commit would silently drop that
+      # exact commit from the bump calculation -- empirically reproduces the
+      # identical "nothing to bump" bug for any repo whose very first commit
+      # is itself a feat:. An orphan commit, unrelated to this branch's
+      # history, excludes nothing: `git log <orphan>..HEAD` still walks
+      # every real commit, while giving git-cliff the "0.0.0" baseline it
+      # needs to compute an actual bump instead of parroting initial_tag
+      # back. Tagged at the same version the git-cliff config's
+      # [bump].initial_tag already declares, so a repo that legitimately has
+      # no commits at all still resolves to "nothing to bump" (git-cliff
+      # itself reports "next version is the same as the current version").
+      # Deleted immediately after "Compute next version from Git history"
+      # below (see "Remove synthetic cold-start baseline tag") so it never
+      # reaches GoReleaser or the real tag-push step.
       - name: Resolve previous release tag
         id: previous_tag
         if: ${{ github.ref_type != 'tag' }}
@@ -451,14 +493,19 @@ jobs:
             previous_version="0.0.0"
             latest_tag=""
           fi
-          # No previous tag means the very first release: leave range empty
-          # so git-cliff falls back to processing full history, same as
-          # before this change.
+          cold_start="false"
           range=""
           if [ -n "$latest_tag" ]; then
             range="${latest_tag}..HEAD"
+          else
+            cold_start="true"
+            empty_tree="$(git hash-object -t tree /dev/null)"
+            synthetic_tag="${PREFIX}0.0.0"
+            orphan_commit="$(GIT_AUTHOR_NAME=cicd-release-workflow GIT_AUTHOR_EMAIL=cicd-release-workflow@users.noreply.github.com GIT_COMMITTER_NAME=cicd-release-workflow GIT_COMMITTER_EMAIL=cicd-release-workflow@users.noreply.github.com git commit-tree "$empty_tree" -m "synthetic cold-start baseline (local-only, never pushed)")"
+            git tag "$synthetic_tag" "$orphan_commit"
+            range="${synthetic_tag}..HEAD"
           fi
-          printf 'latest_tag=%s\nprevious_version=%s\nrange=%s\n' "$latest_tag" "$previous_version" "$range" >> "$GITHUB_OUTPUT"
+          printf 'latest_tag=%s\nprevious_version=%s\nrange=%s\ncold_start=%s\n' "$latest_tag" "$previous_version" "$range" "$cold_start" >> "$GITHUB_OUTPUT"
 
       # The action prints the proposed tag (with the configured prefix) to its
       # `content` output; the resolver below converts it to bare SemVer.
@@ -489,11 +536,55 @@ jobs:
         shell: bash
         run: rm -rf git-cliff
 
+      # Cleans up the synthetic cold-start baseline tag created above (see
+      # "Resolve previous release tag") before anything downstream -- most
+      # importantly "Determine and push guarded tag" and GoReleaser itself --
+      # can see it. It is local-only and was never pushed, but leaving it in
+      # the checkout would still be a phantom "${PREFIX}0.0.0" tag sitting on
+      # an orphan commit unrelated to this branch's history, and GoReleaser
+      # generates its own changelog/tag listing independently of git-cliff --
+      # no reason to risk it noticing a tag this workflow invented. `|| true`
+      # because the step above already deletes nothing when cold_start is
+      # false, and a tag that for any reason doesn't exist is not a failure
+      # here.
+      - name: Remove synthetic cold-start baseline tag
+        if: ${{ always() && steps.previous_tag.outputs.cold_start == 'true' }}
+        shell: bash
+        env:
+          PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          git tag -d "${PREFIX}0.0.0" || true
+
       # Preserve default_bump for callers that explicitly request a release.
       # previous_version/latest_tag come from the "Resolve previous release
       # tag" step above rather than being rescanned here, so the range fed to
       # git-cliff and the baseline this step compares against can never
       # disagree.
+      #
+      # SILENT-NOOP INCIDENT (three in one day: sneat-cli, datatug-cli,
+      # openvaultdb/ovdb): the one exit 0 below that declines to cut a tag
+      # used to do so with NO output and NO annotation -- a run that declined
+      # was indistinguishable, from the run summary, from one that published
+      # successfully; explaining any of the three required opening logs and
+      # reconstructing PROPOSED_VERSION/LATEST_TAG/default_bump by hand. This
+      # is the enforcement of sneat-co/backstage lesson
+      # a-successful-release-run-must-not-hide-a-noop-publication (recurred
+      # three times). Fix: an `::notice::` naming the proposed version, the
+      # baseline it was compared against, the default_bump setting, and which
+      # of those caused the decline, emitted right before that exit 0.
+      # `::notice::` (not `::warning::`/`::error::`) because declining is the
+      # CORRECT, unremarkable outcome for a no-op merge -- it must be
+      # unmistakable, not alarming. GitHub surfaces every `::notice::`/
+      # `::warning::`/`::error::` in the run's Annotations panel regardless
+      # of which step emitted it, so this is visible on the run summary
+      # without expanding a single step's logs. This is the ONLY exit 0 in
+      # this step that both (a) is reached on the branch/merge trigger this
+      # auto-bump logic exists for and (b) leaves new_version unset --
+      # audited against every other `exit 0`/`exit 1` in this job (see the
+      # git-cliff-based bump success path just above, which always sets
+      # outputs, and the `default_bump` forced-bump path just below, which
+      # cannot reach here and always sets outputs too).
       - name: Resolve configured default bump
         id: resolved_bump
         if: ${{ github.ref == 'refs/heads/main' && github.ref_type != 'tag' }}
@@ -503,6 +594,7 @@ jobs:
           DEFAULT_BUMP: ${{ inputs.default_bump }}
           LATEST_TAG: ${{ steps.previous_tag.outputs.latest_tag }}
           PREVIOUS_VERSION: ${{ steps.previous_tag.outputs.previous_version }}
+          COLD_START: ${{ steps.previous_tag.outputs.cold_start }}
         run: |
           set -euo pipefail
           version_is_greater() {
@@ -520,6 +612,16 @@ jobs:
             exit 0
           fi
           if [ "$DEFAULT_BUMP" = "false" ] || [ -z "$DEFAULT_BUMP" ]; then
+            display_proposed="${proposed_tag:-<empty>}"
+            display_default_bump="${DEFAULT_BUMP:-<empty>}"
+            if [ "$COLD_START" = "true" ]; then
+              baseline_label="no previous tag (this would have been the first release)"
+              cause="no commit in this repo's entire history is a releasing type under the configured commit parsers (git-cliff proposed ${display_proposed}, i.e. no bump at all) -- only chore:/ci:/docs:/refactor: commits, or no commits, so there is nothing to bootstrap"
+            else
+              baseline_label="${latest_tag} (previous_version ${previous_version})"
+              cause="no commit since ${latest_tag} is a releasing type under the configured commit parsers (git-cliff proposed ${display_proposed}, not greater than ${previous_version}) and default_bump is '${display_default_bump}', which does not force a release"
+            fi
+            echo "::notice title=No release published this run::Declining to cut a tag or run GoReleaser. Proposed version: ${display_proposed}. Baseline: ${baseline_label}. default_bump: '${display_default_bump}'. Reason: ${cause}. This is the expected outcome for a no-op merge, not a failure."
             exit 0
           fi
           case "$DEFAULT_BUMP" in patch|minor|major) ;; *) echo "Unsupported default_bump: $DEFAULT_BUMP" >&2; exit 1 ;; esac

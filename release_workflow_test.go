@@ -307,6 +307,26 @@ esac
 func TestReleaseWorkflowResolvesPreviousReleaseTag(t *testing.T) {
 	script := releaseWorkflowRunBlock(t, "Resolve previous release tag")
 
+	// COLD START (strongo/cicd defect #2): a repo with no matching tag used
+	// to leave `range` empty, which made git-cliff --bumped-version fall
+	// back to reporting [bump].initial_tag verbatim regardless of the
+	// commits in history -- a repo with only feat:/fix: commits and no tags
+	// could never bootstrap its first release (empirically reproduced
+	// against openvaultdb/ovdb: six feat: commits, still proposed v0.0.0).
+	// The fix: create a synthetic, LOCAL-ONLY, never-pushed baseline tag on
+	// an orphan commit (NOT an ancestor of HEAD) and pass an explicit
+	// <synthetic-tag>..HEAD range, so git-cliff computes a real bump from
+	// the actual parsed commit types instead of parroting initial_tag back.
+	// These subtests assert the mechanism directly: the tag this step
+	// creates really exists, really is NOT reachable from HEAD (so no real
+	// commit is excluded from the diff the way tagging the true first
+	// commit would exclude it -- git-cliff's range syntax is exclusive of
+	// the left-hand tag), and is named to match [bump].initial_tag
+	// ("${PREFIX}0.0.0") in the "Prepare git-cliff configuration" step
+	// above. Whether git-cliff then actually computes the correct bump from
+	// that range is exercised end-to-end, with the real git-cliff binary,
+	// in TestReleaseWorkflowResolvesVersionAgainstRealGitCliff below; this
+	// step has no git-cliff dependency of its own.
 	t.Run("no previous tag yet", func(t *testing.T) {
 		repository := initGitRepo(t)
 		outputFile := filepath.Join(t.TempDir(), "github-output")
@@ -318,16 +338,54 @@ func TestReleaseWorkflowResolvesPreviousReleaseTag(t *testing.T) {
 			t.Fatalf("resolve previous release tag: %v\n%s", err, output)
 		}
 		if got := githubOutput(t, outputFile, "latest_tag"); got != "" {
-			t.Fatalf("latest_tag = %q, want empty", got)
+			t.Fatalf("latest_tag = %q, want empty (no REAL previous release exists)", got)
 		}
 		if got := githubOutput(t, outputFile, "previous_version"); got != "0.0.0" {
 			t.Fatalf("previous_version = %q, want 0.0.0", got)
 		}
-		// No previous tag means the first release: git-cliff must fall back
-		// to processing full history, same as before this change, so the
-		// range passed to it must be empty rather than a bogus "..HEAD".
-		if got := githubOutput(t, outputFile, "range"); got != "" {
-			t.Fatalf("range = %q, want empty for the initial release", got)
+		if got := githubOutput(t, outputFile, "cold_start"); got != "true" {
+			t.Fatalf("cold_start = %q, want true", got)
+		}
+		// The range must now point at a synthetic "v0.0.0..HEAD" baseline
+		// (not empty) so git-cliff computes a real bump instead of falling
+		// back to initial_tag.
+		if got := githubOutput(t, outputFile, "range"); got != "v0.0.0..HEAD" {
+			t.Fatalf("range = %q, want v0.0.0..HEAD", got)
+		}
+		// The synthetic tag must actually exist...
+		tagCmd := exec.Command("git", "rev-parse", "-q", "--verify", "refs/tags/v0.0.0")
+		tagCmd.Dir = repository
+		if output, err := tagCmd.CombinedOutput(); err != nil {
+			t.Fatalf("synthetic baseline tag v0.0.0 was not created: %v\n%s", err, output)
+		}
+		// ...and must NOT be an ancestor of HEAD, or git-cliff's exclusive
+		// <tag>..HEAD range would silently drop a real first commit that
+		// happens to be a feat: (the exact bug tagging the true first
+		// commit would reintroduce).
+		ancestorCmd := exec.Command("git", "merge-base", "--is-ancestor", "v0.0.0", "HEAD")
+		ancestorCmd.Dir = repository
+		if err := ancestorCmd.Run(); err == nil {
+			t.Fatal("synthetic baseline tag v0.0.0 must not be an ancestor of HEAD")
+		}
+	})
+
+	t.Run("cold-start synthetic tag is scoped to the exact configured prefix", func(t *testing.T) {
+		repository := initGitRepo(t)
+		outputFile := filepath.Join(t.TempDir(), "github-output")
+		output, err := runBash(repository, script, map[string]string{
+			"PREFIX":        "backend/v",
+			"GITHUB_OUTPUT": outputFile,
+		})
+		if err != nil {
+			t.Fatalf("resolve previous release tag: %v\n%s", err, output)
+		}
+		if got := githubOutput(t, outputFile, "range"); got != "backend/v0.0.0..HEAD" {
+			t.Fatalf("range = %q, want backend/v0.0.0..HEAD", got)
+		}
+		tagCmd := exec.Command("git", "rev-parse", "-q", "--verify", "refs/tags/backend/v0.0.0")
+		tagCmd.Dir = repository
+		if output, err := tagCmd.CombinedOutput(); err != nil {
+			t.Fatalf("synthetic baseline tag backend/v0.0.0 was not created: %v\n%s", err, output)
 		}
 	})
 
@@ -350,6 +408,10 @@ func TestReleaseWorkflowResolvesPreviousReleaseTag(t *testing.T) {
 		}
 		if got := githubOutput(t, outputFile, "range"); got != "v0.10.0..HEAD" {
 			t.Fatalf("range = %q, want v0.10.0..HEAD", got)
+		}
+		// An already-tagged repo must never take the cold-start path.
+		if got := githubOutput(t, outputFile, "cold_start"); got != "false" {
+			t.Fatalf("cold_start = %q, want false (a real tag exists)", got)
 		}
 	})
 
@@ -383,6 +445,78 @@ func TestReleaseWorkflowResolvesPreviousReleaseTag(t *testing.T) {
 		}
 		if got := githubOutput(t, outputFile, "range"); got != "backend/v0.5.0..HEAD" {
 			t.Fatalf("range = %q, want backend/v0.5.0..HEAD", got)
+		}
+	})
+}
+
+// TestReleaseWorkflowRemovesSyntheticColdStartBaselineTag exercises "Remove
+// synthetic cold-start baseline tag" in isolation: the cleanup counterpart of
+// the synthetic tag "Resolve previous release tag" creates for a cold start
+// (see TestReleaseWorkflowResolvesPreviousReleaseTag above). It must run
+// before "Determine and push guarded tag" and GoReleaser ever see the
+// checkout, so the phantom local tag never reaches either.
+func TestReleaseWorkflowRemovesSyntheticColdStartBaselineTag(t *testing.T) {
+	script := releaseWorkflowRunBlock(t, "Remove synthetic cold-start baseline tag")
+
+	t.Run("deletes the synthetic tag", func(t *testing.T) {
+		repository := initGitRepo(t)
+		tagCmd := exec.Command("git", "tag", "v0.0.0")
+		tagCmd.Dir = repository
+		if output, err := tagCmd.CombinedOutput(); err != nil {
+			t.Fatalf("seed synthetic tag: %v\n%s", err, output)
+		}
+		output, err := runBash(repository, script, map[string]string{
+			"PREFIX": "v",
+		})
+		if err != nil {
+			t.Fatalf("remove synthetic cold-start baseline tag: %v\n%s", err, output)
+		}
+		verifyCmd := exec.Command("git", "rev-parse", "-q", "--verify", "refs/tags/v0.0.0")
+		verifyCmd.Dir = repository
+		if err := verifyCmd.Run(); err == nil {
+			t.Fatal("synthetic baseline tag v0.0.0 must be deleted")
+		}
+	})
+
+	t.Run("respects the configured prefix and never touches a real release tag", func(t *testing.T) {
+		repository := initGitRepo(t, "v0.0.0", "backend/v0.0.0")
+		output, err := runBash(repository, script, map[string]string{
+			"PREFIX": "backend/v",
+		})
+		if err != nil {
+			t.Fatalf("remove synthetic cold-start baseline tag: %v\n%s", err, output)
+		}
+		verifyCmd := exec.Command("git", "rev-parse", "-q", "--verify", "refs/tags/backend/v0.0.0")
+		verifyCmd.Dir = repository
+		if err := verifyCmd.Run(); err == nil {
+			t.Fatal("backend/v0.0.0 must be deleted")
+		}
+		// A real "v0.0.0" tag under a DIFFERENT prefix than the one
+		// configured must survive -- this step only ever deletes exactly
+		// "${PREFIX}0.0.0".
+		keepCmd := exec.Command("git", "rev-parse", "-q", "--verify", "refs/tags/v0.0.0")
+		keepCmd.Dir = repository
+		if err := keepCmd.Run(); err != nil {
+			t.Fatal("v0.0.0 (a different prefix's tag) must not be touched")
+		}
+	})
+
+	t.Run("is a no-op, not a failure, when no synthetic tag exists", func(t *testing.T) {
+		// The already-tagged path never creates a synthetic tag at all; the
+		// step's own `if:` condition (cold_start == 'true') is expected to
+		// skip it, but the script itself must also tolerate being run
+		// against a repository where the tag simply isn't there.
+		repository := initGitRepo(t, "v0.33.2")
+		output, err := runBash(repository, script, map[string]string{
+			"PREFIX": "v",
+		})
+		if err != nil {
+			t.Fatalf("remove synthetic cold-start baseline tag: %v\n%s", err, output)
+		}
+		keepCmd := exec.Command("git", "rev-parse", "-q", "--verify", "refs/tags/v0.33.2")
+		keepCmd.Dir = repository
+		if err := keepCmd.Run(); err != nil {
+			t.Fatal("v0.33.2 must not be touched")
 		}
 	})
 }
@@ -440,7 +574,16 @@ func TestReleaseWorkflowResolvesConfiguredDefaultBumpFromSharedPreviousTag(t *te
 		}
 	})
 
-	t.Run("stays silent when default_bump is disabled and nothing was proposed", func(t *testing.T) {
+	// SILENT-NOOP INCIDENT fix: declining still sets no GITHUB_OUTPUT (a
+	// chained "Determine and push guarded tag" step must still see an empty
+	// new_version and skip), but the run is no longer silent about it -- an
+	// `::notice::` naming the proposed version, the baseline, default_bump,
+	// and which of those caused the decline must appear on stdout, where
+	// GitHub Actions surfaces it on the run's Annotations panel regardless
+	// of which step emitted it. This is the exact scenario behind the
+	// sneat-cli and datatug-cli incidents: an already-tagged repo where no
+	// commit since the last tag implies a bump.
+	t.Run("declines without setting outputs, but emits a loud notice, when default_bump is disabled and nothing was proposed", func(t *testing.T) {
 		outputFile := filepath.Join(t.TempDir(), "github-output")
 		if err := os.WriteFile(outputFile, nil, 0o644); err != nil {
 			t.Fatal(err)
@@ -451,6 +594,7 @@ func TestReleaseWorkflowResolvesConfiguredDefaultBumpFromSharedPreviousTag(t *te
 			"DEFAULT_BUMP":     "false",
 			"LATEST_TAG":       "v0.33.2",
 			"PREVIOUS_VERSION": "0.33.2",
+			"COLD_START":       "false",
 			"GITHUB_OUTPUT":    outputFile,
 		})
 		if err != nil {
@@ -463,6 +607,7 @@ func TestReleaseWorkflowResolvesConfiguredDefaultBumpFromSharedPreviousTag(t *te
 		if len(content) != 0 {
 			t.Fatalf("GITHUB_OUTPUT = %q, want no output written", content)
 		}
+		assertDeclineNotice(t, string(output), "v0.33.2", "v0.33.2", "false")
 	})
 
 	t.Run("handles the very first release with no previous tag", func(t *testing.T) {
@@ -473,6 +618,7 @@ func TestReleaseWorkflowResolvesConfiguredDefaultBumpFromSharedPreviousTag(t *te
 			"DEFAULT_BUMP":     "false",
 			"LATEST_TAG":       "",
 			"PREVIOUS_VERSION": "0.0.0",
+			"COLD_START":       "true",
 			"GITHUB_OUTPUT":    outputFile,
 		})
 		if err != nil {
@@ -484,7 +630,72 @@ func TestReleaseWorkflowResolvesConfiguredDefaultBumpFromSharedPreviousTag(t *te
 		if got := githubOutput(t, outputFile, "previous_tag"); got != "" {
 			t.Fatalf("previous_tag = %q, want empty", got)
 		}
+		// A successful bootstrap is not a decline: it must NOT emit the
+		// decline notice (the run summary would be misleading otherwise).
+		if strings.Contains(string(output), "::notice title=No release published this run::") {
+			t.Fatalf("a successful cold-start bootstrap must not emit the decline notice, got:\n%s", output)
+		}
 	})
+
+	// Defect 2 (cold start): a never-tagged repo whose entire history is
+	// chore:/ci:/docs:/refactor: (or has no commits at all) must still
+	// publish nothing -- the cold-start bootstrap must be gated on the same
+	// releasing-commit-type rule as every other release, never leak into
+	// "any never-tagged repo auto-releases". git-cliff proposing back the
+	// same "0.0.0" baseline (see TestReleaseWorkflowResolvesVersionAgainst
+	// RealGitCliff for the real git-cliff invocation that produces this)
+	// is exactly the signal this step already treats as "nothing to bump".
+	t.Run("declines a cold start with no releasing commits and explains the bootstrap failed", func(t *testing.T) {
+		outputFile := filepath.Join(t.TempDir(), "github-output")
+		if err := os.WriteFile(outputFile, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		output, err := runBash(workspace, script, map[string]string{
+			"PROPOSED_VERSION": "v0.0.0",
+			"PREFIX":           "v",
+			"DEFAULT_BUMP":     "false",
+			"LATEST_TAG":       "",
+			"PREVIOUS_VERSION": "0.0.0",
+			"COLD_START":       "true",
+			"GITHUB_OUTPUT":    outputFile,
+		})
+		if err != nil {
+			t.Fatalf("resolve configured default bump: %v\n%s", err, output)
+		}
+		content, err := os.ReadFile(outputFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(content) != 0 {
+			t.Fatalf("GITHUB_OUTPUT = %q, want no output written (no releasing commit exists to bootstrap from)", content)
+		}
+		if !strings.Contains(string(output), "::notice title=No release published this run::") {
+			t.Fatalf("declining a cold start must emit a decline notice, got:\n%s", output)
+		}
+		if !strings.Contains(string(output), "first release") {
+			t.Fatalf("decline notice for a cold start must say this would have been the first release, got:\n%s", output)
+		}
+	})
+}
+
+// assertDeclineNotice asserts that output contains the "Resolve configured
+// default bump" step's decline `::notice::`, and that it names the proposed
+// version, the previous/baseline tag, and the default_bump setting -- the
+// three pieces of context that used to require opening logs to reconstruct
+// (see the three same-day incidents: sneat-cli, datatug-cli,
+// openvaultdb/ovdb). It is deliberately loose about exact wording so the
+// message can keep improving without brittle string-locking every rewrite,
+// while still failing if any required piece of context goes missing.
+func assertDeclineNotice(t *testing.T, output, proposedVersion, previousTag, defaultBump string) {
+	t.Helper()
+	if !strings.Contains(output, "::notice title=No release published this run::") {
+		t.Fatalf("expected a decline ::notice::, got:\n%s", output)
+	}
+	for _, want := range []string{proposedVersion, previousTag, defaultBump} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("decline notice must mention %q, got:\n%s", want, output)
+		}
+	}
 }
 
 // initGitRepo creates a git repository with a single commit and the given
@@ -1215,6 +1426,196 @@ exit 1
 			t.Fatalf("AUR rollback must name the repo it could not restore for lack of a key:\n%s", output)
 		}
 	})
+}
+
+// TestReleaseWorkflowResolvesVersionAgainstRealGitCliff runs the ACTUAL
+// version-resolution pipeline release.yml drives -- "Resolve previous
+// release tag" (real git), then the real `git-cliff` binary with the exact
+// config and args "Compute next version from Git history" and "Prepare
+// git-cliff configuration" build, then "Remove synthetic cold-start baseline
+// tag", then "Resolve configured default bump" -- against four scratch
+// repositories covering the cross product this PR must get right:
+//
+//	no tags + feat:/fix: commits      -> bootstrap the first release (Defect 2)
+//	no tags + only chore:/ci: commits -> still decline (no auto-release leak)
+//	tags + feat: commits since        -> bump exactly as today (must not regress)
+//	tags + only ci: commits since     -> still decline, now with a notice (Defect 1)
+//
+// This is the Go-test encoding of the four-case table verified by hand
+// against the same real git-cliff 2.13.1 this workflow pins (see the PR
+// description for that manual run's pasted output). It is skipped, not
+// failed, when git-cliff isn't on PATH: git-cliff is normally supplied by
+// orhun/git-cliff-action inside the actual GitHub Actions job, not
+// installed as a prerequisite for `go test`, so a runner without it must
+// not fail the build over a tool this suite does not otherwise depend on --
+// the other tests in this file cover the same shell contracts without it.
+func TestReleaseWorkflowResolvesVersionAgainstRealGitCliff(t *testing.T) {
+	if _, err := exec.LookPath("git-cliff"); err != nil {
+		t.Skip("git-cliff not on PATH; skipping real-binary version-resolution test")
+	}
+
+	previousTagScript := releaseWorkflowRunBlock(t, "Resolve previous release tag")
+	removeSyntheticTagScript := releaseWorkflowRunBlock(t, "Remove synthetic cold-start baseline tag")
+	resolvedBumpScript := releaseWorkflowRunBlock(t, "Resolve configured default bump")
+
+	cliffConfig := filepath.Join(t.TempDir(), "cicd-git-cliff.toml")
+	if err := os.WriteFile(cliffConfig, []byte(`[bump]
+initial_tag = "v0.0.0"
+features_always_bump_minor = true
+breaking_always_bump_major = false
+[git]
+commit_parsers = [{ message = "^(chore|ci|docs|refactor)(\\(.+\\))?:", skip = true }]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	repoWithCommits := func(t *testing.T, messages []string, tagAfterFirstCommit string) string {
+		t.Helper()
+		dir := t.TempDir()
+		run := func(args ...string) {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = dir
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+			}
+		}
+		run("init", "--initial-branch=main", "-q")
+		run("config", "user.email", "release-test@example.invalid")
+		run("config", "user.name", "Release Test")
+		for i, message := range messages {
+			run("commit", "--allow-empty", "-q", "-m", message)
+			if i == 0 && tagAfterFirstCommit != "" {
+				run("tag", tagAfterFirstCommit)
+			}
+		}
+		return dir
+	}
+
+	// bumpedVersion reproduces "Compute next version from Git history"
+	// exactly: same git-cliff version's binary, same --tag-pattern built
+	// from PREFIX, same explicit range this step now always supplies.
+	bumpedVersion := func(t *testing.T, repo, prefix, rng string) string {
+		t.Helper()
+		args := []string{"--config", cliffConfig, "--bumped-version", "--tag-pattern", "^" + prefix + `[0-9]+\.[0-9]+\.[0-9]+$`}
+		if rng != "" {
+			args = append(args, rng)
+		}
+		cmd := exec.Command("git-cliff", args...)
+		cmd.Dir = repo
+		output, err := cmd.Output()
+		if err != nil {
+			var stderr []byte
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				stderr = exitErr.Stderr
+			}
+			t.Fatalf("git-cliff: %v\n%s", err, stderr)
+		}
+		return strings.TrimSpace(string(output))
+	}
+
+	for _, tc := range []struct {
+		name          string
+		messages      []string
+		tag           string // seeded on the first commit; "" means no tags at all
+		wantNewTag    string // "" means declined -- no new_tag output
+		wantNotice    bool
+		wantColdStart string
+	}{
+		{
+			name:          "no tags, feat/fix commits: bootstraps the first release",
+			messages:      []string{"chore: bootstrap", "feat: add thing", "fix: fix thing"},
+			tag:           "",
+			wantNewTag:    "v0.1.0",
+			wantNotice:    false,
+			wantColdStart: "true",
+		},
+		{
+			name:          "no tags, only chore/ci commits: still declines",
+			messages:      []string{"chore: bootstrap", "ci: tweak pipeline"},
+			tag:           "",
+			wantNewTag:    "",
+			wantNotice:    true,
+			wantColdStart: "true",
+		},
+		{
+			name:          "tagged, feat commit since: bumps exactly as today",
+			messages:      []string{"chore: bootstrap", "feat: add thing"},
+			tag:           "v0.5.0",
+			wantNewTag:    "v0.6.0",
+			wantNotice:    false,
+			wantColdStart: "false",
+		},
+		{
+			name:          "tagged, only ci commit since: still declines",
+			messages:      []string{"chore: bootstrap", "ci: tweak pipeline"},
+			tag:           "v0.5.0",
+			wantNewTag:    "",
+			wantNotice:    true,
+			wantColdStart: "false",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := repoWithCommits(t, tc.messages, tc.tag)
+
+			previousTagOutput := filepath.Join(t.TempDir(), "github-output")
+			output, err := runBash(repo, previousTagScript, map[string]string{
+				"PREFIX":        "v",
+				"GITHUB_OUTPUT": previousTagOutput,
+			})
+			if err != nil {
+				t.Fatalf("resolve previous release tag: %v\n%s", err, output)
+			}
+			latestTag := githubOutput(t, previousTagOutput, "latest_tag")
+			previousVersion := githubOutput(t, previousTagOutput, "previous_version")
+			rng := githubOutput(t, previousTagOutput, "range")
+			coldStart := githubOutput(t, previousTagOutput, "cold_start")
+			if coldStart != tc.wantColdStart {
+				t.Fatalf("cold_start = %q, want %q", coldStart, tc.wantColdStart)
+			}
+
+			proposed := bumpedVersion(t, repo, "v", rng)
+			t.Logf("resolved version for %q: %s (range=%q)", tc.name, proposed, rng)
+
+			if output, err := runBash(repo, removeSyntheticTagScript, map[string]string{"PREFIX": "v"}); err != nil {
+				t.Fatalf("remove synthetic cold-start baseline tag: %v\n%s", err, output)
+			}
+
+			resolvedBumpOutput := filepath.Join(t.TempDir(), "github-output")
+			if err := os.WriteFile(resolvedBumpOutput, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			output, err = runBash(repo, resolvedBumpScript, map[string]string{
+				"PROPOSED_VERSION": proposed,
+				"PREFIX":           "v",
+				"DEFAULT_BUMP":     "false",
+				"LATEST_TAG":       latestTag,
+				"PREVIOUS_VERSION": previousVersion,
+				"COLD_START":       coldStart,
+				"GITHUB_OUTPUT":    resolvedBumpOutput,
+			})
+			if err != nil {
+				t.Fatalf("resolve configured default bump: %v\n%s", err, output)
+			}
+
+			if tc.wantNewTag == "" {
+				content, readErr := os.ReadFile(resolvedBumpOutput)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if len(content) != 0 {
+					t.Fatalf("new_tag output = %q, want no output written (decline)", content)
+				}
+			} else if got := githubOutput(t, resolvedBumpOutput, "new_tag"); got != tc.wantNewTag {
+				t.Fatalf("new_tag = %q, want %q", got, tc.wantNewTag)
+			}
+
+			hasNotice := strings.Contains(string(output), "::notice title=No release published this run::")
+			if hasNotice != tc.wantNotice {
+				t.Fatalf("decline notice present = %v, want %v; output:\n%s", hasNotice, tc.wantNotice, output)
+			}
+		})
+	}
 }
 
 func TestReadmeKeepsQuillSigningIncidentAndOwnershipVisible(t *testing.T) {

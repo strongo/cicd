@@ -287,8 +287,17 @@ jobs:
         shell: bash
         env:
           ACTUAL: ${{ steps.prefixed_first.outputs.content }}
-        # With no existing tags git-cliff returns initial_tag itself. The
-        # resolver then applies default_bump when the caller requests one.
+        # With no existing tags AND no explicit range (as passed here), raw
+        # git-cliff returns initial_tag itself verbatim, regardless of what
+        # the history actually contains -- this is the documented quirk this
+        # step pins as a regression guard on the library's own behavior.
+        # release.yml's "Resolve previous release tag" step no longer hits
+        # this path for a real cold start: it now supplies an explicit
+        # synthetic-baseline..HEAD range (see that step's comments), which
+        # makes git-cliff compute a real bump from the parsed commit types
+        # instead of parroting initial_tag back. This assertion stays
+        # because it documents raw git-cliff behavior other config/flag
+        # choices could still hit.
         run: test "$ACTUAL" = 'backend/v0.0.0'
 
       - name: Assert version resolution is monotonic
