@@ -487,6 +487,31 @@ things must be true for it to see your `feat:`/`fix:` commits:
     Either way, enabling a linear-history / conventional-PR-title convention makes
     tagging deterministic.
 
+### Cold start: a never-tagged repo's first release
+
+A repo with **no matching tag anywhere in history** now bootstraps its first
+release automatically, gated on the exact same rule as every other release:
+only when the history actually contains a releasing commit type (`feat:`,
+`fix:`, a breaking change) under the configured commit parsers. A repo whose
+entire history is `chore:`/`ci:`/`docs:`/`refactor:` (or has no commits at
+all) still publishes nothing — the bootstrap never overrides `default_bump`
+or forces a release git-cliff itself found nothing to cut. Internally,
+`release.yml`'s "Resolve previous release tag" step gives git-cliff a
+synthetic, local-only baseline tag to diff against (never pushed, deleted
+before GoReleaser runs) instead of the empty range it used to pass, which
+made git-cliff silently report its configured `initial_tag` verbatim
+regardless of what history actually contained.
+
+### Declined releases are no longer silent
+
+Every run that decides **not** to cut a tag — whatever the reason (no
+releasing commit since the last tag, an already-tagged commit, or a
+never-tagged repo with nothing to bootstrap) — now emits a `::notice::`
+naming the proposed version, the baseline it was compared against, the
+`default_bump` setting, and which of those caused the decline. GitHub
+surfaces it on the run's Annotations panel regardless of which step emitted
+it, so a no-op merge is legible from the run summary without opening logs.
+
 ### `default_bump` input
 
 Controls what happens when **no** commit since the last tag implies a bump
