@@ -103,6 +103,18 @@ on:
         description: 'Allow automatic major version bump when a commit message contains the major string token. Disabled by default to prevent accidental major bumps.'
         required: false
         default: false
+      go_version:
+        type: string
+        description: >-
+          Go toolchain version for setup-go, used by both the Lint and Build &
+          test jobs. Defaults to '1.27.0', preserving today's hardcoded value
+          -- this input only makes it overridable. Keep in sync with
+          release.yml's go_version input (also '1.27.0' by default): a
+          mismatch between what CI proves a repo builds under and what the
+          release job actually builds under broke ingitdb-cli with "go.mod
+          requires go >= 1.27.0 (running go 1.26.5; GOTOOLCHAIN=local)".
+        required: false
+        default: '1.27.0'
       default_bump:
         type: string
         description: >-
@@ -116,10 +128,21 @@ on:
       build_command:
         type: string
         description: >-
-          Shell command executed by the Build job after dependencies are downloaded.
-          Defaults to validating every package with `go build ./...`.
+          Shell command executed by the Build job after dependencies are
+          downloaded, e.g. together with artifact_name/artifact_path to
+          produce a real deployable. Empty (the default) SKIPS the step
+          entirely: `go test ./...` already compiles every package it runs
+          against, including packages with no test files -- a `go build
+          ./...` step used only for validation duplicates that compilation
+          for no extra coverage (verified: a package with zero _test.go
+          files still fails `go test ./...` on a genuine compile error,
+          identically to `go build ./...`). Exactly one of the two test
+          steps below always runs, so this coverage is unconditional. Set
+          this explicitly when you need the step for something `go test`
+          doesn't already give you, most commonly building a real artifact
+          for artifact_name/artifact_path.
         required: false
-        default: 'go build ./...'
+        default: ''
       artifact_name:
         type: string
         description: >-
@@ -175,7 +198,13 @@ jobs:
           # modules actually declare (sneat-go go.mod: 1.26.1,
           # sneat-core-modules: 1.26) -- linting them under 1.27 was ahead of
           # the code being linted. Raise both versions together, deliberately.
-          go-version: '1.27.0'
+          #
+          # Driven by the go_version input (default '1.27.0', same literal
+          # this replaced) so a caller CAN override it -- but overriding it
+          # now moves both this job and Build & test together, since both
+          # consume the same input. Overriding still requires golangci-lint
+          # v2.13.2 (pinned below) to support whatever version you pick.
+          go-version: ${{ inputs.go_version }}
           # Cache restore/save is owned explicitly below. Letting setup-go save
           # from both parallel jobs causes a cold-cache reservation race.
           cache: false
@@ -305,7 +334,11 @@ jobs:
           # modules actually declare (sneat-go go.mod: 1.26.1,
           # sneat-core-modules: 1.26) -- linting them under 1.27 was ahead of
           # the code being linted. Raise both versions together, deliberately.
-          go-version: '1.27.0'
+          #
+          # Driven by the same go_version input as Lint above (default
+          # '1.27.0'), so the two jobs cannot drift apart the way two
+          # independent hardcoded literals could.
+          go-version: ${{ inputs.go_version }}
           # The Build & test job is the sole writer for the shared Go cache;
           # see the matching restore in Lint above.
           cache: false
@@ -357,7 +390,14 @@ jobs:
 
       # Build first so a compilation failure is reported before any optional
       # test runtime setup. Tests then use the same runner and Go build cache.
+      # Opt-in only (build_command defaults to ''): `go test ./...` below
+      # already compiles everything it runs against, including packages with
+      # no test files, so an unconditional `go build ./...` here duplicated
+      # that compilation for no extra coverage. Set build_command explicitly
+      # to produce a real deployable (with artifact_name/artifact_path) or to
+      # run something go test doesn't already give you.
       - name: Build
+        if: ${{ inputs.build_command != '' }}
         run: ${{ inputs.build_command }}
         shell: bash
 

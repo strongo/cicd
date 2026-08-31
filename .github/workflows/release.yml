@@ -97,11 +97,16 @@ on:
       go_version:
         type: string
         required: false
-        default: '1.26'
+        default: '1.27.0'
         description: >-
-          Go toolchain version for setup-go. Defaults to '1.26'. Set to match
-          your module's go.mod (e.g. '1.26.5') when a build/release needs a
-          specific patch release.
+          Go toolchain version for setup-go. Defaults to '1.27.0' -- matching
+          workflow.yml's go_version input default, so CI proves a repo builds
+          on the same toolchain the release job actually builds it with. (A
+          mismatch previously here, '1.26' against workflow.yml's hardcoded
+          '1.27.0', broke ingitdb-cli's release with "go.mod requires go >=
+          1.27.0 (running go 1.26.5; GOTOOLCHAIN=local)".) Set to match your
+          module's go.mod (e.g. '1.26.5') when a release needs a specific,
+          older toolchain.
       goreleaser_extra_args:
         type: string
         required: false
@@ -289,266 +294,27 @@ on:
     outputs:
       tag:
         description: >-
-          The tag created by this workflow, or empty when no tag was
-          cut (no bumping commits) or the run was already on a tag. Consumers can
-          chain per-repo publisher jobs on `needs.<job>.outputs.tag`.
-        value: ${{ jobs.release.outputs.tag }}
+          The tag created by this workflow, or empty when no tag was cut (no
+          bumping commits), the run was already on a tag with nothing to
+          release, or require_notarized_macos is true and macOS verification
+          of the published artifact failed (the release exists but was never
+          promoted out of draft -- see macos_verify_and_promote). Consumers
+          can chain per-repo publisher jobs on `needs.<job>.outputs.tag`
+          exactly as before; this output is computed by finalize_release, not
+          jobs.release directly, precisely so a chained publisher never fires
+          against a tag whose release didn't actually go public.
+        value: ${{ jobs.finalize_release.outputs.tag }}
 #  push:
 #    tags:
 #      - 'v*.*.*'   # triggers only on tags like v1.26.0
 
 jobs:
-  # Run each consumer's own GoReleaser v2.18.0 snapshot before any tag or
-  # release is published. This is opt-in with require_notarized_macos so
-  # unsigned consumers retain the existing release path and do not pay for a
-  # macOS runner. Snapshot mode skips validation and all publication pipes,
-  # while still building, signing, and notarizing the consumer's actual
-  # darwin/arm64 artifact from its checked-in GoReleaser configuration.
-  macos_signing_preflight:
-    name: macOS signing preflight
-    if: ${{ inputs.require_notarized_macos }}
-    runs-on: macos-latest
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v7
-        with:
-          # Match the consumer's configured toolchain; do not substitute a
-          # toy binary or a different Go version for the real release input.
-          go-version: ${{ inputs.go_version }}
-
-      - name: Validate signing secrets
-        shell: bash
-        env:
-          SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          NOTARY_ISSUER_ID: ${{ secrets.NOTARIZE_ISSUER_ID }}
-          NOTARY_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
-          NOTARY_KEY: ${{ secrets.NOTARIZE_KEY }}
-        run: |
-          set -euo pipefail
-          for name in SIGN_P12 SIGN_PASSWORD NOTARY_ISSUER_ID NOTARY_KEY_ID NOTARY_KEY; do
-            if [ -z "${!name}" ]; then
-              echo "::error::require_notarized_macos=true requires $name before release publication."
-              exit 1
-            fi
-          done
-
-      # Match production release authentication before running the consumer's
-      # own GoReleaser snapshot. This keeps private-module builds equivalent
-      # without printing or exposing the token value.
-      - name: Set GitHub access token for GOPRIVATE
-        if: ${{ inputs.GOPRIVATE }}
-        shell: bash
-        env:
-          PRIVATE_GIT_TOKEN: ${{ secrets.GH_TOKEN }}
-          PRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
-          PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
-        run: |
-          set -euo pipefail
-          if [ -z "$PRIVATE_GIT_TOKEN" ]; then
-            echo "::error title=Missing private-module token::GH_TOKEN is required when GOPRIVATE is set."
-            exit 1
-          fi
-          prefixes="${PRIVATE_GIT_HOSTS:-$PRIVATE_GIT_HOST}"
-          configured=0
-          while IFS= read -r raw_prefix; do
-            prefix="$(printf '%s' "$raw_prefix" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
-            [ -z "$prefix" ] && continue
-            if [ -n "$PRIVATE_GIT_HOSTS" ] && ! [[ "$prefix" =~ ^[A-Za-z0-9.-]+/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
-              echo "::error title=Invalid goprivate_git_hosts entry::'$prefix' must be a host/owner URL prefix such as github.com/my-org; host-wide credential rewrites are not allowed."
-              exit 1
-            fi
-            git config --global "url.https://${PRIVATE_GIT_TOKEN}:x-oauth-basic@${prefix}/.insteadOf" "https://${prefix}/"
-            configured=$((configured + 1))
-          done < <(printf '%s\n' "$prefixes" | tr ',' '\n')
-          if [ "$configured" -eq 0 ]; then
-            echo "::error title=Missing GOPRIVATE Git prefix::Set goprivate_git_hosts or goprivate_git_host when GOPRIVATE is set."
-            exit 1
-          fi
-
-      - name: Build and sign the consumer snapshot with pinned GoReleaser
-        uses: goreleaser/goreleaser-action@v7
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GOPRIVATE: ${{ inputs.GOPRIVATE }}
-          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          NOTARIZE_ISSUER_ID: ${{ secrets.NOTARIZE_ISSUER_ID }}
-          NOTARIZE_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
-          NOTARIZE_KEY: ${{ secrets.NOTARIZE_KEY }}
-        with:
-          # GoReleaser v2.18.0 documents --snapshot as unversioned,
-          # non-publishing release mode; --skip=publish makes the no-publish
-          # contract explicit and is a supported release skip in this pin.
-          version: v2.18.0
-          args: release --snapshot --clean --skip=publish
-
-      - name: Locate the consumer's darwin/arm64 snapshot binary
-        id: preflight_binary
-        shell: bash
-        env:
-          BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}
-          TAG_PREFIX: ${{ inputs.tag_prefix }}
-        run: |
-          set -euo pipefail
-          config_file=""
-          for f in .goreleaser.yaml .goreleaser.yml goreleaser.yaml goreleaser.yml; do
-            if [ -f "$f" ]; then config_file="$f"; break; fi
-          done
-
-          # Keep the same resolution contract as the published-artifact smoke
-          # job: explicit override, then builds[0].binary, then project_name,
-          # then the documented repo-name fallback.
-          binary="$BINARY_OVERRIDE"
-          if [ -n "$config_file" ] && command -v yq >/dev/null 2>&1; then
-            if [ -z "$binary" ]; then
-              binary="$(yq -r '.builds[0].binary // ""' "$config_file")"
-              [ "$binary" = "null" ] && binary=""
-              if [ -z "$binary" ]; then
-                binary="$(yq -r '.project_name // ""' "$config_file")"
-                [ "$binary" = "null" ] && binary=""
-              fi
-            fi
-          fi
-          if [ -z "$binary" ]; then
-            case "$TAG_PREFIX" in
-              */*)
-                echo "::error::Cannot resolve a preflight binary for subdirectory-module tag_prefix '$TAG_PREFIX'; set artifact_smoke_test_binary explicitly."
-                exit 1
-                ;;
-              *)
-                repo_name="${GITHUB_REPOSITORY#*/}"
-                org_name="${GITHUB_REPOSITORY%%/*}"
-                if [ "$repo_name" = "cli" ]; then
-                  binary="$org_name"
-                else
-                  binary="${repo_name%-cli}"
-                fi
-                ;;
-            esac
-          fi
-
-          bin_path=""
-          while IFS= read -r candidate; do
-            [ -x "$candidate" ] || continue
-            if file "$candidate" | grep -qE 'Mach-O.*arm64'; then
-              bin_path="$candidate"
-              break
-            fi
-          done < <(find dist -type f -name "$binary" -print)
-          if [ -z "$bin_path" ]; then
-            echo "::error::GoReleaser snapshot did not produce an executable darwin/arm64 '$binary' under dist."
-            exit 1
-          fi
-          bin_path="$(cd "$(dirname "$bin_path")" && pwd -P)/$(basename "$bin_path")"
-          echo "Resolved consumer snapshot binary: $bin_path"
-          echo "bin_path=$bin_path" >> "$GITHUB_OUTPUT"
-
-      - name: Verify and execute the consumer's notarized snapshot
-        shell: bash
-        env:
-          BIN_PATH: ${{ steps.preflight_binary.outputs.bin_path }}
-          SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
-          TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
-        run: |
-          set -uo pipefail
-          set +e
-          codesign_output="$(codesign --verify --deep --strict --verbose=4 "$BIN_PATH" 2>&1)"
-          codesign_status=$?
-          printf '%s\n' "$codesign_output"
-          if [ "$codesign_status" -ne 0 ]; then
-            echo "::error::consumer darwin/arm64 snapshot has an invalid code signature (codesign exited $codesign_status)."
-            exit 1
-          fi
-
-          spctl_output="$(spctl -a -t install -vv "$BIN_PATH" 2>&1)"
-          spctl_status=$?
-          printf '%s\n' "$spctl_output"
-          if [ "$spctl_status" -ne 0 ] || ! printf '%s\n' "$spctl_output" | grep -q 'source=Notarized Developer ID'; then
-            echo "::error::consumer darwin/arm64 snapshot was not accepted as source=Notarized Developer ID."
-            exit 1
-          fi
-
-          run_with_timeout() {
-            local seconds="$1"; shift
-            process_group_exists() {
-              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
-            }
-            # Put the command in its own process group so forked descendants
-            # cannot survive the watchdog or keep the job alive.
-            set -m
-            "$@" &
-            local cmd_pid=$!
-            set +m
-            python3 -c '
-          import os
-          import signal
-          import sys
-          import time
-
-          seconds = float(sys.argv[1])
-          pgid = int(sys.argv[2])
-          marker = sys.argv[3]
-          time.sleep(seconds)
-          try:
-              os.killpg(pgid, 0)
-          except ProcessLookupError:
-              sys.exit(0)
-          open(marker, "a").close()
-          os.killpg(pgid, signal.SIGTERM)
-          time.sleep(2)
-          try:
-              os.killpg(pgid, signal.SIGKILL)
-          except ProcessLookupError:
-              pass
-          ' "$seconds" "$cmd_pid" "${RUNNER_TEMP}/.preflight_timed_out" >/dev/null 2>&1 &
-            local watchdog_pid=$!
-            wait "$cmd_pid" 2>/dev/null
-            local exit_code=$?
-            if process_group_exists "$cmd_pid"; then
-              kill -TERM -- "-$cmd_pid" 2>/dev/null
-              local deadline=$((SECONDS + 2))
-              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
-                sleep 0.05
-              done
-              if process_group_exists "$cmd_pid"; then
-                kill -KILL -- "-$cmd_pid" 2>/dev/null
-              fi
-            fi
-            kill "$watchdog_pid" 2>/dev/null
-            wait "$watchdog_pid" 2>/dev/null
-            return "$exit_code"
-          }
-
-          rm -f "${RUNNER_TEMP}/.preflight_timed_out"
-          # SMOKE_CMD is deliberately unquoted: it is the same configured
-          # space-separated argument list used by the published-artifact job.
-          # shellcheck disable=SC2086
-          output="$(run_with_timeout "$TIMEOUT_SECONDS" "$BIN_PATH" $SMOKE_CMD 2>&1)"
-          status=$?
-          printf '%s\n' "$output"
-          if [ -f "${RUNNER_TEMP}/.preflight_timed_out" ]; then
-            echo "::error::consumer darwin/arm64 snapshot exceeded ${TIMEOUT_SECONDS}s and was killed with its process group."
-            exit 1
-          fi
-          if [ "$status" -ne 0 ]; then
-            echo "::error::consumer darwin/arm64 snapshot exited $status running '$BIN_PATH $SMOKE_CMD'."
-            exit 1
-          fi
-          if [ -z "$(printf '%s' "$output" | tr -d '[:space:]')" ]; then
-            echo "::error::consumer darwin/arm64 snapshot exited 0 but produced no output running '$BIN_PATH $SMOKE_CMD'."
-            exit 1
-          fi
-          echo "OK: consumer darwin/arm64 snapshot is signed, notarized, runnable, and produced output."
-
   release:
     name: GoReleaser
-    needs: macos_signing_preflight
-    if: ${{ always() && (needs.macos_signing_preflight.result == 'success' || needs.macos_signing_preflight.result == 'skipped') }}
+    # No upstream `needs` any more: this job now builds the matrix ONCE and
+    # (when require_notarized_macos) publishes as a draft; macos_verify_and_
+    # promote below verifies the real published bytes and gates PUBLIC
+    # visibility, not this job's build. See the comment on that job.
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required for GoReleaser to push GitHub releases
@@ -568,8 +334,10 @@ jobs:
           go-version: ${{ inputs.go_version }}
 
       # A signing secret must never silently activate Quill in a release that
-      # did not opt into the pre-publication macOS proof. Fail before any tag
-      # or release mutation when the caller accidentally wires the secret.
+      # did not opt into the macOS verification-and-promotion gate below
+      # (macos_verify_and_promote). Fail before any tag or release mutation
+      # when the caller accidentally wires the secret without also setting
+      # require_notarized_macos: true.
       - name: Guard signing secret policy before tagging
         shell: bash
         env:
@@ -577,7 +345,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$SIGN_P12" ] && [ "${{ inputs.require_notarized_macos }}" != "true" ]; then
-            echo "::error::MACOS_SIGN_P12 is set but require_notarized_macos is false; refusing to tag or publish before the macOS signing preflight passes."
+            echo "::error::MACOS_SIGN_P12 is set but require_notarized_macos is false; refusing to tag or publish without the macOS verify-and-promote gate active. Set require_notarized_macos: true."
             exit 1
           fi
 
@@ -797,9 +565,21 @@ jobs:
         uses: goreleaser/goreleaser-action@v7
         with:
           # Pin the exact GoReleaser release whose embedded Quill module is
-          # reproduced by macos_signing_preflight above.
+          # verified against the real published asset by
+          # macos_verify_and_promote below.
           version: v2.18.0
-          args: release --clean ${{ inputs.goreleaser_extra_args }}
+          # --draft (a plain OSS CLI flag, overrides release.draft in the
+          # consumer's .goreleaser.yaml -- no per-repo config change needed)
+          # publishes this run's GitHub release as a draft ONLY when
+          # require_notarized_macos is true: assets upload normally, but the
+          # release is not listed and its assets are not served publicly
+          # until macos_verify_and_promote below verifies them and promotes
+          # it. When require_notarized_macos is false this is identical to
+          # today: a normal, immediately-public release.
+          args: >-
+            release --clean
+            ${{ inputs.require_notarized_macos && '--draft' || '' }}
+            ${{ inputs.goreleaser_extra_args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # required for releases
           GOPRIVATE: ${{ inputs.GOPRIVATE }}
@@ -821,16 +601,376 @@ jobs:
           NOTARIZE_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
           NOTARIZE_KEY: ${{ secrets.NOTARIZE_KEY }}
 
+  # Verifies the darwin/arm64 artifact THIS RUN PUBLISHED, and gates its
+  # public visibility on that verification. Replaces the old
+  # macos_signing_preflight job, which built its own full binary matrix
+  # SNAPSHOT on macos-latest before `release` below built the full matrix a
+  # SECOND time on ubuntu-latest and published it -- two full matrix builds
+  # per release, and the macOS job verified snapshot bytes that were never
+  # the bytes actually published. See
+  # https://github.com/strongo/cicd/issues/70.
+  #
+  # New shape: `release` (ubuntu-latest, below) builds the matrix ONCE,
+  # signs and notarizes it -- GoReleaser's `notarize` publisher (quill) is
+  # pure Go and needs no macOS runner -- and, only when
+  # require_notarized_macos is true, publishes the GitHub release as a
+  # DRAFT (`goreleaser release --draft`, a GoReleaser OSS CLI flag that
+  # overrides `release.draft` in the consumer's .goreleaser.yaml with no
+  # config change required in any of the 6 repos consuming this workflow).
+  # macos_verify_and_promote (this job) then downloads the REAL published
+  # darwin/arm64 asset from that draft release, runs the same three checks
+  # the old preflight ran against a throwaway snapshot -- codesign --verify
+  # --strict, spctl -a -t install asserting `source=Notarized Developer
+  # ID`, and actually executing the binary -- and promotes the draft to a
+  # public release ONLY on success (`gh release edit --draft=false`). A
+  # verification failure leaves the release an unpromoted draft: GitHub
+  # does not list a draft release or serve its assets to anyone without
+  # write access to the repo, so nothing reaches a real user.
+  #
+  # KNOWN RESIDUAL RISK, not fully closed by this change: `goreleaser
+  # release --draft` still runs this repo's Homebrew/AUR/Scoop/Chocolatey/
+  # WinGet publishers (when configured) in the SAME invocation, because
+  # GoReleaser OSS has no supported way to build+sign+notarize+create-the-
+  # release once and defer JUST those publishers to a later invocation
+  # without rebuilding -- that split/merge (`release --split` + `continue`,
+  # or `publish --merge`) is GoReleaser PRO-only (confirmed against the OSS
+  # v2.18.0 source this workflow pins: its `cmd/` package has no `publish`
+  # or `continue` subcommand at all). So those publishers push
+  # formula/manifest updates pointing at the draft release's asset URLs
+  # before this job has verified anything. Two consequences: (1) a brief
+  # window (this job's runtime, typically a few minutes) where a
+  # freshly-tapped/AUR-pushed formula 404s until promotion -- narrow, and
+  # no worse than the tap-visibility-timing gaps this workflow already
+  # treats as "could not test, not broken" elsewhere (see
+  # artifact_smoke_test_homebrew_cask below); (2) if verification then
+  # FAILS, those formula/manifest updates stay live in the public
+  # tap/AUR/bucket referencing a release that will never be promoted, and
+  # need a manual revert -- strictly worse than the old preflight's
+  # all-or-nothing block, where a failed preflight prevented the tag, the
+  # release, AND every publisher from running at all. This is the accepted
+  # trade-off for closing the "verifies bytes it does not publish" gap
+  # without hand-rolling GoReleaser Pro's split/merge from raw --skip
+  # flags, which would be unproven and risky to get right blind. Flagged
+  # explicitly in the PR that introduced this job; not hidden here only.
+  macos_verify_and_promote:
+    name: Verify and promote macOS release
+    needs: release
+    if: ${{ inputs.require_notarized_macos && !failure() && !cancelled() && (needs.release.outputs.tag != '' || github.ref_type == 'tag') }}
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # gh release edit --draft=false promotes the release
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
+      TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
+
+    steps:
+      # Same tag-resolution contract as resolve_artifact_smoke_test below:
+      # `release`'s own tag output is empty on a direct tag push (the bump
+      # step that sets it only runs on a branch/merge trigger), so fall
+      # back to the ref name in that case.
+      - name: Determine the tag this run published
+        id: release_tag
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          [ -z "$tag" ] && tag="${GITHUB_REF_NAME}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Sparse, ref-pinned checkout of just the GoReleaser config as it
+      # existed at the exact tag just published. This job resolves its own
+      # binary name independently (duplicated from resolve_artifact_smoke_test
+      # below) rather than depending on that job, so require_notarized_macos
+      # keeps gating publication even when a caller sets
+      # artifact_smoke_test: false.
+      - name: Checkout GoReleaser config at the published tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release_tag.outputs.tag }}
+          sparse-checkout: |
+            .goreleaser.yaml
+            .goreleaser.yml
+            goreleaser.yaml
+            goreleaser.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve darwin/arm64 binary name
+        id: resolve_binary
+        env:
+          BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          config_file=""
+          for f in .goreleaser.yaml .goreleaser.yml goreleaser.yaml goreleaser.yml; do
+            if [ -f "$f" ]; then config_file="$f"; break; fi
+          done
+
+          binary="$BINARY_OVERRIDE"
+          if [ -n "$config_file" ] && command -v yq >/dev/null 2>&1; then
+            if [ -z "$binary" ]; then
+              binary="$(yq -r '.builds[0].binary // ""' "$config_file")"
+              [ "$binary" = "null" ] && binary=""
+              if [ -z "$binary" ]; then
+                binary="$(yq -r '.project_name // ""' "$config_file")"
+                [ "$binary" = "null" ] && binary=""
+              fi
+            fi
+          fi
+          if [ -z "$binary" ]; then
+            case "$TAG_PREFIX" in
+              */*)
+                echo "::error::Cannot resolve a darwin/arm64 binary to verify for subdirectory-module tag_prefix '$TAG_PREFIX'; set artifact_smoke_test_binary explicitly. require_notarized_macos cannot be enforced without it, and the release stays an unpromoted draft."
+                exit 1
+                ;;
+              *)
+                repo_name="${GITHUB_REPOSITORY#*/}"
+                org_name="${GITHUB_REPOSITORY%%/*}"
+                if [ "$repo_name" = "cli" ]; then
+                  binary="$org_name"
+                else
+                  binary="${repo_name%-cli}"
+                fi
+                ;;
+            esac
+          fi
+          echo "Resolved binary: $binary"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+
+      # Same asset-selection contract as the post-publish smoke test job
+      # below: only a real archive ("*_darwin_arm64.{tar.gz,tgz,zip}"), never
+      # a sidecar that happens to share the arch-suffixed name. Unlike that
+      # job, a miss here is a hard failure, not a warning: this job is the
+      # ONLY thing gating require_notarized_macos, so "could not verify" must
+      # not be silently treated the same as "verified fine" -- it must block
+      # promotion exactly like a real signing failure would.
+      - name: Download the published darwin/arm64 asset
+        id: download
+        shell: bash
+        env:
+          TAG: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          set -uo pipefail
+          set +e
+          mkdir -p "${RUNNER_TEMP}/macos-verify"
+          echo "Downloading darwin/arm64 archive from $GITHUB_REPOSITORY@$TAG"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "*_darwin_arm64.tar.gz" \
+            --pattern "*_darwin_arm64.tgz" \
+            --pattern "*_darwin_arm64.zip" \
+            --dir "${RUNNER_TEMP}/macos-verify" --clobber
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::require_notarized_macos=true but no darwin/arm64 release asset matched '*_darwin_arm64.{tar.gz,tgz,zip}' for tag $TAG on the just-published draft release. Cannot verify what this check cannot find, so refusing to promote -- the release stays an unpromoted draft. Common cause: this repo's archive naming differs from GoReleaser's default '<name>_<version>_<os>_<arch>' convention."
+            exit 1
+          fi
+          ls -la "${RUNNER_TEMP}/macos-verify"
+
+      - name: Extract published archive
+        id: extract
+        shell: bash
+        working-directory: ${{ runner.temp }}/macos-verify
+        env:
+          BINARY: ${{ steps.resolve_binary.outputs.binary }}
+        run: |
+          set -euo pipefail
+          archive="$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.zip' \) | head -n1)"
+          if [ -z "$archive" ]; then
+            echo "::error::Downloaded darwin/arm64 asset(s) matched by name but none was a recognizable archive (.tar.gz/.tgz/.zip). Refusing to promote."
+            exit 1
+          fi
+          echo "Verifying artifact: $archive"
+          case "$archive" in
+            *.zip) unzip -o -q "$archive" ;;
+            *.tar.gz|*.tgz) tar xzf "$archive" ;;
+          esac
+          bin_path="$(find . -maxdepth 3 -type f -name "$BINARY" | head -n1)"
+          if [ -z "$bin_path" ]; then
+            echo "::error::Extracted '$archive' but found no '$BINARY' executable inside it. Refusing to promote. Set artifact_smoke_test_binary explicitly if the resolved name is wrong."
+            exit 1
+          fi
+          bin_path="$(cd "$(dirname "$bin_path")" && pwd -P)/$(basename "$bin_path")"
+          chmod +x "$bin_path"
+          echo "bin_path=$bin_path" >> "$GITHUB_OUTPUT"
+
+      # Identical assertions to the removed macos_signing_preflight job, now
+      # run against the exact published bytes instead of a discarded
+      # snapshot. See the Layer 2 smoke-test step further below for the full
+      # incident history behind the codesign/spctl reasoning duplicated here
+      # (GitHub Actions has no mechanism to share logic across jobs).
+      - name: Verify signature, notarization, and execution
+        shell: bash
+        env:
+          BIN_PATH: ${{ steps.extract.outputs.bin_path }}
+        run: |
+          set -uo pipefail
+          set +e
+          codesign_output="$(codesign --verify --deep --strict --verbose=4 "$BIN_PATH" 2>&1)"
+          codesign_status=$?
+          printf '%s\n' "$codesign_output"
+          if [ "$codesign_status" -ne 0 ]; then
+            echo "::error::Published darwin/arm64 artifact has an invalid code signature (codesign exited $codesign_status). Refusing to promote."
+            exit 1
+          fi
+
+          spctl_output="$(spctl -a -t install -vv "$BIN_PATH" 2>&1)"
+          spctl_status=$?
+          printf '%s\n' "$spctl_output"
+          # spctl -t install can exit 0 for a Developer-ID-signed-but-never-
+          # notarized binary, so exit code alone is not sufficient -- the
+          # string match is the real notarization assertion. See the Layer 2
+          # smoke-test step below for the incident (specscore-cli v0.24.0)
+          # that made this the required check rather than a bare exit-code
+          # check.
+          if [ "$spctl_status" -ne 0 ] || ! printf '%s\n' "$spctl_output" | grep -q 'source=Notarized Developer ID'; then
+            echo "::error::Published darwin/arm64 artifact was not accepted as source=Notarized Developer ID. Refusing to promote."
+            exit 1
+          fi
+
+          run_with_timeout() {
+            local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
+            set -m
+            "$@" &
+            local cmd_pid=$!
+            set +m
+            python3 -c '
+          import os
+          import signal
+          import sys
+          import time
+
+          seconds = float(sys.argv[1])
+          pgid = int(sys.argv[2])
+          marker = sys.argv[3]
+          time.sleep(seconds)
+          try:
+              os.killpg(pgid, 0)
+          except ProcessLookupError:
+              sys.exit(0)
+          open(marker, "a").close()
+          os.killpg(pgid, signal.SIGTERM)
+          time.sleep(2)
+          try:
+              os.killpg(pgid, signal.SIGKILL)
+          except ProcessLookupError:
+              pass
+          ' "$seconds" "$cmd_pid" "${RUNNER_TEMP}/.macos_verify_timed_out" >/dev/null 2>&1 &
+            local watchdog_pid=$!
+            wait "$cmd_pid" 2>/dev/null
+            local exit_code=$?
+            if process_group_exists "$cmd_pid"; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if process_group_exists "$cmd_pid"; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+              fi
+            fi
+            kill "$watchdog_pid" 2>/dev/null
+            wait "$watchdog_pid" 2>/dev/null
+            return "$exit_code"
+          }
+
+          rm -f "${RUNNER_TEMP}/.macos_verify_timed_out"
+          # SMOKE_CMD is deliberately unquoted, same as every other smoke-test
+          # step in this file.
+          # shellcheck disable=SC2086
+          output="$(run_with_timeout "$TIMEOUT_SECONDS" "$BIN_PATH" $SMOKE_CMD 2>&1)"
+          status=$?
+          printf '%s\n' "$output"
+          if [ -f "${RUNNER_TEMP}/.macos_verify_timed_out" ]; then
+            echo "::error::Published darwin/arm64 artifact exceeded ${TIMEOUT_SECONDS}s and was killed. Refusing to promote."
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Published darwin/arm64 artifact exited $status running '$BIN_PATH $SMOKE_CMD'. Refusing to promote."
+            exit 1
+          fi
+          if [ -z "$(printf '%s' "$output" | tr -d '[:space:]')" ]; then
+            echo "::error::Published darwin/arm64 artifact exited 0 but produced no output running '$BIN_PATH $SMOKE_CMD'. Refusing to promote."
+            exit 1
+          fi
+          echo "OK: published darwin/arm64 artifact is signed, notarized, runnable, and produced output."
+
+      # Only reached if every check above passed. Promotion is the sole gate
+      # on public visibility: assets were already uploaded when `release`
+      # ran GoReleaser above, but a draft release is not listed and its
+      # assets are not served to anyone without write access to this repo.
+      - name: Promote draft release to public
+        env:
+          TAG: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Promoted $GITHUB_REPOSITORY@$TAG from draft to public."
+
+  # Recomputes this workflow's public `tag` output (see on.workflow_call.
+  # outputs.tag above) so a consumer's own downstream jobs -- e.g.
+  # ingitdb-cli's Chocolatey/Snapcraft publisher jobs, which fire on
+  # `needs.<this-workflow-job>.outputs.tag != ''` -- never see a non-empty
+  # tag until the release is genuinely public. Needed because `release`
+  # below now creates the tag and (when require_notarized_macos) a DRAFT
+  # release unconditionally, before macos_verify_and_promote has run --
+  # unlike the removed macos_signing_preflight, which gated `release`
+  # itself, so a failed preflight meant `release` never ran and its tag
+  # output was simply never set. Runs unconditionally (`if: always()`) so
+  # it always produces a value, including when macos_verify_and_promote
+  # never runs at all (require_notarized_macos: false, its normal
+  # 'skipped' result), in which case release's own tag passes through
+  # unchanged -- identical to today's behaviour for that (currently
+  # default, though no live consumer uses it) case.
+  finalize_release:
+    name: Finalize release tag output
+    needs: [ release, macos_verify_and_promote ]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.finalize.outputs.tag }}
+    steps:
+      - name: Compute the publicly-released tag
+        id: finalize
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+          REQUIRE_NOTARIZED: ${{ inputs.require_notarized_macos }}
+          VERIFY_RESULT: ${{ needs.macos_verify_and_promote.result }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          if [ "$REQUIRE_NOTARIZED" = "true" ] && [ "$VERIFY_RESULT" != "success" ]; then
+            tag=""
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   # Resolves what layers 1-3 below need to know about THIS repo's own
   # release: the tag that was just published, the binary name (read from the
   # repo's own GoReleaser config, not guessed blind), and whether it
   # publishes a Homebrew cask (for layer 3). Runs once on ubuntu-latest —
   # where `yq` is guaranteed present — so the per-platform jobs below don't
   # each repeat this checkout/parse.
+  #
+  # Also waits on macos_verify_and_promote (a no-op dependency when
+  # require_notarized_macos is false — that job doesn't run, so its result
+  # is 'skipped' and the check below passes straight through): these are
+  # POST-PUBLISH checks against the real public release, and when
+  # require_notarized_macos is true the release is not actually public
+  # until that job promotes it. Downloading and testing a still-draft (or
+  # promotion-failed) release here would test something no real user can
+  # reach yet.
   resolve_artifact_smoke_test:
     name: Resolve artifact smoke test target
-    needs: release
-    if: ${{ inputs.artifact_smoke_test && !failure() && !cancelled() && (needs.release.outputs.tag != '' || github.ref_type == 'tag') }}
+    needs: [ release, macos_verify_and_promote ]
+    if: >-
+      ${{ inputs.artifact_smoke_test && !failure() && !cancelled() &&
+          (needs.release.outputs.tag != '' || github.ref_type == 'tag') &&
+          (needs.macos_verify_and_promote.result == 'success' || needs.macos_verify_and_promote.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
