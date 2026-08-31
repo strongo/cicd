@@ -29,26 +29,29 @@ version tag instead:
 ```yaml
 jobs:
   ci:
-    uses: strongo/cicd/.github/workflows/workflow.yml@v1   # moving major tag
+    uses: strongo/cicd/.github/workflows/workflow.yml@v1.14.15   # exact release tag
     secrets:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-Two pinning styles are supported:
-
-- **`@v1` — moving major tag (recommended default).** A lightweight tag that the
-  maintainer advances deliberately to the latest backward-compatible release.
-  You automatically get fixes without opening a PR, but a bad release only
-  reaches you when `v1` is advanced (not on every push to `main`).
-- **`@v1.x.y` — exact release (maximum control).** Pin an immutable release and
-  let **Renovate** open a PR to bump it (see below). Each bump runs through your
-  own CI before merging, giving you a full per-repo firebreak and an audit trail.
+**Pin an exact release — `@vX.Y.Z`.** Pin an immutable tag and let
+**Renovate** open a PR to bump it (see below). Each bump runs through your own CI
+before merging, giving you a per-repo firebreak and an audit trail.
 
 `@main` still works and stays supported for backward compatibility, but is
-discouraged for the reasons above.
+discouraged: it silently takes whatever last landed upstream.
 
-> Existing `@main` consumers are **not** being mass-migrated. Adopt `@v1` (or the
-> Renovate preset) gradually, per repo, on your own schedule.
+> **The moving `@v1` tag has been retired.** It was a lightweight tag the
+> maintainer was expected to advance to the latest backward-compatible release.
+> In practice it went unadvanced and drifted 14 patch releases behind, while
+> still *accepting* inputs added after it — so `require_notarized_macos: true`
+> was accepted without error by a copy of `release.yml` that did not contain the
+> `macos_signing_preflight` job implementing it. Consumers believed they had a
+> release gate; nothing ran. Two CLIs shipped macOS binaries that the kernel
+> killed on launch.
+>
+> A moving tag that is only as fresh as someone remembering to move it gives the
+> appearance of a pin without the guarantee. Pin an exact tag instead.
 
 ## CI cache policy
 
@@ -80,7 +83,7 @@ comma- or newline-separated `host/owner` entries:
 ```yaml
 jobs:
   ci:
-    uses: strongo/cicd/.github/workflows/workflow.yml@v1
+    uses: strongo/cicd/.github/workflows/workflow.yml@v1.14.15
     with:
       GOPRIVATE: github.com/sneat-co,github.com/sneat-games
       goprivate_git_hosts: |
@@ -123,7 +126,7 @@ permissions:
   contents: write
 jobs:
   release:
-    uses: strongo/cicd/.github/workflows/release.yml@v1
+    uses: strongo/cicd/.github/workflows/release.yml@v1.14.15
     with:
       go_version: '1.26.5'                 # optional; defaults to '1.26'
       # goreleaser_extra_args: '--skip=chocolatey,snapcraft'  # optional
@@ -225,7 +228,7 @@ not an optional extra.
 ```yaml
 jobs:
   release:
-    uses: strongo/cicd/.github/workflows/release.yml@v1
+    uses: strongo/cicd/.github/workflows/release.yml@v1.14.15
     with:
       # All of the below are optional; shown at their defaults.
       # artifact_smoke_test: true
@@ -237,9 +240,9 @@ jobs:
     secrets: { ... }
 ```
 
-Existing `@v1` callers get layer 1 automatically (hard-fail) and layers 2/3
-automatically (warn-only) the next time the maintainer advances the `v1`
-tag — no config changes required. A repo whose binary name the inference
+Callers get layer 1 automatically (hard-fail) and layers 2/3 automatically
+(warn-only) the next time they bump their pinned `strongo/cicd` tag — no other
+config changes required. A repo whose binary name the inference
 guesses wrong (multi-binary repos only check the first `builds[]` entry;
 repos where the executable doesn't match `project_name` or a `-cli`-stripped
 repo name) should set `artifact_smoke_test_binary` explicitly. A repo that
@@ -267,7 +270,7 @@ permissions:
 
 jobs:
   validate:
-    uses: strongo/cicd/.github/workflows/validate-published-artifact.yml@v1
+    uses: strongo/cicd/.github/workflows/validate-published-artifact.yml@v1.14.15
     permissions:
       contents: read
     with:
@@ -395,7 +398,7 @@ alarm rather than a fence.
 
 Add the shared preset to a consumer repo's `renovate.json` so Renovate keeps the
 `strongo/cicd` reference current — and rewrites any lingering
-`strongo/go-ci-action` reference onto `strongo/cicd@v1` — automatically:
+`strongo/go-ci-action` reference onto a pinned `strongo/cicd@vX.Y.Z` — automatically:
 
 ```json
 {
@@ -410,11 +413,12 @@ Add the shared preset to a consumer repo's `renovate.json` so Renovate keeps the
 The preset (`default.json` in this repo):
 
 - Groups and auto-updates the `strongo/cicd` reusable-workflow / action ref,
-  advancing `@v1.x.y` pins (and following the moving `@v1`) as releases are cut.
+  advancing `@vX.Y.Z` pins as releases are cut. This is what replaces the retired
+  moving `@v1` tag: the bump arrives as a reviewable PR rather than silently.
 - Auto-merges those bumps **through a PR gated by your CI**, so a broken release
   fails your build and blocks the merge — the firebreak — instead of landing
   silently.
-- Replaces legacy `strongo/go-ci-action` references with `strongo/cicd@v1`,
+- Replaces legacy `strongo/go-ci-action` references with `strongo/cicd@vX.Y.Z`,
   automating the rename find-and-replace.
 
 Override anything you like (e.g. disable `automerge`) in your own `renovate.json`
