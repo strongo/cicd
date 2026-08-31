@@ -97,11 +97,16 @@ on:
       go_version:
         type: string
         required: false
-        default: '1.26'
+        default: '1.27.0'
         description: >-
-          Go toolchain version for setup-go. Defaults to '1.26'. Set to match
-          your module's go.mod (e.g. '1.26.5') when a build/release needs a
-          specific patch release.
+          Go toolchain version for setup-go. Defaults to '1.27.0' -- matching
+          workflow.yml's go_version input default, so CI proves a repo builds
+          on the same toolchain the release job actually builds it with. (A
+          mismatch previously here, '1.26' against workflow.yml's hardcoded
+          '1.27.0', broke ingitdb-cli's release with "go.mod requires go >=
+          1.27.0 (running go 1.26.5; GOTOOLCHAIN=local)".) Set to match your
+          module's go.mod (e.g. '1.26.5') when a release needs a specific,
+          older toolchain.
       goreleaser_extra_args:
         type: string
         required: false
@@ -289,271 +294,40 @@ on:
     outputs:
       tag:
         description: >-
-          The tag created by this workflow, or empty when no tag was
-          cut (no bumping commits) or the run was already on a tag. Consumers can
-          chain per-repo publisher jobs on `needs.<job>.outputs.tag`.
-        value: ${{ jobs.release.outputs.tag }}
+          The tag created by this workflow, or empty when no tag was cut (no
+          bumping commits), the run was already on a tag with nothing to
+          release, or require_notarized_macos is true and macOS verification
+          of the published artifact failed (the release exists but was never
+          promoted out of draft -- see macos_verify_and_promote). Consumers
+          can chain per-repo publisher jobs on `needs.<job>.outputs.tag`
+          exactly as before; this output is computed by finalize_release, not
+          jobs.release directly, precisely so a chained publisher never fires
+          against a tag whose release didn't actually go public.
+        value: ${{ jobs.finalize_release.outputs.tag }}
 #  push:
 #    tags:
 #      - 'v*.*.*'   # triggers only on tags like v1.26.0
 
 jobs:
-  # Run each consumer's own GoReleaser v2.18.0 snapshot before any tag or
-  # release is published. This is opt-in with require_notarized_macos so
-  # unsigned consumers retain the existing release path and do not pay for a
-  # macOS runner. Snapshot mode skips validation and all publication pipes,
-  # while still building, signing, and notarizing the consumer's actual
-  # darwin/arm64 artifact from its checked-in GoReleaser configuration.
-  macos_signing_preflight:
-    name: macOS signing preflight
-    if: ${{ inputs.require_notarized_macos }}
-    runs-on: macos-latest
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v7
-        with:
-          # Match the consumer's configured toolchain; do not substitute a
-          # toy binary or a different Go version for the real release input.
-          go-version: ${{ inputs.go_version }}
-
-      - name: Validate signing secrets
-        shell: bash
-        env:
-          SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          NOTARY_ISSUER_ID: ${{ secrets.NOTARIZE_ISSUER_ID }}
-          NOTARY_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
-          NOTARY_KEY: ${{ secrets.NOTARIZE_KEY }}
-        run: |
-          set -euo pipefail
-          for name in SIGN_P12 SIGN_PASSWORD NOTARY_ISSUER_ID NOTARY_KEY_ID NOTARY_KEY; do
-            if [ -z "${!name}" ]; then
-              echo "::error::require_notarized_macos=true requires $name before release publication."
-              exit 1
-            fi
-          done
-
-      # Match production release authentication before running the consumer's
-      # own GoReleaser snapshot. This keeps private-module builds equivalent
-      # without printing or exposing the token value.
-      - name: Set GitHub access token for GOPRIVATE
-        if: ${{ inputs.GOPRIVATE }}
-        shell: bash
-        env:
-          PRIVATE_GIT_TOKEN: ${{ secrets.GH_TOKEN }}
-          PRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
-          PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
-        run: |
-          set -euo pipefail
-          if [ -z "$PRIVATE_GIT_TOKEN" ]; then
-            echo "::error title=Missing private-module token::GH_TOKEN is required when GOPRIVATE is set."
-            exit 1
-          fi
-          prefixes="${PRIVATE_GIT_HOSTS:-$PRIVATE_GIT_HOST}"
-          configured=0
-          while IFS= read -r raw_prefix; do
-            prefix="$(printf '%s' "$raw_prefix" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
-            [ -z "$prefix" ] && continue
-            if [ -n "$PRIVATE_GIT_HOSTS" ] && ! [[ "$prefix" =~ ^[A-Za-z0-9.-]+/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
-              echo "::error title=Invalid goprivate_git_hosts entry::'$prefix' must be a host/owner URL prefix such as github.com/my-org; host-wide credential rewrites are not allowed."
-              exit 1
-            fi
-            git config --global "url.https://${PRIVATE_GIT_TOKEN}:x-oauth-basic@${prefix}/.insteadOf" "https://${prefix}/"
-            configured=$((configured + 1))
-          done < <(printf '%s\n' "$prefixes" | tr ',' '\n')
-          if [ "$configured" -eq 0 ]; then
-            echo "::error title=Missing GOPRIVATE Git prefix::Set goprivate_git_hosts or goprivate_git_host when GOPRIVATE is set."
-            exit 1
-          fi
-
-      - name: Build and sign the consumer snapshot with pinned GoReleaser
-        uses: goreleaser/goreleaser-action@v7
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GOPRIVATE: ${{ inputs.GOPRIVATE }}
-          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          NOTARIZE_ISSUER_ID: ${{ secrets.NOTARIZE_ISSUER_ID }}
-          NOTARIZE_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
-          NOTARIZE_KEY: ${{ secrets.NOTARIZE_KEY }}
-        with:
-          # GoReleaser v2.18.0 documents --snapshot as unversioned,
-          # non-publishing release mode; --skip=publish makes the no-publish
-          # contract explicit and is a supported release skip in this pin.
-          version: v2.18.0
-          args: release --snapshot --clean --skip=publish
-
-      - name: Locate the consumer's darwin/arm64 snapshot binary
-        id: preflight_binary
-        shell: bash
-        env:
-          BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}
-          TAG_PREFIX: ${{ inputs.tag_prefix }}
-        run: |
-          set -euo pipefail
-          config_file=""
-          for f in .goreleaser.yaml .goreleaser.yml goreleaser.yaml goreleaser.yml; do
-            if [ -f "$f" ]; then config_file="$f"; break; fi
-          done
-
-          # Keep the same resolution contract as the published-artifact smoke
-          # job: explicit override, then builds[0].binary, then project_name,
-          # then the documented repo-name fallback.
-          binary="$BINARY_OVERRIDE"
-          if [ -n "$config_file" ] && command -v yq >/dev/null 2>&1; then
-            if [ -z "$binary" ]; then
-              binary="$(yq -r '.builds[0].binary // ""' "$config_file")"
-              [ "$binary" = "null" ] && binary=""
-              if [ -z "$binary" ]; then
-                binary="$(yq -r '.project_name // ""' "$config_file")"
-                [ "$binary" = "null" ] && binary=""
-              fi
-            fi
-          fi
-          if [ -z "$binary" ]; then
-            case "$TAG_PREFIX" in
-              */*)
-                echo "::error::Cannot resolve a preflight binary for subdirectory-module tag_prefix '$TAG_PREFIX'; set artifact_smoke_test_binary explicitly."
-                exit 1
-                ;;
-              *)
-                repo_name="${GITHUB_REPOSITORY#*/}"
-                org_name="${GITHUB_REPOSITORY%%/*}"
-                if [ "$repo_name" = "cli" ]; then
-                  binary="$org_name"
-                else
-                  binary="${repo_name%-cli}"
-                fi
-                ;;
-            esac
-          fi
-
-          bin_path=""
-          while IFS= read -r candidate; do
-            [ -x "$candidate" ] || continue
-            if file "$candidate" | grep -qE 'Mach-O.*arm64'; then
-              bin_path="$candidate"
-              break
-            fi
-          done < <(find dist -type f -name "$binary" -print)
-          if [ -z "$bin_path" ]; then
-            echo "::error::GoReleaser snapshot did not produce an executable darwin/arm64 '$binary' under dist."
-            exit 1
-          fi
-          bin_path="$(cd "$(dirname "$bin_path")" && pwd -P)/$(basename "$bin_path")"
-          echo "Resolved consumer snapshot binary: $bin_path"
-          echo "bin_path=$bin_path" >> "$GITHUB_OUTPUT"
-
-      - name: Verify and execute the consumer's notarized snapshot
-        shell: bash
-        env:
-          BIN_PATH: ${{ steps.preflight_binary.outputs.bin_path }}
-          SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
-          TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
-        run: |
-          set -uo pipefail
-          set +e
-          codesign_output="$(codesign --verify --deep --strict --verbose=4 "$BIN_PATH" 2>&1)"
-          codesign_status=$?
-          printf '%s\n' "$codesign_output"
-          if [ "$codesign_status" -ne 0 ]; then
-            echo "::error::consumer darwin/arm64 snapshot has an invalid code signature (codesign exited $codesign_status)."
-            exit 1
-          fi
-
-          spctl_output="$(spctl -a -t install -vv "$BIN_PATH" 2>&1)"
-          spctl_status=$?
-          printf '%s\n' "$spctl_output"
-          if [ "$spctl_status" -ne 0 ] || ! printf '%s\n' "$spctl_output" | grep -q 'source=Notarized Developer ID'; then
-            echo "::error::consumer darwin/arm64 snapshot was not accepted as source=Notarized Developer ID."
-            exit 1
-          fi
-
-          run_with_timeout() {
-            local seconds="$1"; shift
-            process_group_exists() {
-              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
-            }
-            # Put the command in its own process group so forked descendants
-            # cannot survive the watchdog or keep the job alive.
-            set -m
-            "$@" &
-            local cmd_pid=$!
-            set +m
-            python3 -c '
-          import os
-          import signal
-          import sys
-          import time
-
-          seconds = float(sys.argv[1])
-          pgid = int(sys.argv[2])
-          marker = sys.argv[3]
-          time.sleep(seconds)
-          try:
-              os.killpg(pgid, 0)
-          except ProcessLookupError:
-              sys.exit(0)
-          open(marker, "a").close()
-          os.killpg(pgid, signal.SIGTERM)
-          time.sleep(2)
-          try:
-              os.killpg(pgid, signal.SIGKILL)
-          except ProcessLookupError:
-              pass
-          ' "$seconds" "$cmd_pid" "${RUNNER_TEMP}/.preflight_timed_out" >/dev/null 2>&1 &
-            local watchdog_pid=$!
-            wait "$cmd_pid" 2>/dev/null
-            local exit_code=$?
-            if process_group_exists "$cmd_pid"; then
-              kill -TERM -- "-$cmd_pid" 2>/dev/null
-              local deadline=$((SECONDS + 2))
-              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
-                sleep 0.05
-              done
-              if process_group_exists "$cmd_pid"; then
-                kill -KILL -- "-$cmd_pid" 2>/dev/null
-              fi
-            fi
-            kill "$watchdog_pid" 2>/dev/null
-            wait "$watchdog_pid" 2>/dev/null
-            return "$exit_code"
-          }
-
-          rm -f "${RUNNER_TEMP}/.preflight_timed_out"
-          # SMOKE_CMD is deliberately unquoted: it is the same configured
-          # space-separated argument list used by the published-artifact job.
-          # shellcheck disable=SC2086
-          output="$(run_with_timeout "$TIMEOUT_SECONDS" "$BIN_PATH" $SMOKE_CMD 2>&1)"
-          status=$?
-          printf '%s\n' "$output"
-          if [ -f "${RUNNER_TEMP}/.preflight_timed_out" ]; then
-            echo "::error::consumer darwin/arm64 snapshot exceeded ${TIMEOUT_SECONDS}s and was killed with its process group."
-            exit 1
-          fi
-          if [ "$status" -ne 0 ]; then
-            echo "::error::consumer darwin/arm64 snapshot exited $status running '$BIN_PATH $SMOKE_CMD'."
-            exit 1
-          fi
-          if [ -z "$(printf '%s' "$output" | tr -d '[:space:]')" ]; then
-            echo "::error::consumer darwin/arm64 snapshot exited 0 but produced no output running '$BIN_PATH $SMOKE_CMD'."
-            exit 1
-          fi
-          echo "OK: consumer darwin/arm64 snapshot is signed, notarized, runnable, and produced output."
-
   release:
     name: GoReleaser
-    needs: macos_signing_preflight
-    if: ${{ always() && (needs.macos_signing_preflight.result == 'success' || needs.macos_signing_preflight.result == 'skipped') }}
+    # No upstream `needs` any more: this job now builds the matrix ONCE and
+    # (when require_notarized_macos) publishes as a draft; macos_verify_and_
+    # promote below verifies the real published bytes and gates PUBLIC
+    # visibility, not this job's build. See the comment on that job.
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required for GoReleaser to push GitHub releases
     outputs:
       tag: ${{ steps.tag.outputs.new_tag }}
+      # JSON list of {owner, name, branch, pre_sha, post_sha} for each
+      # git-hosted publisher repo (Homebrew tap/cask, Scoop bucket, Nix
+      # repo) this run pushed to. Consumed by macos_verify_and_promote to
+      # roll each one back to pre_sha if macOS verification fails. Empty
+      # ('[]', or unset when the capture steps below were skipped) when
+      # require_notarized_macos is false, no such publisher is configured,
+      # or GoReleaser never actually ran (no tag cut this run).
+      rollback_targets: ${{ steps.capture_post.outputs.rollback_targets }}
 
     steps:
       # 1. Checkout the code with full history + all tags. Both GoReleaser (changelog /
@@ -568,8 +342,10 @@ jobs:
           go-version: ${{ inputs.go_version }}
 
       # A signing secret must never silently activate Quill in a release that
-      # did not opt into the pre-publication macOS proof. Fail before any tag
-      # or release mutation when the caller accidentally wires the secret.
+      # did not opt into the macOS verification-and-promotion gate below
+      # (macos_verify_and_promote). Fail before any tag or release mutation
+      # when the caller accidentally wires the secret without also setting
+      # require_notarized_macos: true.
       - name: Guard signing secret policy before tagging
         shell: bash
         env:
@@ -577,7 +353,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$SIGN_P12" ] && [ "${{ inputs.require_notarized_macos }}" != "true" ]; then
-            echo "::error::MACOS_SIGN_P12 is set but require_notarized_macos is false; refusing to tag or publish before the macOS signing preflight passes."
+            echo "::error::MACOS_SIGN_P12 is set but require_notarized_macos is false; refusing to tag or publish without the macOS verify-and-promote gate active. Set require_notarized_macos: true."
             exit 1
           fi
 
@@ -781,6 +557,167 @@ jobs:
           git push origin "refs/tags/$tag"
           echo "new_tag=$tag" >> "$GITHUB_OUTPUT"
 
+      # Enumerates the git-hosted package-manager repos this release will
+      # push to -- Homebrew tap/cask, Scoop bucket, Nix repo (via
+      # GORELEASER_GITHUB_TOKEN over the GitHub API), and AUR (a plain git
+      # repo at ssh://aur@aur.archlinux.org/<pkg>.git, over
+      # AUR_SSH_PRIVATE_KEY) -- and captures each one's current HEAD SHA
+      # BEFORE GoReleaser runs. macos_verify_and_promote below uses this to
+      # roll each repo back to this exact commit if macOS verification
+      # fails, restoring the old all-or-nothing release semantics instead of
+      # leaving a formula/manifest/PKGBUILD live pointing at a release that
+      # will never be promoted.
+      #
+      # WinGet and Chocolatey remain explicitly out of scope: WinGet opens a
+      # cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs repo --
+      # not a publish, so there is nothing here to force-reset, and a human
+      # closes the PR by hand (it would fail winget-pkgs' own validation
+      # against a rolled-back release anyway); Chocolatey pushes a .nupkg
+      # directly to chocolatey.org via API key, not to any git ref at all --
+      # there is no commit to snapshot or restore. Both warn by name below
+      # if configured, so the gap is visible rather than silent.
+      #
+      # Only runs when GoReleaser is actually about to run (same condition
+      # as the step below): a no-op merge with no tag to cut has nothing to
+      # capture.
+      - name: Capture pre-release publisher repo SHAs
+        id: capture_pre
+        if: ${{ inputs.require_notarized_macos && (github.ref_type == 'tag' || steps.tag.outputs.new_tag != '') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          cat > "${RUNNER_TEMP}/capture_pre_release_shas.py" <<'PYEOF'
+          import json
+          import os
+          import stat
+          import subprocess
+
+          config = {}
+          for name in [".goreleaser.yaml", ".goreleaser.yml", "goreleaser.yaml", "goreleaser.yml"]:
+              if os.path.isfile(name):
+                  proc = subprocess.run(["yq", "-o=json", ".", name], capture_output=True, text=True)
+                  if proc.returncode == 0 and proc.stdout.strip():
+                      config = json.loads(proc.stdout)
+                  break
+
+          # Non-interactive, bounded SSH for every AUR git operation in this
+          # workflow: BatchMode=yes and ConnectTimeout make a hung or
+          # prompting SSH connection impossible on git's side; every
+          # subprocess call below also passes an explicit `timeout=` so a
+          # stalled network op cannot block this job on Python's side
+          # either. accept-new (not full host-key pinning) trusts a
+          # first-seen host key non-interactively -- simple, and consistent
+          # with what a from-scratch CI runner can verify with no prior
+          # state; not a materially weaker guarantee than what GoReleaser's
+          # own aurs publisher already relies on to push today.
+          def aur_ssh_env(key_path):
+              env = dict(os.environ)
+              env["GIT_SSH_COMMAND"] = (
+                  "ssh -i " + key_path
+                  + " -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10"
+                  + " -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="
+                  + os.path.join(os.path.dirname(key_path), "known_hosts")
+              )
+              return env
+
+          def aur_head(git_url, env):
+              try:
+                  proc = subprocess.run(
+                      ["git", "ls-remote", "--symref", git_url, "HEAD"],
+                      capture_output=True, text=True, env=env, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  return None, None, "timed out reaching " + git_url
+              if proc.returncode != 0:
+                  return None, None, "git ls-remote failed: " + proc.stderr.strip()
+              branch, sha = "", ""
+              for line in proc.stdout.splitlines():
+                  if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                      branch = line[len("ref: refs/heads/"):-len("\tHEAD")]
+                  elif line.endswith("\tHEAD"):
+                      sha = line.split("\t", 1)[0]
+              if not branch or not sha:
+                  return None, None, "could not parse HEAD from ls-remote output"
+              return branch, sha, None
+
+          UNCOVERED = {
+              "winget": "it opens a cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs repo, not a publish -- nothing here to force-reset, and a human closes the PR by hand",
+              "wingets": "it opens a cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs repo, not a publish -- nothing here to force-reset, and a human closes the PR by hand",
+              "chocolateys": "it pushes a .nupkg directly to chocolatey.org via API key, not to any git ref -- there is no commit to snapshot or restore at all",
+          }
+          for key, reason in UNCOVERED.items():
+              if config.get(key):
+                  print("::warning::This repo configures " + key + " in its GoReleaser config. Automatic rollback on a failed macOS verification does NOT cover it: " + reason + ". A verification failure will require manual cleanup of that publisher.")
+
+          COVERED = ["brews", "homebrew_casks", "scoops", "nix"]
+          targets = []
+          seen = set()
+          for key in COVERED:
+              for entry in (config.get(key) or []):
+                  repo = (entry or {}).get("repository") or {}
+                  owner, name = repo.get("owner"), repo.get("name")
+                  if not owner or not name:
+                      continue
+                  branch = repo.get("branch") or ""
+                  ident = ("github", owner, name, branch)
+                  if ident in seen:
+                      continue
+                  seen.add(ident)
+                  targets.append({"kind": "github", "owner": owner, "name": name, "branch": branch})
+
+          gh_token = os.environ.get("GH_TOKEN", "")
+          resolved = []
+          if targets and not gh_token:
+              print("::warning::This repo configures Homebrew/Scoop/Nix publishers but GORELEASER_GITHUB_TOKEN is not set; automatic rollback cannot read or restore them on a failed verification.")
+          else:
+              for t in targets:
+                  owner, name, branch = t["owner"], t["name"], t["branch"]
+                  if not branch:
+                      proc = subprocess.run(["gh", "api", "repos/" + owner + "/" + name, "--jq", ".default_branch"], capture_output=True, text=True)
+                      branch = proc.stdout.strip()
+                      if proc.returncode != 0 or not branch:
+                          print("::warning::Could not resolve a branch for publisher repo " + owner + "/" + name + "; skipping rollback capture for it.")
+                          continue
+                  proc = subprocess.run(["gh", "api", "repos/" + owner + "/" + name + "/branches/" + branch, "--jq", ".commit.sha"], capture_output=True, text=True)
+                  sha = proc.stdout.strip()
+                  if proc.returncode != 0 or not sha:
+                      print("::warning::Could not read the current HEAD of " + owner + "/" + name + "@" + branch + " (missing repo/branch, or GORELEASER_GITHUB_TOKEN lacks access); skipping rollback capture for it.")
+                      continue
+                  print("Captured pre-release SHA for " + owner + "/" + name + "@" + branch + ": " + sha)
+                  resolved.append({"kind": "github", "owner": owner, "name": name, "branch": branch, "pre_sha": sha})
+
+          aur_entries = config.get("aurs") or config.get("aur") or []
+          aur_key = os.environ.get("AUR_SSH_PRIVATE_KEY", "")
+          if aur_entries and not aur_key:
+              print("::warning::This repo configures aurs but AUR_SSH_PRIVATE_KEY is not set; automatic rollback cannot read or restore its AUR package on a failed verification.")
+          elif aur_entries:
+              key_dir = os.path.join(os.environ.get("RUNNER_TEMP", "."), "aur-ssh")
+              os.makedirs(key_dir, exist_ok=True)
+              key_path = os.path.join(key_dir, "id_aur")
+              with open(key_path, "w") as f:
+                  f.write(aur_key if aur_key.endswith("\n") else aur_key + "\n")
+              os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+              env = aur_ssh_env(key_path)
+              seen_urls = set()
+              for entry in aur_entries:
+                  git_url = (entry or {}).get("git_url")
+                  if not git_url or git_url in seen_urls:
+                      continue
+                  seen_urls.add(git_url)
+                  branch, sha, error = aur_head(git_url, env)
+                  if error:
+                      print("::warning::Could not read the current HEAD of AUR repo " + git_url + " (" + error + "); skipping rollback capture for it.")
+                      continue
+                  print("Captured pre-release SHA for AUR " + git_url + "@" + branch + ": " + sha)
+                  resolved.append({"kind": "aur", "git_url": git_url, "branch": branch, "pre_sha": sha})
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("targets=" + json.dumps(resolved) + "\n")
+          PYEOF
+          python3 "${RUNNER_TEMP}/capture_pre_release_shas.py"
+
       # The full-history checkout already fetched the remote tags, and a tag
       # created above is present in this checkout immediately. Do not fetch
       # again here: GoReleaser releases the local exact tag, while a redundant
@@ -793,13 +730,26 @@ jobs:
       # to release — skip GoReleaser (running it on an untagged commit would
       # fail the job).
       - name: Run GoReleaser
+        id: run_goreleaser
         if: ${{ github.ref_type == 'tag' || steps.tag.outputs.new_tag != '' }}
         uses: goreleaser/goreleaser-action@v7
         with:
           # Pin the exact GoReleaser release whose embedded Quill module is
-          # reproduced by macos_signing_preflight above.
+          # verified against the real published asset by
+          # macos_verify_and_promote below.
           version: v2.18.0
-          args: release --clean ${{ inputs.goreleaser_extra_args }}
+          # --draft (a plain OSS CLI flag, overrides release.draft in the
+          # consumer's .goreleaser.yaml -- no per-repo config change needed)
+          # publishes this run's GitHub release as a draft ONLY when
+          # require_notarized_macos is true: assets upload normally, but the
+          # release is not listed and its assets are not served publicly
+          # until macos_verify_and_promote below verifies them and promotes
+          # it. When require_notarized_macos is false this is identical to
+          # today: a normal, immediately-public release.
+          args: >-
+            release --clean
+            ${{ inputs.require_notarized_macos && '--draft' || '' }}
+            ${{ inputs.goreleaser_extra_args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # required for releases
           GOPRIVATE: ${{ inputs.GOPRIVATE }}
@@ -821,16 +771,724 @@ jobs:
           NOTARIZE_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
           NOTARIZE_KEY: ${{ secrets.NOTARIZE_KEY }}
 
+      # Captures each rollback target's HEAD SHA again immediately AFTER
+      # GoReleaser has pushed to it, so macos_verify_and_promote below can
+      # tell -- via compare-and-swap against a repo re-read at rollback
+      # time -- whether it is still safe to reset that repo to its
+      # pre-release SHA, or whether someone else has pushed to it since (in
+      # which case rollback must refuse, not clobber that push).
+      #
+      # Only runs once GoReleaser has actually succeeded: if it failed
+      # partway through its own publish pipeline, that is an existing,
+      # separate failure mode this change does not newly introduce (the
+      # release job simply fails, exactly as before, and
+      # macos_verify_and_promote's own `if` already requires the release job
+      # to not have failed).
+      - name: Capture post-release publisher repo SHAs
+        id: capture_post
+        if: ${{ inputs.require_notarized_macos && steps.run_goreleaser.outcome == 'success' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          PRE_TARGETS: ${{ steps.capture_pre.outputs.targets }}
+        run: |
+          cat > "${RUNNER_TEMP}/capture_post_release_shas.py" <<'PYEOF'
+          import json
+          import os
+          import stat
+          import subprocess
+
+          def aur_ssh_env(key_path):
+              env = dict(os.environ)
+              env["GIT_SSH_COMMAND"] = (
+                  "ssh -i " + key_path
+                  + " -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10"
+                  + " -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="
+                  + os.path.join(os.path.dirname(key_path), "known_hosts")
+              )
+              return env
+
+          def aur_head(git_url, env):
+              try:
+                  proc = subprocess.run(
+                      ["git", "ls-remote", "--symref", git_url, "HEAD"],
+                      capture_output=True, text=True, env=env, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  return None, "timed out reaching " + git_url
+              if proc.returncode != 0:
+                  return None, "git ls-remote failed: " + proc.stderr.strip()
+              sha = ""
+              for line in proc.stdout.splitlines():
+                  if line.endswith("\tHEAD") and not line.startswith("ref: "):
+                      sha = line.split("\t", 1)[0]
+              if not sha:
+                  return None, "could not parse HEAD from ls-remote output"
+              return sha, None
+
+          pre_targets = json.loads(os.environ.get("PRE_TARGETS") or "[]")
+          gh_token = os.environ.get("GH_TOKEN", "")
+          aur_key = os.environ.get("AUR_SSH_PRIVATE_KEY", "")
+          aur_env = None
+          if aur_key and any(t.get("kind") == "aur" for t in pre_targets):
+              key_dir = os.path.join(os.environ.get("RUNNER_TEMP", "."), "aur-ssh")
+              os.makedirs(key_dir, exist_ok=True)
+              key_path = os.path.join(key_dir, "id_aur")
+              with open(key_path, "w") as f:
+                  f.write(aur_key if aur_key.endswith("\n") else aur_key + "\n")
+              os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+              aur_env = aur_ssh_env(key_path)
+
+          resolved = []
+          for t in pre_targets:
+              if t.get("kind") == "aur":
+                  label = t["git_url"]
+                  if not aur_env:
+                      print("::warning::AUR_SSH_PRIVATE_KEY is not set; rollback will not be able to verify or restore " + label + " if the macOS check later fails.")
+                      continue
+                  sha, error = aur_head(t["git_url"], aur_env)
+                  if error:
+                      print("::warning::Could not read the post-release HEAD of AUR repo " + label + " right after GoReleaser ran (" + error + "); rollback will not be able to verify or restore it if the macOS check later fails.")
+                      continue
+              else:
+                  owner, name, branch = t["owner"], t["name"], t["branch"]
+                  label = owner + "/" + name + "@" + branch
+                  if not gh_token:
+                      continue
+                  proc = subprocess.run(
+                      ["gh", "api", "repos/" + owner + "/" + name + "/branches/" + branch, "--jq", ".commit.sha"],
+                      capture_output=True, text=True,
+                  )
+                  sha = proc.stdout.strip()
+                  if proc.returncode != 0 or not sha:
+                      print("::warning::Could not read the post-release HEAD of " + label + " right after GoReleaser ran; rollback will not be able to verify or restore this repo if the macOS check later fails.")
+                      continue
+              print("Captured post-release SHA for " + label + ": " + sha)
+              merged = dict(t)
+              merged["post_sha"] = sha
+              resolved.append(merged)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("rollback_targets=" + json.dumps(resolved) + "\n")
+          PYEOF
+          python3 "${RUNNER_TEMP}/capture_post_release_shas.py"
+
+  # Verifies the darwin/arm64 artifact THIS RUN PUBLISHED, and gates its
+  # public visibility on that verification. Replaces the old
+  # macos_signing_preflight job, which built its own full binary matrix
+  # SNAPSHOT on macos-latest before `release` below built the full matrix a
+  # SECOND time on ubuntu-latest and published it -- two full matrix builds
+  # per release, and the macOS job verified snapshot bytes that were never
+  # the bytes actually published. See
+  # https://github.com/strongo/cicd/issues/70.
+  #
+  # New shape: `release` (ubuntu-latest, below) builds the matrix ONCE,
+  # signs and notarizes it -- GoReleaser's `notarize` publisher (quill) is
+  # pure Go and needs no macOS runner -- and, only when
+  # require_notarized_macos is true, publishes the GitHub release as a
+  # DRAFT (`goreleaser release --draft`, a GoReleaser OSS CLI flag that
+  # overrides `release.draft` in the consumer's .goreleaser.yaml with no
+  # config change required in any of the 6 repos consuming this workflow).
+  # macos_verify_and_promote (this job) then downloads the REAL published
+  # darwin/arm64 asset from that draft release, runs the same three checks
+  # the old preflight ran against a throwaway snapshot -- codesign --verify
+  # --strict, spctl -a -t install asserting `source=Notarized Developer
+  # ID`, and actually executing the binary -- and promotes the draft to a
+  # public release ONLY on success (`gh release edit --draft=false`). A
+  # verification failure leaves the release an unpromoted draft: GitHub
+  # does not list a draft release or serve its assets to anyone without
+  # write access to the repo, so nothing reaches a real user.
+  #
+  # KNOWN RESIDUAL RISK, mostly closed by the "Roll back publisher repos"
+  # step at the end of this job: `goreleaser release --draft` still runs
+  # this repo's Homebrew/Scoop/Nix/AUR/Chocolatey/WinGet publishers (when
+  # configured) in the SAME invocation as the draft release, because
+  # GoReleaser OSS has no supported way to build+sign+notarize+create-the-
+  # release once and defer JUST those publishers to a later invocation
+  # without rebuilding -- that split/merge (`release --split` + `continue`,
+  # or `publish --merge`) is GoReleaser PRO-only (confirmed against the OSS
+  # v2.18.0 source this workflow pins: its `cmd/` package has no `publish`
+  # or `continue` subcommand at all; separately confirmed neither the brew,
+  # cask, nor aur publisher pipes gate on `draft` -- only `skip_upload`).
+  # So those publishers push formula/manifest/PKGBUILD updates pointing at
+  # the draft release's asset URLs before this job has verified anything.
+  # Consequences, and what is and isn't covered:
+  #
+  # (1) A brief window (this job's runtime, typically a few minutes) where
+  #     a freshly-tapped/pushed formula 404s until promotion -- narrow, not
+  #     destructive (it self-heals the moment "Promote draft release to
+  #     public" below succeeds), and no worse than the tap-visibility-timing
+  #     gaps this workflow already treats as "could not test, not broken"
+  #     elsewhere (see artifact_smoke_test_homebrew_cask below). No rollback
+  #     mechanism can shrink this window without GoReleaser Pro's
+  #     split/merge; it is accepted as-is.
+  #
+  # (2) If verification then FAILS, "Roll back publisher repos and delete
+  #     the draft release" below restores every publisher that pushes to a
+  #     git ref this workflow can reach -- Homebrew (brews/homebrew_casks),
+  #     Scoop, and Nix over the GitHub API (GORELEASER_GITHUB_TOKEN), and
+  #     AUR over SSH (AUR_SSH_PRIVATE_KEY, a plain `git push --force` to
+  #     ssh://aur@aur.archlinux.org/<pkg>.git) -- to its pre-release commit.
+  #     Every restore is compare-and-swap guarded: it refuses to touch a
+  #     repo that has been pushed to again since GoReleaser's push, naming
+  #     both SHAs instead of clobbering that push. It also deletes the
+  #     unpromoted draft release. This recovers the old preflight's
+  #     all-or-nothing guarantee for all four publisher kinds.
+  #
+  #     COVERED BY ROLLBACK: brews, homebrew_casks, scoops, nix, aurs.
+  #     NOT COVERED, genuinely unrecoverable by this mechanism: WinGet
+  #     (opens a cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs
+  #     repo -- not a publish, so there is nothing to force-reset; a human
+  #     closes the PR by hand, and it would fail winget-pkgs' own validation
+  #     against a rolled-back release anyway) and Chocolatey (pushes a
+  #     .nupkg directly to chocolatey.org via API key, not to any git ref --
+  #     there is no commit to snapshot or restore at all). A failure while
+  #     either is configured still needs manual cleanup; the capture step
+  #     below emits an explicit `::warning::` naming which one and why.
+  #     ingitdb-cli is the one current consumer configuring WinGet (and the
+  #     only one configuring AUR, which IS now covered).
+  macos_verify_and_promote:
+    name: Verify and promote macOS release
+    needs: release
+    if: ${{ inputs.require_notarized_macos && !failure() && !cancelled() && (needs.release.outputs.tag != '' || github.ref_type == 'tag') }}
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # gh release edit --draft=false promotes the release
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
+      TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
+
+    steps:
+      # Same tag-resolution contract as resolve_artifact_smoke_test below:
+      # `release`'s own tag output is empty on a direct tag push (the bump
+      # step that sets it only runs on a branch/merge trigger), so fall
+      # back to the ref name in that case.
+      - name: Determine the tag this run published
+        id: release_tag
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          [ -z "$tag" ] && tag="${GITHUB_REF_NAME}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Sparse, ref-pinned checkout of just the GoReleaser config as it
+      # existed at the exact tag just published. This job resolves its own
+      # binary name independently (duplicated from resolve_artifact_smoke_test
+      # below) rather than depending on that job, so require_notarized_macos
+      # keeps gating publication even when a caller sets
+      # artifact_smoke_test: false.
+      - name: Checkout GoReleaser config at the published tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release_tag.outputs.tag }}
+          sparse-checkout: |
+            .goreleaser.yaml
+            .goreleaser.yml
+            goreleaser.yaml
+            goreleaser.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve darwin/arm64 binary name
+        id: resolve_binary
+        env:
+          BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          config_file=""
+          for f in .goreleaser.yaml .goreleaser.yml goreleaser.yaml goreleaser.yml; do
+            if [ -f "$f" ]; then config_file="$f"; break; fi
+          done
+
+          binary="$BINARY_OVERRIDE"
+          if [ -n "$config_file" ] && command -v yq >/dev/null 2>&1; then
+            if [ -z "$binary" ]; then
+              binary="$(yq -r '.builds[0].binary // ""' "$config_file")"
+              [ "$binary" = "null" ] && binary=""
+              if [ -z "$binary" ]; then
+                binary="$(yq -r '.project_name // ""' "$config_file")"
+                [ "$binary" = "null" ] && binary=""
+              fi
+            fi
+          fi
+          if [ -z "$binary" ]; then
+            case "$TAG_PREFIX" in
+              */*)
+                echo "::error::Cannot resolve a darwin/arm64 binary to verify for subdirectory-module tag_prefix '$TAG_PREFIX'; set artifact_smoke_test_binary explicitly. require_notarized_macos cannot be enforced without it, and the release stays an unpromoted draft."
+                exit 1
+                ;;
+              *)
+                repo_name="${GITHUB_REPOSITORY#*/}"
+                org_name="${GITHUB_REPOSITORY%%/*}"
+                if [ "$repo_name" = "cli" ]; then
+                  binary="$org_name"
+                else
+                  binary="${repo_name%-cli}"
+                fi
+                ;;
+            esac
+          fi
+          echo "Resolved binary: $binary"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+
+      # Same asset-selection contract as the post-publish smoke test job
+      # below: only a real archive ("*_darwin_arm64.{tar.gz,tgz,zip}"), never
+      # a sidecar that happens to share the arch-suffixed name. Unlike that
+      # job, a miss here is a hard failure, not a warning: this job is the
+      # ONLY thing gating require_notarized_macos, so "could not verify" must
+      # not be silently treated the same as "verified fine" -- it must block
+      # promotion exactly like a real signing failure would.
+      - name: Download the published darwin/arm64 asset
+        id: download
+        shell: bash
+        env:
+          TAG: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          set -uo pipefail
+          set +e
+          mkdir -p "${RUNNER_TEMP}/macos-verify"
+          echo "Downloading darwin/arm64 archive from $GITHUB_REPOSITORY@$TAG"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "*_darwin_arm64.tar.gz" \
+            --pattern "*_darwin_arm64.tgz" \
+            --pattern "*_darwin_arm64.zip" \
+            --dir "${RUNNER_TEMP}/macos-verify" --clobber
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::require_notarized_macos=true but no darwin/arm64 release asset matched '*_darwin_arm64.{tar.gz,tgz,zip}' for tag $TAG on the just-published draft release. Cannot verify what this check cannot find, so refusing to promote -- the release stays an unpromoted draft. Common cause: this repo's archive naming differs from GoReleaser's default '<name>_<version>_<os>_<arch>' convention."
+            exit 1
+          fi
+          ls -la "${RUNNER_TEMP}/macos-verify"
+
+      - name: Extract archive for macOS verification
+        id: extract
+        shell: bash
+        working-directory: ${{ runner.temp }}/macos-verify
+        env:
+          BINARY: ${{ steps.resolve_binary.outputs.binary }}
+        run: |
+          set -euo pipefail
+          archive="$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.zip' \) | head -n1)"
+          if [ -z "$archive" ]; then
+            echo "::error::Downloaded darwin/arm64 asset(s) matched by name but none was a recognizable archive (.tar.gz/.tgz/.zip). Refusing to promote."
+            exit 1
+          fi
+          echo "Verifying artifact: $archive"
+          case "$archive" in
+            *.zip) unzip -o -q "$archive" ;;
+            *.tar.gz|*.tgz) tar xzf "$archive" ;;
+          esac
+          bin_path="$(find . -maxdepth 3 -type f -name "$BINARY" | head -n1)"
+          if [ -z "$bin_path" ]; then
+            echo "::error::Extracted '$archive' but found no '$BINARY' executable inside it. Refusing to promote. Set artifact_smoke_test_binary explicitly if the resolved name is wrong."
+            exit 1
+          fi
+          bin_path="$(cd "$(dirname "$bin_path")" && pwd -P)/$(basename "$bin_path")"
+          chmod +x "$bin_path"
+          echo "bin_path=$bin_path" >> "$GITHUB_OUTPUT"
+
+      # Identical assertions to the removed macos_signing_preflight job, now
+      # run against the exact published bytes instead of a discarded
+      # snapshot. See the Layer 2 smoke-test step further below for the full
+      # incident history behind the codesign/spctl reasoning duplicated here
+      # (GitHub Actions has no mechanism to share logic across jobs).
+      - name: Verify signature, notarization, and execution
+        shell: bash
+        env:
+          BIN_PATH: ${{ steps.extract.outputs.bin_path }}
+        run: |
+          set -uo pipefail
+          set +e
+          codesign_output="$(codesign --verify --deep --strict --verbose=4 "$BIN_PATH" 2>&1)"
+          codesign_status=$?
+          printf '%s\n' "$codesign_output"
+          if [ "$codesign_status" -ne 0 ]; then
+            echo "::error::Published darwin/arm64 artifact has an invalid code signature (codesign exited $codesign_status). Refusing to promote."
+            exit 1
+          fi
+
+          spctl_output="$(spctl -a -t install -vv "$BIN_PATH" 2>&1)"
+          spctl_status=$?
+          printf '%s\n' "$spctl_output"
+          # spctl -t install can exit 0 for a Developer-ID-signed-but-never-
+          # notarized binary, so exit code alone is not sufficient -- the
+          # string match is the real notarization assertion. See the Layer 2
+          # smoke-test step below for the incident (specscore-cli v0.24.0)
+          # that made this the required check rather than a bare exit-code
+          # check.
+          if [ "$spctl_status" -ne 0 ] || ! printf '%s\n' "$spctl_output" | grep -q 'source=Notarized Developer ID'; then
+            echo "::error::Published darwin/arm64 artifact was not accepted as source=Notarized Developer ID. Refusing to promote."
+            exit 1
+          fi
+
+          run_with_timeout() {
+            local seconds="$1"; shift
+            process_group_exists() {
+              python3 -c 'import os, sys; os.killpg(int(sys.argv[1]), 0)' "$1" 2>/dev/null
+            }
+            set -m
+            "$@" &
+            local cmd_pid=$!
+            set +m
+            python3 -c '
+          import os
+          import signal
+          import sys
+          import time
+
+          seconds = float(sys.argv[1])
+          pgid = int(sys.argv[2])
+          marker = sys.argv[3]
+          time.sleep(seconds)
+          try:
+              os.killpg(pgid, 0)
+          except ProcessLookupError:
+              sys.exit(0)
+          open(marker, "a").close()
+          os.killpg(pgid, signal.SIGTERM)
+          time.sleep(2)
+          try:
+              os.killpg(pgid, signal.SIGKILL)
+          except ProcessLookupError:
+              pass
+          ' "$seconds" "$cmd_pid" "${RUNNER_TEMP}/.macos_verify_timed_out" >/dev/null 2>&1 &
+            local watchdog_pid=$!
+            wait "$cmd_pid" 2>/dev/null
+            local exit_code=$?
+            if process_group_exists "$cmd_pid"; then
+              kill -TERM -- "-$cmd_pid" 2>/dev/null
+              local deadline=$((SECONDS + 2))
+              while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$deadline" ]; do
+                sleep 0.05
+              done
+              if process_group_exists "$cmd_pid"; then
+                kill -KILL -- "-$cmd_pid" 2>/dev/null
+              fi
+            fi
+            kill "$watchdog_pid" 2>/dev/null
+            wait "$watchdog_pid" 2>/dev/null
+            return "$exit_code"
+          }
+
+          rm -f "${RUNNER_TEMP}/.macos_verify_timed_out"
+          # SMOKE_CMD is deliberately unquoted, same as every other smoke-test
+          # step in this file.
+          # shellcheck disable=SC2086
+          output="$(run_with_timeout "$TIMEOUT_SECONDS" "$BIN_PATH" $SMOKE_CMD 2>&1)"
+          status=$?
+          printf '%s\n' "$output"
+          if [ -f "${RUNNER_TEMP}/.macos_verify_timed_out" ]; then
+            echo "::error::Published darwin/arm64 artifact exceeded ${TIMEOUT_SECONDS}s and was killed. Refusing to promote."
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Published darwin/arm64 artifact exited $status running '$BIN_PATH $SMOKE_CMD'. Refusing to promote."
+            exit 1
+          fi
+          if [ -z "$(printf '%s' "$output" | tr -d '[:space:]')" ]; then
+            echo "::error::Published darwin/arm64 artifact exited 0 but produced no output running '$BIN_PATH $SMOKE_CMD'. Refusing to promote."
+            exit 1
+          fi
+          echo "OK: published darwin/arm64 artifact is signed, notarized, runnable, and produced output."
+
+      # Only reached if every check above passed. Promotion is the sole gate
+      # on public visibility: assets were already uploaded when `release`
+      # ran GoReleaser above, but a draft release is not listed and its
+      # assets are not served to anyone without write access to this repo.
+      - name: Promote draft release to public
+        env:
+          TAG: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Promoted $GITHUB_REPOSITORY@$TAG from draft to public."
+
+      # Runs ONLY when a step above in this job failed (codesign, spctl,
+      # execution, or the darwin/arm64 asset never being found/downloaded).
+      # Restores the old all-or-nothing release semantics that the removed
+      # macos_signing_preflight job provided for free (a failed preflight
+      # blocked the tag, the release, AND every publisher from running at
+      # all): rolls each publisher repo GoReleaser just pushed to back to
+      # its pre-release commit -- GitHub-hosted (Homebrew/Scoop/Nix) via
+      # the GitHub API, AUR over SSH via a plain force-push -- and deletes
+      # the unpromoted draft release so neither an orphan draft nor a stale
+      # formula/manifest/PKGBUILD is left behind pointing at a release that
+      # will never go public.
+      #
+      # Best-effort and loud, by design: every target is attempted
+      # independently even if an earlier one fails, and this step always
+      # ends by naming exactly which repos were and were not restored --
+      # never silently. A rollback failure here does not, and cannot, mask
+      # the ORIGINAL verification failure above (this step's own outcome
+      # does not change the job's already-`failure` conclusion); it is
+      # reported as its own, separate `::error::`.
+      #
+      # Safety: only resets a repo if its CURRENT head, re-read right now,
+      # still matches the SHA GoReleaser's push produced (captured
+      # immediately after "Run GoReleaser" succeeded, in the `release` job
+      # above, by capture_post). If anything else has pushed to that
+      # repo/branch since, that is a real concurrent write and
+      # force-resetting would destroy it -- so this refuses to touch that
+      # repo, names both SHAs, and requires a human to reconcile it by hand
+      # instead. Every SSH call carries its own timeout, and SSH itself
+      # runs BatchMode + ConnectTimeout, so this step cannot hang waiting on
+      # a prompt or a stalled connection.
+      - name: Roll back publisher repos and delete the draft release
+        if: failure()
+        shell: bash
+        env:
+          RELEASE_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_GH_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          ROLLBACK_TARGETS: ${{ needs.release.outputs.rollback_targets }}
+          TAG: ${{ steps.release_tag.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat > "${RUNNER_TEMP}/rollback.py" <<'PYEOF'
+          import json
+          import os
+          import stat
+          import subprocess
+          import sys
+          import tempfile
+
+          def aur_ssh_env(key_path):
+              env = dict(os.environ)
+              env["GIT_SSH_COMMAND"] = (
+                  "ssh -i " + key_path
+                  + " -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10"
+                  + " -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="
+                  + os.path.join(os.path.dirname(key_path), "known_hosts")
+              )
+              return env
+
+          def aur_head(git_url, env):
+              try:
+                  proc = subprocess.run(
+                      ["git", "ls-remote", "--symref", git_url, "HEAD"],
+                      capture_output=True, text=True, env=env, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  return None, "timed out reaching " + git_url
+              if proc.returncode != 0:
+                  return None, "git ls-remote failed: " + proc.stderr.strip()
+              sha = ""
+              for line in proc.stdout.splitlines():
+                  if line.endswith("\tHEAD") and not line.startswith("ref: "):
+                      sha = line.split("\t", 1)[0]
+              if not sha:
+                  return None, "could not parse HEAD from ls-remote output"
+              return sha, None
+
+          def aur_force_push(git_url, branch, pre_sha, env):
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  try:
+                      clone = subprocess.run(
+                          ["git", "clone", "--bare", "--quiet", git_url, tmpdir],
+                          capture_output=True, text=True, env=env, timeout=60,
+                      )
+                  except subprocess.TimeoutExpired:
+                      return "timed out cloning " + git_url
+                  if clone.returncode != 0:
+                      return "git clone failed: " + clone.stderr.strip()
+                  try:
+                      push = subprocess.run(
+                          ["git", "push", "--force", git_url, pre_sha + ":refs/heads/" + branch],
+                          capture_output=True, text=True, env=env, cwd=tmpdir, timeout=60,
+                      )
+                  except subprocess.TimeoutExpired:
+                      return "timed out force-pushing to " + git_url
+                  if push.returncode != 0:
+                      return "git push --force failed: " + push.stderr.strip()
+              return None
+
+          tap_token = os.environ.get("TAP_GH_TOKEN", "")
+          tap_env = None
+          if tap_token:
+              tap_env = dict(os.environ)
+              tap_env["GH_TOKEN"] = tap_token
+
+          aur_key = os.environ.get("AUR_SSH_PRIVATE_KEY", "")
+          targets = json.loads(os.environ.get("ROLLBACK_TARGETS") or "[]")
+          aur_env = None
+          if aur_key and any(t.get("kind") == "aur" for t in targets):
+              key_dir = os.path.join(os.environ.get("RUNNER_TEMP", "."), "aur-ssh-rollback")
+              os.makedirs(key_dir, exist_ok=True)
+              key_path = os.path.join(key_dir, "id_aur")
+              with open(key_path, "w") as f:
+                  f.write(aur_key if aur_key.endswith("\n") else aur_key + "\n")
+              os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+              aur_env = aur_ssh_env(key_path)
+
+          restored = []
+          refused = []
+          errored = []
+
+          for t in targets:
+              kind = t.get("kind", "github")
+              label = t["git_url"] if kind == "aur" else t["owner"] + "/" + t["name"] + "@" + t["branch"]
+              pre_sha, post_sha = t.get("pre_sha"), t.get("post_sha")
+              if not pre_sha or not post_sha:
+                  print("::error::No pre/post SHA recorded for " + label + "; cannot safely restore it. Check it by hand.")
+                  errored.append(label)
+                  continue
+
+              if kind == "aur":
+                  if not aur_env:
+                      print("::error::AUR_SSH_PRIVATE_KEY is not set; cannot verify or restore " + label + ". Restore it by hand.")
+                      errored.append(label)
+                      continue
+                  current_sha, error = aur_head(t["git_url"], aur_env)
+                  if error:
+                      print("::error::Could not re-read the current HEAD of " + label + " to check it is safe to restore (" + error + "). Check it by hand.")
+                      errored.append(label)
+                      continue
+              else:
+                  if not tap_env:
+                      print("::error::GORELEASER_GITHUB_TOKEN is not set; cannot verify or restore " + label + ". Restore it by hand.")
+                      errored.append(label)
+                      continue
+                  proc = subprocess.run(
+                      ["gh", "api", "repos/" + t["owner"] + "/" + t["name"] + "/branches/" + t["branch"], "--jq", ".commit.sha"],
+                      capture_output=True, text=True, env=tap_env,
+                  )
+                  current_sha = proc.stdout.strip()
+                  if proc.returncode != 0 or not current_sha:
+                      print("::error::Could not re-read the current HEAD of " + label + " to check it is safe to restore. Check it by hand.")
+                      errored.append(label)
+                      continue
+
+              if current_sha != post_sha:
+                  print("::error::Refusing to restore " + label + ": expected it to still be at the SHA GoReleaser just pushed (" + post_sha + "), but it is now at " + current_sha + ". Someone else has pushed to it since -- restoring would destroy that push. Reconcile it by hand; it currently points at unpublished/unverified content.")
+                  refused.append(label + " (expected " + post_sha + ", found " + current_sha + ")")
+                  continue
+
+              if kind == "aur":
+                  error = aur_force_push(t["git_url"], t["branch"], pre_sha, aur_env)
+                  if error:
+                      print("::error::Failed to restore " + label + " to its pre-release SHA " + pre_sha + " (" + error + ").")
+                      errored.append(label)
+                      continue
+              else:
+                  proc = subprocess.run(
+                      [
+                          "gh", "api", "-X", "PATCH",
+                          "repos/" + t["owner"] + "/" + t["name"] + "/git/refs/heads/" + t["branch"],
+                          "-f", "sha=" + pre_sha,
+                          "-F", "force=true",
+                      ],
+                      capture_output=True, text=True, env=tap_env,
+                  )
+                  if proc.returncode != 0:
+                      print("::error::Failed to restore " + label + " to its pre-release SHA " + pre_sha + ": " + proc.stderr.strip())
+                      errored.append(label)
+                      continue
+
+              print("Restored " + label + " to its pre-release SHA " + pre_sha + ".")
+              restored.append(label)
+
+          # Delete the unpromoted draft release regardless of publisher
+          # rollback outcome, so a later re-run is never blocked by an
+          # existing (draft) release for the same tag and no orphan drafts
+          # accumulate. Left as a warning-only no-op if this fails -- an
+          # orphan draft is a cheap, purely cosmetic leftover compared to a
+          # live formula pointing at unpublished content.
+          tag = os.environ.get("TAG", "")
+          release_env = dict(os.environ)
+          release_env["GH_TOKEN"] = os.environ.get("RELEASE_GH_TOKEN", "")
+          if tag:
+              proc = subprocess.run(
+                  ["gh", "release", "delete", tag, "--repo", os.environ.get("REPO", ""), "--yes"],
+                  capture_output=True, text=True, env=release_env,
+              )
+              if proc.returncode == 0:
+                  print("Deleted the unpromoted draft release " + tag + ".")
+              else:
+                  print("::warning::Could not delete the unpromoted draft release " + tag + ": " + proc.stderr.strip() + ". A human should delete it by hand so it does not linger as an orphan draft.")
+          else:
+              print("::warning::No tag resolved for this run; could not attempt to delete an unpromoted draft release.")
+
+          print("Rollback summary: " + str(len(restored)) + " restored, " + str(len(refused)) + " refused (concurrent push), " + str(len(errored)) + " errored.")
+          if restored:
+              print("  restored: " + ", ".join(restored))
+          if refused:
+              print("::error::" + str(len(refused)) + " publisher repo(s) were NOT restored because of a concurrent push since GoReleaser's push: " + "; ".join(refused))
+          if errored:
+              print("::error::" + str(len(errored)) + " publisher repo(s) could not be checked or restored: " + "; ".join(errored))
+
+          # Never mask the original verification failure above (this step's
+          # own outcome does not change the job's already-failed
+          # conclusion), but do exit non-zero when something here itself
+          # needs a human's attention, so this step is visibly red too.
+          if refused or errored:
+              sys.exit(1)
+          PYEOF
+          python3 "${RUNNER_TEMP}/rollback.py"
+
+  # Recomputes this workflow's public `tag` output (see on.workflow_call.
+  # outputs.tag above) so a consumer's own downstream jobs -- e.g.
+  # ingitdb-cli's Chocolatey/Snapcraft publisher jobs, which fire on
+  # `needs.<this-workflow-job>.outputs.tag != ''` -- never see a non-empty
+  # tag until the release is genuinely public. Needed because `release`
+  # below now creates the tag and (when require_notarized_macos) a DRAFT
+  # release unconditionally, before macos_verify_and_promote has run --
+  # unlike the removed macos_signing_preflight, which gated `release`
+  # itself, so a failed preflight meant `release` never ran and its tag
+  # output was simply never set. Runs unconditionally (`if: always()`) so
+  # it always produces a value, including when macos_verify_and_promote
+  # never runs at all (require_notarized_macos: false, its normal
+  # 'skipped' result), in which case release's own tag passes through
+  # unchanged -- identical to today's behaviour for that (currently
+  # default, though no live consumer uses it) case.
+  finalize_release:
+    name: Finalize release tag output
+    needs: [ release, macos_verify_and_promote ]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.finalize.outputs.tag }}
+    steps:
+      - name: Compute the publicly-released tag
+        id: finalize
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+          REQUIRE_NOTARIZED: ${{ inputs.require_notarized_macos }}
+          VERIFY_RESULT: ${{ needs.macos_verify_and_promote.result }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          if [ "$REQUIRE_NOTARIZED" = "true" ] && [ "$VERIFY_RESULT" != "success" ]; then
+            tag=""
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   # Resolves what layers 1-3 below need to know about THIS repo's own
   # release: the tag that was just published, the binary name (read from the
   # repo's own GoReleaser config, not guessed blind), and whether it
   # publishes a Homebrew cask (for layer 3). Runs once on ubuntu-latest —
   # where `yq` is guaranteed present — so the per-platform jobs below don't
   # each repeat this checkout/parse.
+  #
+  # Also waits on macos_verify_and_promote (a no-op dependency when
+  # require_notarized_macos is false — that job doesn't run, so its result
+  # is 'skipped' and the check below passes straight through): these are
+  # POST-PUBLISH checks against the real public release, and when
+  # require_notarized_macos is true the release is not actually public
+  # until that job promotes it. Downloading and testing a still-draft (or
+  # promotion-failed) release here would test something no real user can
+  # reach yet.
   resolve_artifact_smoke_test:
     name: Resolve artifact smoke test target
-    needs: release
-    if: ${{ inputs.artifact_smoke_test && !failure() && !cancelled() && (needs.release.outputs.tag != '' || github.ref_type == 'tag') }}
+    needs: [ release, macos_verify_and_promote ]
+    if: >-
+      ${{ inputs.artifact_smoke_test && !failure() && !cancelled() &&
+          (needs.release.outputs.tag != '' || github.ref_type == 'tag') &&
+          (needs.macos_verify_and_promote.result == 'success' || needs.macos_verify_and_promote.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
