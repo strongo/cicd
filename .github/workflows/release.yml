@@ -320,6 +320,14 @@ jobs:
       contents: write   # required for GoReleaser to push GitHub releases
     outputs:
       tag: ${{ steps.tag.outputs.new_tag }}
+      # JSON list of {owner, name, branch, pre_sha, post_sha} for each
+      # git-hosted publisher repo (Homebrew tap/cask, Scoop bucket, Nix
+      # repo) this run pushed to. Consumed by macos_verify_and_promote to
+      # roll each one back to pre_sha if macOS verification fails. Empty
+      # ('[]', or unset when the capture steps below were skipped) when
+      # require_notarized_macos is false, no such publisher is configured,
+      # or GoReleaser never actually ran (no tag cut this run).
+      rollback_targets: ${{ steps.capture_post.outputs.rollback_targets }}
 
     steps:
       # 1. Checkout the code with full history + all tags. Both GoReleaser (changelog /
@@ -549,6 +557,100 @@ jobs:
           git push origin "refs/tags/$tag"
           echo "new_tag=$tag" >> "$GITHUB_OUTPUT"
 
+      # Enumerates the git-hosted package-manager repos this release will
+      # push to (Homebrew tap/cask, Scoop bucket, Nix repo -- the publishers
+      # GoReleaser pushes to directly via a plain git ref update, using
+      # GORELEASER_GITHUB_TOKEN) and captures each one's current HEAD SHA
+      # BEFORE GoReleaser runs. macos_verify_and_promote below uses this to
+      # roll each repo back to this exact commit if macOS verification
+      # fails, restoring the old all-or-nothing release semantics instead of
+      # leaving a formula/manifest live pointing at a release that will
+      # never be promoted.
+      #
+      # Scoped to brews/homebrew_casks/scoops/nix only. WinGet publishes via
+      # a cross-fork PR against a THIRD-PARTY repo (microsoft/winget-pkgs)
+      # that reverting our own fork's branch would not retract; AUR pushes
+      # over SSH to a non-GitHub git host this GitHub-API-based mechanism
+      # cannot reach. Both are out of scope for automatic rollback -- a
+      # verification failure while either is configured still needs manual
+      # cleanup, and this step says so explicitly if it finds one.
+      #
+      # Only runs when GoReleaser is actually about to run (same condition
+      # as the step below): a no-op merge with no tag to cut has nothing to
+      # capture.
+      - name: Capture pre-release publisher repo SHAs
+        id: capture_pre
+        if: ${{ inputs.require_notarized_macos && (github.ref_type == 'tag' || steps.tag.outputs.new_tag != '') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+        run: |
+          cat > "${RUNNER_TEMP}/capture_pre_release_shas.py" <<'PYEOF'
+          import json
+          import os
+          import subprocess
+
+          config = {}
+          for name in [".goreleaser.yaml", ".goreleaser.yml", "goreleaser.yaml", "goreleaser.yml"]:
+              if os.path.isfile(name):
+                  proc = subprocess.run(["yq", "-o=json", ".", name], capture_output=True, text=True)
+                  if proc.returncode == 0 and proc.stdout.strip():
+                      config = json.loads(proc.stdout)
+                  break
+
+          UNCOVERED = {
+              "winget": "it opens a cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs repo; reverting our own fork's branch would not retract an already-filed PR there",
+              "wingets": "it opens a cross-fork PR against the THIRD-PARTY microsoft/winget-pkgs repo; reverting our own fork's branch would not retract an already-filed PR there",
+              "aur": "it pushes over SSH to a non-GitHub git host (aur.archlinux.org); this GitHub-API-based rollback mechanism cannot reach it",
+              "aurs": "it pushes over SSH to a non-GitHub git host (aur.archlinux.org); this GitHub-API-based rollback mechanism cannot reach it",
+              "chocolateys": "it pushes a .nupkg directly to chocolatey.org via API key, not to any git ref -- there is no commit to snapshot or restore at all",
+          }
+          for key, reason in UNCOVERED.items():
+              if config.get(key):
+                  print("::warning::This repo configures " + key + " in its GoReleaser config. Automatic rollback on a failed macOS verification does NOT cover it: " + reason + ". A verification failure will require manual cleanup of that publisher.")
+
+          COVERED = ["brews", "homebrew_casks", "scoops", "nix"]
+          targets = []
+          seen = set()
+          for key in COVERED:
+              for entry in (config.get(key) or []):
+                  repo = (entry or {}).get("repository") or {}
+                  owner, name = repo.get("owner"), repo.get("name")
+                  if not owner or not name:
+                      continue
+                  branch = repo.get("branch") or ""
+                  ident = (owner, name, branch)
+                  if ident in seen:
+                      continue
+                  seen.add(ident)
+                  targets.append({"owner": owner, "name": name, "branch": branch})
+
+          gh_token = os.environ.get("GH_TOKEN", "")
+          resolved = []
+          if targets and not gh_token:
+              print("::warning::This repo configures Homebrew/Scoop/Nix publishers but GORELEASER_GITHUB_TOKEN is not set; automatic rollback cannot read or restore them on a failed verification.")
+          else:
+              for t in targets:
+                  owner, name, branch = t["owner"], t["name"], t["branch"]
+                  if not branch:
+                      proc = subprocess.run(["gh", "api", "repos/" + owner + "/" + name, "--jq", ".default_branch"], capture_output=True, text=True)
+                      branch = proc.stdout.strip()
+                      if proc.returncode != 0 or not branch:
+                          print("::warning::Could not resolve a branch for publisher repo " + owner + "/" + name + "; skipping rollback capture for it.")
+                          continue
+                  proc = subprocess.run(["gh", "api", "repos/" + owner + "/" + name + "/branches/" + branch, "--jq", ".commit.sha"], capture_output=True, text=True)
+                  sha = proc.stdout.strip()
+                  if proc.returncode != 0 or not sha:
+                      print("::warning::Could not read the current HEAD of " + owner + "/" + name + "@" + branch + " (missing repo/branch, or GORELEASER_GITHUB_TOKEN lacks access); skipping rollback capture for it.")
+                      continue
+                  print("Captured pre-release SHA for " + owner + "/" + name + "@" + branch + ": " + sha)
+                  resolved.append({"owner": owner, "name": name, "branch": branch, "pre_sha": sha})
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("targets=" + json.dumps(resolved) + "\n")
+          PYEOF
+          python3 "${RUNNER_TEMP}/capture_pre_release_shas.py"
+
       # The full-history checkout already fetched the remote tags, and a tag
       # created above is present in this checkout immediately. Do not fetch
       # again here: GoReleaser releases the local exact tag, while a redundant
@@ -561,6 +663,7 @@ jobs:
       # to release — skip GoReleaser (running it on an untagged commit would
       # fail the job).
       - name: Run GoReleaser
+        id: run_goreleaser
         if: ${{ github.ref_type == 'tag' || steps.tag.outputs.new_tag != '' }}
         uses: goreleaser/goreleaser-action@v7
         with:
@@ -601,6 +704,57 @@ jobs:
           NOTARIZE_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
           NOTARIZE_KEY: ${{ secrets.NOTARIZE_KEY }}
 
+      # Captures each rollback target's HEAD SHA again immediately AFTER
+      # GoReleaser has pushed to it, so macos_verify_and_promote below can
+      # tell -- via compare-and-swap against a repo re-read at rollback
+      # time -- whether it is still safe to reset that repo to its
+      # pre-release SHA, or whether someone else has pushed to it since (in
+      # which case rollback must refuse, not clobber that push).
+      #
+      # Only runs once GoReleaser has actually succeeded: if it failed
+      # partway through its own publish pipeline, that is an existing,
+      # separate failure mode this change does not newly introduce (the
+      # release job simply fails, exactly as before, and
+      # macos_verify_and_promote's own `if` already requires the release job
+      # to not have failed).
+      - name: Capture post-release publisher repo SHAs
+        id: capture_post
+        if: ${{ inputs.require_notarized_macos && steps.run_goreleaser.outcome == 'success' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+          PRE_TARGETS: ${{ steps.capture_pre.outputs.targets }}
+        run: |
+          cat > "${RUNNER_TEMP}/capture_post_release_shas.py" <<'PYEOF'
+          import json
+          import os
+          import subprocess
+
+          pre_targets = json.loads(os.environ.get("PRE_TARGETS") or "[]")
+          gh_token = os.environ.get("GH_TOKEN", "")
+          resolved = []
+          for t in pre_targets:
+              owner, name, branch = t["owner"], t["name"], t["branch"]
+              if not gh_token:
+                  continue
+              proc = subprocess.run(
+                  ["gh", "api", "repos/" + owner + "/" + name + "/branches/" + branch, "--jq", ".commit.sha"],
+                  capture_output=True, text=True,
+              )
+              sha = proc.stdout.strip()
+              if proc.returncode != 0 or not sha:
+                  print("::warning::Could not read the post-release HEAD of " + owner + "/" + name + "@" + branch + " right after GoReleaser ran; rollback will not be able to verify or restore this repo if the macOS check later fails.")
+                  continue
+              print("Captured post-release SHA for " + owner + "/" + name + "@" + branch + ": " + sha)
+              merged = dict(t)
+              merged["post_sha"] = sha
+              resolved.append(merged)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("rollback_targets=" + json.dumps(resolved) + "\n")
+          PYEOF
+          python3 "${RUNNER_TEMP}/capture_post_release_shas.py"
+
   # Verifies the darwin/arm64 artifact THIS RUN PUBLISHED, and gates its
   # public visibility on that verification. Replaces the old
   # macos_signing_preflight job, which built its own full binary matrix
@@ -627,9 +781,10 @@ jobs:
   # does not list a draft release or serve its assets to anyone without
   # write access to the repo, so nothing reaches a real user.
   #
-  # KNOWN RESIDUAL RISK, not fully closed by this change: `goreleaser
-  # release --draft` still runs this repo's Homebrew/AUR/Scoop/Chocolatey/
-  # WinGet publishers (when configured) in the SAME invocation, because
+  # KNOWN RESIDUAL RISK, partially closed by the "Roll back publisher
+  # repos" step at the end of this job: `goreleaser release --draft` still
+  # runs this repo's Homebrew/Scoop/Nix/AUR/Chocolatey/WinGet publishers
+  # (when configured) in the SAME invocation as the draft release, because
   # GoReleaser OSS has no supported way to build+sign+notarize+create-the-
   # release once and defer JUST those publishers to a later invocation
   # without rebuilding -- that split/merge (`release --split` + `continue`,
@@ -637,21 +792,34 @@ jobs:
   # v2.18.0 source this workflow pins: its `cmd/` package has no `publish`
   # or `continue` subcommand at all). So those publishers push
   # formula/manifest updates pointing at the draft release's asset URLs
-  # before this job has verified anything. Two consequences: (1) a brief
-  # window (this job's runtime, typically a few minutes) where a
-  # freshly-tapped/AUR-pushed formula 404s until promotion -- narrow, and
-  # no worse than the tap-visibility-timing gaps this workflow already
-  # treats as "could not test, not broken" elsewhere (see
-  # artifact_smoke_test_homebrew_cask below); (2) if verification then
-  # FAILS, those formula/manifest updates stay live in the public
-  # tap/AUR/bucket referencing a release that will never be promoted, and
-  # need a manual revert -- strictly worse than the old preflight's
-  # all-or-nothing block, where a failed preflight prevented the tag, the
-  # release, AND every publisher from running at all. This is the accepted
-  # trade-off for closing the "verifies bytes it does not publish" gap
-  # without hand-rolling GoReleaser Pro's split/merge from raw --skip
-  # flags, which would be unproven and risky to get right blind. Flagged
-  # explicitly in the PR that introduced this job; not hidden here only.
+  # before this job has verified anything. Consequences, and what is and
+  # isn't covered:
+  #
+  # (1) A brief window (this job's runtime, typically a few minutes) where
+  #     a freshly-tapped/pushed formula 404s until promotion -- narrow, not
+  #     destructive (it self-heals the moment "Promote draft release to
+  #     public" below succeeds), and no worse than the tap-visibility-timing
+  #     gaps this workflow already treats as "could not test, not broken"
+  #     elsewhere (see artifact_smoke_test_homebrew_cask below). No rollback
+  #     mechanism can shrink this window without GoReleaser Pro's
+  #     split/merge; it is accepted as-is.
+  #
+  # (2) If verification then FAILS, "Roll back publisher repos and delete
+  #     the draft release" below restores Homebrew (brews/homebrew_casks),
+  #     Scoop, and Nix repos to their pre-release commit (compare-and-swap
+  #     guarded: it refuses to touch a repo that has been pushed to again
+  #     since GoReleaser's push, naming both SHAs instead) and deletes the
+  #     unpromoted draft release -- recovering the old preflight's
+  #     all-or-nothing guarantee for those publishers. WinGet (a cross-fork
+  #     PR against the THIRD-PARTY microsoft/winget-pkgs repo -- reverting
+  #     our own fork's branch would not retract an already-filed PR there),
+  #     AUR (pushed over SSH to a non-GitHub git host this GitHub-API-based
+  #     mechanism cannot reach), and Chocolatey (pushed directly to
+  #     chocolatey.org via API key, not to any git ref -- nothing to
+  #     snapshot at all) remain genuinely unrecoverable: a failure while any
+  #     of those is configured still needs manual cleanup, and the capture
+  #     step below emits an explicit `::warning::` naming which one and why.
+  #     ingitdb-cli is the one current consumer configuring WinGet.
   macos_verify_and_promote:
     name: Verify and promote macOS release
     needs: release
@@ -911,6 +1079,141 @@ jobs:
           set -euo pipefail
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
           echo "Promoted $GITHUB_REPOSITORY@$TAG from draft to public."
+
+      # Runs ONLY when a step above in this job failed (codesign, spctl,
+      # execution, or the darwin/arm64 asset never being found/downloaded).
+      # Restores the old all-or-nothing release semantics that the removed
+      # macos_signing_preflight job provided for free (a failed preflight
+      # blocked the tag, the release, AND every publisher from running at
+      # all): rolls each publisher repo GoReleaser just pushed to back to
+      # its pre-release commit, and deletes the unpromoted draft release so
+      # neither an orphan draft nor a stale formula/manifest is left behind
+      # pointing at a release that will never go public.
+      #
+      # Best-effort and loud, by design: every target is attempted
+      # independently even if an earlier one fails, and this step always
+      # ends by naming exactly which repos were and were not restored --
+      # never silently. A rollback failure here does not, and cannot, mask
+      # the ORIGINAL verification failure above (this step's own outcome
+      # does not change the job's already-`failure` conclusion); it is
+      # reported as its own, separate `::error::`.
+      #
+      # Safety: only resets a repo if its CURRENT head, re-read right now,
+      # still matches the SHA GoReleaser's push produced (captured
+      # immediately after "Run GoReleaser" succeeded, in the `release` job
+      # above, by capture_post). If anything else has pushed to that
+      # repo/branch since, that is a real concurrent write and
+      # force-resetting would destroy it -- so this refuses to touch that
+      # repo, names both SHAs, and requires a human to reconcile it by hand
+      # instead.
+      - name: Roll back publisher repos and delete the draft release
+        if: failure()
+        shell: bash
+        env:
+          RELEASE_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_GH_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+          ROLLBACK_TARGETS: ${{ needs.release.outputs.rollback_targets }}
+          TAG: ${{ steps.release_tag.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat > "${RUNNER_TEMP}/rollback.py" <<'PYEOF'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          tap_token = os.environ.get("TAP_GH_TOKEN", "")
+          targets = json.loads(os.environ.get("ROLLBACK_TARGETS") or "[]")
+
+          restored = []
+          refused = []
+          errored = []
+
+          if targets and not tap_token:
+              print("::error::GORELEASER_GITHUB_TOKEN is not set; cannot verify or restore " + str(len(targets)) + " publisher repo(s) GoReleaser may have already pushed to. Restore them by hand.")
+              errored = [t["owner"] + "/" + t["name"] + "@" + t["branch"] for t in targets]
+              targets = []
+
+          for t in targets:
+              owner, name, branch = t["owner"], t["name"], t["branch"]
+              pre_sha, post_sha = t.get("pre_sha"), t.get("post_sha")
+              label = owner + "/" + name + "@" + branch
+              if not pre_sha or not post_sha:
+                  print("::error::No pre/post SHA recorded for " + label + "; cannot safely restore it. Check it by hand.")
+                  errored.append(label)
+                  continue
+
+              env = dict(os.environ)
+              env["GH_TOKEN"] = tap_token
+              proc = subprocess.run(
+                  ["gh", "api", "repos/" + owner + "/" + name + "/branches/" + branch, "--jq", ".commit.sha"],
+                  capture_output=True, text=True, env=env,
+              )
+              current_sha = proc.stdout.strip()
+              if proc.returncode != 0 or not current_sha:
+                  print("::error::Could not re-read the current HEAD of " + label + " to check it is safe to restore. Check it by hand.")
+                  errored.append(label)
+                  continue
+
+              if current_sha != post_sha:
+                  print("::error::Refusing to restore " + label + ": expected it to still be at the SHA GoReleaser just pushed (" + post_sha + "), but it is now at " + current_sha + ". Someone else has pushed to it since -- restoring would destroy that push. Reconcile it by hand; it currently points at unpublished/unverified content.")
+                  refused.append(label + " (expected " + post_sha + ", found " + current_sha + ")")
+                  continue
+
+              proc = subprocess.run(
+                  [
+                      "gh", "api", "-X", "PATCH",
+                      "repos/" + owner + "/" + name + "/git/refs/heads/" + branch,
+                      "-f", "sha=" + pre_sha,
+                      "-F", "force=true",
+                  ],
+                  capture_output=True, text=True, env=env,
+              )
+              if proc.returncode != 0:
+                  print("::error::Failed to restore " + label + " to its pre-release SHA " + pre_sha + ": " + proc.stderr.strip())
+                  errored.append(label)
+                  continue
+
+              print("Restored " + label + " to its pre-release SHA " + pre_sha + ".")
+              restored.append(label)
+
+          # Delete the unpromoted draft release regardless of publisher
+          # rollback outcome, so a later re-run is never blocked by an
+          # existing (draft) release for the same tag and no orphan drafts
+          # accumulate. Left as a warning-only no-op if this fails -- an
+          # orphan draft is a cheap, purely cosmetic leftover compared to a
+          # live formula pointing at unpublished content.
+          tag = os.environ.get("TAG", "")
+          release_env = dict(os.environ)
+          release_env["GH_TOKEN"] = os.environ.get("RELEASE_GH_TOKEN", "")
+          if tag:
+              proc = subprocess.run(
+                  ["gh", "release", "delete", tag, "--repo", os.environ.get("REPO", ""), "--yes"],
+                  capture_output=True, text=True, env=release_env,
+              )
+              if proc.returncode == 0:
+                  print("Deleted the unpromoted draft release " + tag + ".")
+              else:
+                  print("::warning::Could not delete the unpromoted draft release " + tag + ": " + proc.stderr.strip() + ". A human should delete it by hand so it does not linger as an orphan draft.")
+          else:
+              print("::warning::No tag resolved for this run; could not attempt to delete an unpromoted draft release.")
+
+          print("Rollback summary: " + str(len(restored)) + " restored, " + str(len(refused)) + " refused (concurrent push), " + str(len(errored)) + " errored.")
+          if restored:
+              print("  restored: " + ", ".join(restored))
+          if refused:
+              print("::error::" + str(len(refused)) + " publisher repo(s) were NOT restored because of a concurrent push since GoReleaser's push: " + "; ".join(refused))
+          if errored:
+              print("::error::" + str(len(errored)) + " publisher repo(s) could not be checked or restored: " + "; ".join(errored))
+
+          # Never mask the original verification failure above (this step's
+          # own outcome does not change the job's already-failed
+          # conclusion), but do exit non-zero when something here itself
+          # needs a human's attention, so this step is visibly red too.
+          if refused or errored:
+              sys.exit(1)
+          PYEOF
+          python3 "${RUNNER_TEMP}/rollback.py"
 
   # Recomputes this workflow's public `tag` output (see on.workflow_call.
   # outputs.tag above) so a consumer's own downstream jobs -- e.g.
