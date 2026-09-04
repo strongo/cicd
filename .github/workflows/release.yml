@@ -310,7 +310,7 @@ on:
 
 jobs:
   release:
-    name: GoReleaser
+    name: Build and upload release artifacts
     # No upstream `needs` any more: this job now builds the matrix ONCE and
     # (when require_notarized_macos) publishes as a draft; macos_verify_and_
     # promote below verifies the real published bytes and gates PUBLIC
@@ -1051,7 +1051,7 @@ jobs:
   #     ingitdb-cli is the one current consumer configuring WinGet (and the
   #     only one configuring AUR, which IS now covered).
   macos_verify_and_promote:
-    name: Verify and promote macOS release
+    name: Verify signed macOS artifact and promote draft release
     needs: release
     if: ${{ inputs.require_notarized_macos && !failure() && !cancelled() && (needs.release.outputs.tag != '' || github.ref_type == 'tag') }}
     runs-on: macos-latest
@@ -1064,7 +1064,7 @@ jobs:
       TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
 
     steps:
-      # Same tag-resolution contract as resolve_artifact_smoke_test below:
+      # Same tag-resolution contract as the artifact-smoke jobs below:
       # `release`'s own tag output is empty on a direct tag push (the bump
       # step that sets it only runs on a branch/merge trigger), so fall
       # back to the ref name in that case.
@@ -1080,7 +1080,7 @@ jobs:
 
       # Sparse, ref-pinned checkout of just the GoReleaser config as it
       # existed at the exact tag just published. This job resolves its own
-      # binary name independently (duplicated from resolve_artifact_smoke_test
+      # binary name independently (duplicated from resolve_artifact_smoke_metadata
       # below) rather than depending on that job, so require_notarized_macos
       # keeps gating publication even when a caller sets
       # artifact_smoke_test: false.
@@ -1548,7 +1548,7 @@ jobs:
   # unchanged -- identical to today's behaviour for that (currently
   # default, though no live consumer uses it) case.
   finalize_release:
-    name: Finalize release tag output
+    name: Finalize public release tag
     needs: [ release, macos_verify_and_promote ]
     if: ${{ always() }}
     runs-on: ubuntu-latest
@@ -1569,60 +1569,41 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-  # Resolves what layers 1-3 below need to know about THIS repo's own
-  # release: the tag that was just published, the binary name (read from the
-  # repo's own GoReleaser config, not guessed blind), and whether it
-  # publishes a Homebrew cask (for layer 3). Runs once on ubuntu-latest —
-  # where `yq` is guaranteed present — so the per-platform jobs below don't
-  # each repeat this checkout/parse.
+  # Resolve read-only smoke-test metadata while GoReleaser builds. This is
+  # deliberately separate from resolving the release tag below: the binary
+  # and Homebrew-cask configuration comes from the exact source revision the
+  # release job checks out, whereas the tag is not safe to expose to a smoke
+  # test until the draft has passed macOS verification and been promoted.
   #
-  # Also waits on macos_verify_and_promote (a no-op dependency when
-  # require_notarized_macos is false — that job doesn't run, so its result
-  # is 'skipped' and the check below passes straight through): these are
-  # POST-PUBLISH checks against the real public release, and when
-  # require_notarized_macos is true the release is not actually public
-  # until that job promotes it. Downloading and testing a still-draft (or
-  # promotion-failed) release here would test something no real user can
-  # reach yet.
-  resolve_artifact_smoke_test:
-    name: Resolve artifact smoke test target
-    needs: [ release, macos_verify_and_promote ]
-    if: >-
-      ${{ inputs.artifact_smoke_test && !failure() && !cancelled() &&
-          (needs.release.outputs.tag != '' || github.ref_type == 'tag') &&
-          (needs.macos_verify_and_promote.result == 'success' || needs.macos_verify_and_promote.result == 'skipped') }}
+  # Keeping this work in its own job removes a needless serial checkout/parse
+  # from the release critical path without making a draft release observable
+  # to a user-facing verifier.
+  resolve_artifact_smoke_metadata:
+    name: Resolve release test configuration
+    if: ${{ inputs.artifact_smoke_test }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      binary: ${{ steps.resolve.outputs.binary }}
+      binary: ${{ steps.metadata.outputs.binary }}
       # false only for the specific case where we deliberately refuse to
       # guess (see the tag_prefix branch in "Resolve binary name" below).
       # Downstream jobs skip entirely rather than test/fail on a guess.
-      binary_resolved: ${{ steps.resolve.outputs.binary_resolved }}
-      has_homebrew_cask: ${{ steps.resolve.outputs.has_homebrew_cask }}
-      homebrew_tap: ${{ steps.resolve.outputs.homebrew_tap }}
-      homebrew_cask_name: ${{ steps.resolve.outputs.homebrew_cask_name }}
+      binary_resolved: ${{ steps.metadata.outputs.binary_resolved }}
+      has_homebrew_cask: ${{ steps.metadata.outputs.has_homebrew_cask }}
+      homebrew_tap: ${{ steps.metadata.outputs.homebrew_tap }}
+      homebrew_cask_name: ${{ steps.metadata.outputs.homebrew_cask_name }}
 
     steps:
-      - name: Determine the tag this run published
-        id: release_tag
-        env:
-          RELEASE_TAG: ${{ needs.release.outputs.tag }}
-        run: |
-          set -euo pipefail
-          tag="$RELEASE_TAG"
-          [ -z "$tag" ] && tag="${GITHUB_REF_NAME}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      # Sparse, ref-pinned checkout: we only need the GoReleaser config as it
-      # existed at the exact tag that was released, not the whole repo.
-      - name: Checkout GoReleaser config at the released tag
+      # Sparse, SHA-pinned checkout: `release` checks out this same triggering
+      # revision before calculating/pushing a tag. Do this before the build so
+      # metadata resolution can run in parallel, but never use metadata alone
+      # as proof that a particular tag was released.
+      - name: Checkout GoReleaser config at the release source revision
         uses: actions/checkout@v7
         with:
-          ref: ${{ steps.release_tag.outputs.tag }}
+          ref: ${{ github.sha }}
           sparse-checkout: |
             .goreleaser.yaml
             .goreleaser.yml
@@ -1631,10 +1612,10 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Resolve binary name and Homebrew cask target
-        id: resolve
+        id: metadata
         env:
           BINARY_OVERRIDE: ${{ inputs.artifact_smoke_test_binary }}
-          TAG: ${{ steps.release_tag.outputs.tag }}
+          SOURCE_SHA: ${{ github.sha }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
         run: |
           set -euo pipefail
@@ -1697,7 +1678,7 @@ jobs:
             case "$TAG_PREFIX" in
               */*)
                 binary_resolved="false"
-                resolve_note="Could not resolve a binary name to smoke test: tag_prefix '$TAG_PREFIX' looks like a subdirectory-module path, but no .goreleaser.yaml/.goreleaser.yml/goreleaser.yaml/goreleaser.yml was found at the REPO ROOT at tag $TAG. Guessing from the repo name would likely name the wrong module. Skipping the artifact smoke test for this release rather than testing (or failing on) an unverified guess. Set artifact_smoke_test_binary explicitly to enable it."
+                resolve_note="Could not resolve a binary name to smoke test: tag_prefix '$TAG_PREFIX' looks like a subdirectory-module path, but no .goreleaser.yaml/.goreleaser.yml/goreleaser.yaml/goreleaser.yml was found at the REPO ROOT at release source revision $SOURCE_SHA. Guessing from the repo name would likely name the wrong module. Skipping the artifact smoke test for this release rather than testing (or failing on) an unverified guess. Set artifact_smoke_test_binary explicitly to enable it."
                 ;;
               *)
                 repo_name="${GITHUB_REPOSITORY#*/}"
@@ -1715,9 +1696,8 @@ jobs:
             echo "::warning::$resolve_note"
           fi
 
-          echo "Resolved: tag=$TAG binary=$binary binary_resolved=$binary_resolved has_homebrew_cask=$has_cask homebrew_tap=$tap homebrew_cask_name=$cask_name"
+          echo "Resolved: source_sha=$SOURCE_SHA binary=$binary binary_resolved=$binary_resolved has_homebrew_cask=$has_cask homebrew_tap=$tap homebrew_cask_name=$cask_name"
           {
-            echo "tag=$TAG"
             echo "binary=$binary"
             echo "binary_resolved=$binary_resolved"
             echo "has_homebrew_cask=$has_cask"
@@ -1744,10 +1724,17 @@ jobs:
   # broken" always hard-fails (exit 1), unconditionally for layer 1.
   artifact_smoke_test:
     name: 'Smoke test published artifact (${{ matrix.goos }}/${{ matrix.goarch }})'
-    needs: [ release, resolve_artifact_smoke_test ]
+    # Metadata is source-bound and can resolve in parallel with the build;
+    # release plus macOS promotion are the public-artifact gate. Do not weaken
+    # either edge: a draft is never a smoke-test target.
+    needs: [ release, macos_verify_and_promote, resolve_artifact_smoke_metadata ]
     if: >-
-      ${{ needs.resolve_artifact_smoke_test.result == 'success' &&
-          needs.resolve_artifact_smoke_test.outputs.binary_resolved != 'false' }}
+      ${{ !cancelled() &&
+          needs.release.result == 'success' &&
+          needs.resolve_artifact_smoke_metadata.result == 'success' &&
+          (needs.release.outputs.tag != '' || github.ref_type == 'tag') &&
+          (needs.macos_verify_and_promote.result == 'success' || needs.macos_verify_and_promote.result == 'skipped') &&
+          needs.resolve_artifact_smoke_metadata.outputs.binary_resolved != 'false' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     permissions:
@@ -1758,8 +1745,8 @@ jobs:
         include: ${{ fromJson(inputs.artifact_smoke_test_platforms) }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ needs.resolve_artifact_smoke_test.outputs.tag }}
-      BINARY: ${{ needs.resolve_artifact_smoke_test.outputs.binary }}
+      TAG: ${{ needs.release.outputs.tag || github.ref_name }}
+      BINARY: ${{ needs.resolve_artifact_smoke_metadata.outputs.binary }}
       SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
       TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
       REQUIRE_NOTARIZED: ${{ inputs.require_notarized_macos }}
@@ -2128,7 +2115,7 @@ jobs:
           fi
 
   # LAYER 3 — the path a real Homebrew user actually takes. Auto-detected
-  # from this repo's own GoReleaser config via resolve_artifact_smoke_test;
+  # from this repo's own GoReleaser config via resolve_artifact_smoke_metadata;
   # no-ops for a repo that doesn't publish a Homebrew cask. `brew install
   # --cask` is the only layer that reproduces Homebrew's quarantine
   # attribute on the installed binary, which is what actually blocked
@@ -2149,20 +2136,24 @@ jobs:
   # reliable, deterministic signal on this runner type.
   artifact_smoke_test_homebrew_cask:
     name: 'Smoke test Homebrew cask install (darwin/arm64)'
-    needs: [ release, resolve_artifact_smoke_test ]
+    needs: [ release, macos_verify_and_promote, resolve_artifact_smoke_metadata ]
     if: >-
-      ${{ needs.resolve_artifact_smoke_test.result == 'success' &&
-          needs.resolve_artifact_smoke_test.outputs.binary_resolved != 'false' &&
+      ${{ !cancelled() &&
+          needs.release.result == 'success' &&
+          needs.resolve_artifact_smoke_metadata.result == 'success' &&
+          (needs.release.outputs.tag != '' || github.ref_type == 'tag') &&
+          (needs.macos_verify_and_promote.result == 'success' || needs.macos_verify_and_promote.result == 'skipped') &&
+          needs.resolve_artifact_smoke_metadata.outputs.binary_resolved != 'false' &&
           inputs.artifact_smoke_test_homebrew_cask &&
-          needs.resolve_artifact_smoke_test.outputs.has_homebrew_cask == 'true' }}
+          needs.resolve_artifact_smoke_metadata.outputs.has_homebrew_cask == 'true' }}
     runs-on: macos-latest
     timeout-minutes: 20
     permissions:
       contents: read
     env:
-      BINARY: ${{ needs.resolve_artifact_smoke_test.outputs.binary }}
-      HOMEBREW_TAP: ${{ needs.resolve_artifact_smoke_test.outputs.homebrew_tap }}
-      CASK_NAME: ${{ needs.resolve_artifact_smoke_test.outputs.homebrew_cask_name }}
+      BINARY: ${{ needs.resolve_artifact_smoke_metadata.outputs.binary }}
+      HOMEBREW_TAP: ${{ needs.resolve_artifact_smoke_metadata.outputs.homebrew_tap }}
+      CASK_NAME: ${{ needs.resolve_artifact_smoke_metadata.outputs.homebrew_cask_name }}
       SMOKE_CMD: ${{ inputs.artifact_smoke_test_command }}
       TIMEOUT_SECONDS: ${{ inputs.artifact_smoke_test_timeout_seconds }}
       REQUIRE_NOTARIZED: ${{ inputs.require_notarized_macos }}

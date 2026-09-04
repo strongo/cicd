@@ -80,6 +80,68 @@ func TestReleaseWorkflowExtractsAnAbsoluteRunnableBinaryPath(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflowResolvesSmokeMetadataInParallelButGatesPublishedArtifacts(t *testing.T) {
+	workflow := readReleaseWorkflow(t)
+
+	metadataStart := strings.Index(workflow, "\n  resolve_artifact_smoke_metadata:\n")
+	artifactStart := strings.Index(workflow, "\n  artifact_smoke_test:\n")
+	if metadataStart < 0 || artifactStart < 0 || metadataStart >= artifactStart {
+		t.Fatal("release workflow must declare an inspectable pre-build metadata job before artifact smoke tests")
+	}
+	metadata := workflow[metadataStart:artifactStart]
+	for _, required := range []string{
+		"name: Resolve release test configuration",
+		"ref: ${{ github.sha }}",
+		"id: metadata",
+		"steps.metadata.outputs.binary",
+	} {
+		if !strings.Contains(metadata, required) {
+			t.Fatalf("pre-build metadata job is missing %q", required)
+		}
+	}
+	if strings.Contains(metadata, "needs:") {
+		t.Fatal("source-bound metadata must not wait for release or promotion; it should run in parallel with the build")
+	}
+
+	artifactEnd := strings.Index(workflow, "\n  artifact_smoke_test_homebrew_cask:\n")
+	if artifactEnd < 0 {
+		t.Fatal("release workflow must retain the Homebrew smoke job")
+	}
+	artifact := workflow[artifactStart:artifactEnd]
+	for _, required := range []string{
+		"needs: [ release, macos_verify_and_promote, resolve_artifact_smoke_metadata ]",
+		"!cancelled()",
+		"needs.release.result == 'success'",
+		"needs.resolve_artifact_smoke_metadata.result == 'success'",
+		"needs.macos_verify_and_promote.result == 'success' || needs.macos_verify_and_promote.result == 'skipped'",
+		"TAG: ${{ needs.release.outputs.tag || github.ref_name }}",
+		"BINARY: ${{ needs.resolve_artifact_smoke_metadata.outputs.binary }}",
+	} {
+		if !strings.Contains(artifact, required) {
+			t.Fatalf("artifact smoke job is missing exact publication-gate contract %q", required)
+		}
+	}
+	if strings.Contains(workflow, "resolve_artifact_smoke_target:") {
+		t.Fatal("do not add a runner-only tag resolver; smoke jobs can bind the released tag directly after their publication gates")
+	}
+
+	homebrewStart := artifactEnd
+	homebrew := workflow[homebrewStart:]
+	for _, required := range []string{
+		"needs: [ release, macos_verify_and_promote, resolve_artifact_smoke_metadata ]",
+		"!cancelled()",
+		"needs.release.result == 'success'",
+		"needs.resolve_artifact_smoke_metadata.result == 'success'",
+		"needs.macos_verify_and_promote.result == 'success' || needs.macos_verify_and_promote.result == 'skipped'",
+		"needs.resolve_artifact_smoke_metadata.outputs.has_homebrew_cask == 'true'",
+		"BINARY: ${{ needs.resolve_artifact_smoke_metadata.outputs.binary }}",
+	} {
+		if !strings.Contains(homebrew, required) {
+			t.Fatalf("Homebrew smoke job is missing exact publication-gate contract %q", required)
+		}
+	}
+}
+
 // TestReleaseWorkflowVerifiesRealPublishedArtifactBeforePromotion supersedes
 // the removed TestReleaseWorkflowUsesConsumerGoReleaserSnapshotPreflight:
 // strongo/cicd#70 replaced macos_signing_preflight (a full binary matrix
