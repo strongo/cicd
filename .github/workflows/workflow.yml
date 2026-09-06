@@ -168,10 +168,105 @@ on:
         required: false
         default: false
 
+      reuse_exact_tree_validation:
+        type: boolean
+        description: >-
+          Opt in to publishing an exact-tree validation receipt on same-repository
+          pull requests and reusing it after merge to main. Invalid, missing, expired,
+          or ambiguous receipts fall back to the existing full validation path.
+        required: false
+        default: false
+      validation_receipt_retention_days:
+        type: number
+        description: Days to retain an opt-in pull-request validation receipt.
+        required: false
+        default: 7
+
+# These values are the complete non-secret workflow-call input surface. The
+# receipt tool serializes typed values canonically before hashing them, so a
+# semantically identical number has one digest and any policy change refuses
+# reuse. The exact reusable-workflow revision separately binds actions, scripts,
+# commands, and other policy embedded in this file.
+env:
+  CI_POLICY_CODE_COVERAGE: ${{ inputs.code_coverage }}
+  CI_POLICY_DISABLE_VERSION_BUMPING: ${{ inputs.disable-version-bumping }}
+  CI_POLICY_INSTALL_FIREBASE_TOOLS: ${{ inputs.install-firebase-tools }}
+  CI_POLICY_LINT_TIMEOUT: ${{ inputs.lint-timeout }}
+  CI_POLICY_GOLANGCI_LINT_CACHE: ${{ inputs.golangci_lint_cache }}
+  CI_POLICY_GOLANGCI_LINT_CACHE_INVALIDATION_INTERVAL: ${{ inputs.golangci_lint_cache_invalidation_interval }}
+  CI_POLICY_GOOGLE_APPLICATION_CREDENTIALS: ${{ inputs.GOOGLE_APPLICATION_CREDENTIALS }}
+  CI_POLICY_GOPRIVATE: ${{ inputs.GOPRIVATE }}
+  CI_POLICY_GOPRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
+  CI_POLICY_GOPRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
+  CI_POLICY_ADDITIONAL_GO_TEST_PATH: ${{ inputs.additional_go_test_path }}
+  CI_POLICY_MIN_TEST_COVERAGE_PERCENT: ${{ inputs.min_test_coverage_percent }}
+  CI_POLICY_COVERPKG: ${{ inputs.coverpkg }}
+  CI_POLICY_RUN_GORELEASER: ${{ inputs.run-goreleaser }}
+  CI_POLICY_CGO_ENABLED: ${{ inputs.cgo_enabled }}
+  CI_POLICY_TAG_PREFIX: ${{ inputs.tag_prefix }}
+  CI_POLICY_WORKING_DIRECTORY: ${{ inputs.working_directory }}
+  CI_POLICY_ALLOW_MAJOR_VERSION_BUMP: ${{ inputs.allow_major_version_bump }}
+  CI_POLICY_GO_VERSION: ${{ inputs.go_version }}
+  CI_POLICY_DEFAULT_BUMP: ${{ inputs.default_bump }}
+  CI_POLICY_BUILD_COMMAND: ${{ inputs.build_command }}
+  CI_POLICY_ARTIFACT_NAME: ${{ inputs.artifact_name }}
+  CI_POLICY_ARTIFACT_PATH: ${{ inputs.artifact_path }}
+  CI_POLICY_ARTIFACT_RETENTION_DAYS: ${{ inputs.artifact_retention_days }}
+  CI_POLICY_ARTIFACT_ON_MAIN_ONLY: ${{ inputs.artifact_on_main_only }}
+  CI_POLICY_EXACT_TREE_VALIDATION_REUSE: ${{ inputs.reuse_exact_tree_validation }}
+  CI_POLICY_VALIDATION_RECEIPT_RETENTION_DAYS: ${{ inputs.validation_receipt_retention_days }}
+
 jobs:
+
+  validation_reuse:
+    name: Resolve exact-tree validation receipt
+    if: ${{ inputs.reuse_exact_tree_validation && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    # The optimization itself is never a new gate. A checkout, setup, API, or
+    # verifier failure leaves outputs empty and the existing full jobs run.
+    continue-on-error: true
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      reuse_valid: ${{ steps.resolve.outputs.reuse_valid }}
+      receipt_run_id: ${{ steps.resolve.outputs.receipt_run_id }}
+      reason: ${{ steps.resolve.outputs.reason }}
+    steps:
+      - name: Checkout landed source
+        uses: actions/checkout@v7
+
+      - name: Checkout exact validation receipt tool
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .strongo-cicd-validation-tool
+          persist-credentials: false
+
+      - name: Install Go for validation receipt tool
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: .strongo-cicd-validation-tool/go.mod
+          cache: false
+
+      - name: Resolve exact-tree validation receipt
+        id: resolve
+        working-directory: .strongo-cicd-validation-tool
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CI_RECEIPT_CHECKOUT_DIR: ${{ github.workspace }}
+          CI_RECEIPT_WORKFLOW_REVISION: ${{ job.workflow_sha }}
+        run: go run ./cmd/ci-validation-receipt resolve
 
   go_lint:
     name: Lint
+    needs: [ validation_reuse ]
+    # A skipped or failed resolver means there is no verified receipt. Continue
+    # with the longstanding full lint path; only an explicit true may skip it.
+    if: ${{ !cancelled() && needs.validation_reuse.outputs.reuse_valid != 'true' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -306,6 +401,8 @@ jobs:
 
   go_test_build:
     name: Build & test
+    needs: [ validation_reuse ]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -420,7 +517,7 @@ jobs:
         run: npm install -g firebase-tools
         # run: curl -sL firebase.tools | bash
 
-      - if: ${{ (!inputs.code_coverage || github.ref != 'refs/heads/main') && inputs.min_test_coverage_percent == '' }}
+      - if: ${{ needs.validation_reuse.outputs.reuse_valid != 'true' && (!inputs.code_coverage || github.ref != 'refs/heads/main') && inputs.min_test_coverage_percent == '' }}
         run: go test ./...
         name: Run tests without coverage
         shell: bash
@@ -428,7 +525,7 @@ jobs:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/${{ inputs.GOOGLE_APPLICATION_CREDENTIALS }}
 
-      - if: ${{ inputs.additional_go_test_path }}
+      - if: ${{ needs.validation_reuse.outputs.reuse_valid != 'true' && inputs.additional_go_test_path }}
         run: go test ${{ inputs.additional_go_test_path }}
         name: Run additional go test
         shell: bash
@@ -436,7 +533,7 @@ jobs:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/${{ inputs.GOOGLE_APPLICATION_CREDENTIALS }}
 
-      - if: ${{ (inputs.code_coverage && github.ref == 'refs/heads/main') || inputs.min_test_coverage_percent != '' }}
+      - if: ${{ needs.validation_reuse.outputs.reuse_valid != 'true' && ((inputs.code_coverage && github.ref == 'refs/heads/main') || inputs.min_test_coverage_percent != '') }}
         name: Run tests with coverage
         run: go test ./... -coverprofile=profile.cov -count=1 ${{ inputs.coverpkg && format('-coverpkg={0}', inputs.coverpkg) || '' }}
         shell: bash
@@ -444,7 +541,7 @@ jobs:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/${{ inputs.GOOGLE_APPLICATION_CREDENTIALS }}
 
-      - if: ${{ inputs.code_coverage && github.ref == 'refs/heads/main' }}
+      - if: ${{ needs.validation_reuse.outputs.reuse_valid != 'true' && inputs.code_coverage && github.ref == 'refs/heads/main' }}
         name: Upload coverage to Coveralls
         uses: shogo82148/actions-goveralls@v1
         continue-on-error: true
@@ -454,7 +551,7 @@ jobs:
           github-token: ${{ secrets.GH_TOKEN }}
           path-to-profile: profile.cov
 
-      - if: ${{ inputs.min_test_coverage_percent != '' }}
+      - if: ${{ needs.validation_reuse.outputs.reuse_valid != 'true' && inputs.min_test_coverage_percent != '' }}
         name: Check test coverage
         shell: bash
         run: |
@@ -467,7 +564,7 @@ jobs:
           echo "Total coverage: $total_coverage%"
           awk -v t="$total_coverage" -v m="${{ inputs.min_test_coverage_percent }}" 'BEGIN { if (t < m) { print "Coverage " t "% is below required " m "%"; exit 1 } }'
 
-      - if: ${{ inputs.min_test_coverage_percent != '' }}
+      - if: ${{ needs.validation_reuse.outputs.reuse_valid != 'true' && inputs.min_test_coverage_percent != '' }}
         run: go tool cover -func=profile.cov | tail -n 1
 
       # Upload only a build that compiled and whose tests (including any
@@ -497,11 +594,73 @@ jobs:
           # restores.
           key: ${{ steps.restore_go_cache.outputs.cache-primary-key }}
 
+  publish_validation_receipt:
+    name: Publish exact-tree validation receipt
+    needs: [ go_test_build, go_lint ]
+    if: >-
+      ${{ always() && inputs.reuse_exact_tree_validation &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          needs.go_test_build.result == 'success' && needs.go_lint.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout validated pull-request source
+        uses: actions/checkout@v7
+
+      - name: Checkout exact validation receipt tool
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .strongo-cicd-validation-tool
+          persist-credentials: false
+
+      - name: Install Go for validation receipt tool
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: .strongo-cicd-validation-tool/go.mod
+          cache: false
+
+      - name: Create exact-tree validation receipt
+        working-directory: .strongo-cicd-validation-tool
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CI_RECEIPT_CHECKOUT_DIR: ${{ github.workspace }}
+          CI_RECEIPT_OUTPUT: ${{ runner.temp }}/ci-validation-receipt.json
+          CI_RECEIPT_EXPECTED_CHECKOUT_SHA: ${{ github.sha }}
+          CI_RECEIPT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CI_RECEIPT_PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          CI_RECEIPT_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_RECEIPT_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_RECEIPT_WORKFLOW_REVISION: ${{ job.workflow_sha }}
+          CI_RECEIPT_RUN_ID: ${{ github.run_id }}
+          CI_RECEIPT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CI_RECEIPT_LINT_CONCLUSION: ${{ needs.go_lint.result }}
+          CI_RECEIPT_TEST_CONCLUSION: ${{ needs.go_test_build.result }}
+        run: go run ./cmd/ci-validation-receipt create
+
+      - name: Upload exact-tree validation receipt
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-validation-receipt
+          path: ${{ runner.temp }}/ci-validation-receipt.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.validation_receipt_retention_days }}
+
   go_bump:
     name: Bump version
-    if: ${{ !inputs.disable-version-bumping && github.ref == 'refs/heads/main' }}
+    if: >-
+      ${{ !cancelled() && !inputs.disable-version-bumping && github.ref == 'refs/heads/main' &&
+          needs.go_test_build.result == 'success' &&
+          (needs.go_lint.result == 'success' ||
+           (needs.go_lint.result == 'skipped' && needs.validation_reuse.outputs.reuse_valid == 'true')) }}
     runs-on: ubuntu-latest
-    needs: [ go_test_build, go_lint ]
+    needs: [ validation_reuse, go_test_build, go_lint ]
     permissions:
       contents: write
 
