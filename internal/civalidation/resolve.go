@@ -181,9 +181,12 @@ func (r resolver) getBytes(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
 	if err != nil {
+		_ = response.Body.Close()
+		return nil, err
+	}
+	if err := response.Body.Close(); err != nil {
 		return nil, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -216,12 +219,15 @@ func receiptFromArchive(archive []byte) (Receipt, error) {
 	if err != nil {
 		return Receipt{}, err
 	}
-	defer file.Close()
 	var receipt Receipt
 	decoder := json.NewDecoder(io.LimitReader(file, 64<<10))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&receipt); err != nil {
+		_ = file.Close()
 		return Receipt{}, fmt.Errorf("decode receipt: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return Receipt{}, fmt.Errorf("close receipt: %w", err)
 	}
 	return receipt, nil
 }

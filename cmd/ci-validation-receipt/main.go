@@ -100,8 +100,12 @@ func resolve() {
 		if err != nil {
 			fatalf("open GITHUB_OUTPUT: %v", err)
 		}
-		defer file.Close()
-		fmt.Fprintf(file, "reuse_valid=%s\nreceipt_run_id=%d\nreason=%s\n", value, decision.ReceiptRunID, reason)
+		if _, err := fmt.Fprintf(file, "reuse_valid=%s\nreceipt_run_id=%d\nreason=%s\n", value, decision.ReceiptRunID, reason); err != nil {
+			fatalf("write GITHUB_OUTPUT: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			fatalf("close GITHUB_OUTPUT: %v", err)
+		}
 	}
 	policy, err := civalidation.PolicyFromEnvironment()
 	if err != nil {

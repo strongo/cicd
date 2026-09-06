@@ -188,11 +188,11 @@ func resolveFixture(t *testing.T, fixture *resolveFixtureData) (Decision, error)
 		path := request.URL.Path
 		switch {
 		case strings.Contains(path, "/commits/") && strings.HasSuffix(path, "/pulls"):
-			json.NewEncoder(response).Encode(fixture.pulls)
+			writeFixtureJSON(t, response, fixture.pulls)
 		case strings.HasSuffix(path, "/actions/runs/456"):
-			json.NewEncoder(response).Encode(fixture.currentRun)
+			writeFixtureJSON(t, response, fixture.currentRun)
 		case strings.Contains(path, "/actions/workflows/77/runs"):
-			json.NewEncoder(response).Encode(fixture.runs)
+			writeFixtureJSON(t, response, fixture.runs)
 		case strings.Contains(path, "/actions/runs/") && strings.HasSuffix(path, "/artifacts"):
 			parts := strings.Split(path, "/")
 			var runID int64
@@ -201,7 +201,7 @@ func resolveFixture(t *testing.T, fixture *resolveFixtureData) (Decision, error)
 					runID, _ = ParseInt64("run", parts[index+1])
 				}
 			}
-			json.NewEncoder(response).Encode(fixture.artifacts[runID])
+			writeFixtureJSON(t, response, fixture.artifacts[runID])
 		case strings.Contains(path, "/actions/artifacts/") && strings.HasSuffix(path, "/zip"):
 			parts := strings.Split(path, "/")
 			var artifactID int64
@@ -211,7 +211,9 @@ func resolveFixture(t *testing.T, fixture *resolveFixtureData) (Decision, error)
 				}
 			}
 			response.Header().Set("Content-Type", "application/zip")
-			response.Write(fixture.archives[artifactID])
+			if _, err := response.Write(fixture.archives[artifactID]); err != nil {
+				t.Errorf("write artifact fixture: %v", err)
+			}
 		default:
 			http.NotFound(response, request)
 		}
@@ -238,10 +240,22 @@ func receiptArchive(t *testing.T, receipt Receipt) []byte {
 }
 
 func cloneMap(value map[string]any) map[string]any {
-	encoded, _ := json.Marshal(value)
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
 	var clone map[string]any
-	json.Unmarshal(encoded, &clone)
+	if err := json.Unmarshal(encoded, &clone); err != nil {
+		panic(err)
+	}
 	return clone
+}
+
+func writeFixtureJSON(t *testing.T, response http.ResponseWriter, value any) {
+	t.Helper()
+	if err := json.NewEncoder(response).Encode(value); err != nil {
+		t.Errorf("write JSON fixture: %v", err)
+	}
 }
 
 func setMinimumPolicyEnvironment(t *testing.T) {
