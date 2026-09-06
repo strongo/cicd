@@ -181,6 +181,13 @@ also fixes the token permission to `Contents: read`; it never requests write
 access for dependency downloads. The private key stays a secret and is not
 included in exact-tree validation receipts.
 
+When GitHub App authentication is enabled, `GH_TOKEN` remains available only
+for the explicit prefixes in `goprivate_git_hosts`; the legacy host-wide
+`goprivate_git_host` default is not installed alongside the App token. Exact
+App repository credentials take priority when an explicit legacy prefix also
+covers that owner. Both the bare repository URL and its `.git` form match;
+similarly named repositories do not receive the App token.
+
 ## Releasing with `release.yml`
 
 `release.yml` runs the GoReleaser flow: checkout (full history) → setup-go →

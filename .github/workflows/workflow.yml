@@ -334,6 +334,7 @@ jobs:
           key: go-cache-${{ runner.os }}-${{ runner.arch }}-go1.26-cgo${{ inputs.cgo_enabled && '1' || '0' }}-${{ hashFiles(format('{0}/go.sum', inputs.working_directory)) }}
 
       - name: Validate scoped GitHub App configuration
+        id: goprivate_app_config
         if: ${{ inputs.goprivate_github_app_client_id != '' || inputs.goprivate_github_app_owner != '' || inputs.goprivate_github_app_repositories != '' }}
         shell: bash
         env:
@@ -347,6 +348,26 @@ jobs:
             echo "::error title=Incomplete GitHub App private-module configuration::client ID, private key, owner, and at least one repository are required together."
             exit 1
           fi
+          if ! [[ "$PRIVATE_GIT_APP_OWNER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error title=Invalid GitHub App private-module owner::'$PRIVATE_GIT_APP_OWNER' is not a GitHub owner name."
+            exit 1
+          fi
+          repositories=()
+          while IFS= read -r raw_repository; do
+            repository="$(printf '%s' "$raw_repository" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$repository" ] && continue
+            if ! [[ "$repository" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "::error title=Invalid GitHub App private-module repository::'$repository' must be an unqualified repository name."
+              exit 1
+            fi
+            repositories+=("$repository")
+          done < <(printf '%s\n' "$PRIVATE_GIT_APP_REPOSITORIES" | tr ',' '\n')
+          if [ "${#repositories[@]}" -eq 0 ]; then
+            echo "::error title=Missing GitHub App private-module repository::At least one syntactically valid repository is required before a token is minted."
+            exit 1
+          fi
+          normalized_repositories="$(IFS=,; printf '%s' "${repositories[*]}")"
+          echo "repositories=$normalized_repositories" >> "$GITHUB_OUTPUT"
 
       - name: Mint scoped GitHub App token for GOPRIVATE
         id: goprivate_app_token
@@ -356,7 +377,7 @@ jobs:
           client-id: ${{ inputs.goprivate_github_app_client_id }}
           private-key: ${{ secrets.GOPRIVATE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ inputs.goprivate_github_app_owner }}
-          repositories: ${{ inputs.goprivate_github_app_repositories }}
+          repositories: ${{ steps.goprivate_app_config.outputs.repositories }}
           permission-contents: read
 
       - name: Set scoped GitHub App access for GOPRIVATE
@@ -365,13 +386,20 @@ jobs:
         env:
           PRIVATE_GIT_APP_TOKEN: ${{ steps.goprivate_app_token.outputs.token }}
           PRIVATE_GIT_APP_OWNER: ${{ inputs.goprivate_github_app_owner }}
-          PRIVATE_GIT_APP_REPOSITORIES: ${{ inputs.goprivate_github_app_repositories }}
+          PRIVATE_GIT_APP_REPOSITORIES: ${{ steps.goprivate_app_config.outputs.repositories }}
         run: |
           set -euo pipefail
-          if [ -z "$PRIVATE_GIT_APP_TOKEN" ] || ! [[ "$PRIVATE_GIT_APP_OWNER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [ -z "$PRIVATE_GIT_APP_REPOSITORIES" ]; then
+          if [ -z "$PRIVATE_GIT_APP_TOKEN" ]; then
             echo "::error title=Invalid GitHub App private-module configuration::client ID, private key, owner, and at least one repository are required together."
             exit 1
           fi
+          git_config_global="${RUNNER_TEMP}/goprivate-${GITHUB_JOB}.gitconfig"
+          credential_file="${RUNNER_TEMP}/goprivate-app-${GITHUB_JOB}.credentials"
+          umask 077
+          touch "$git_config_global"
+          : > "$credential_file"
+          export GIT_CONFIG_GLOBAL="$git_config_global"
+          echo "GIT_CONFIG_GLOBAL=$git_config_global" >> "$GITHUB_ENV"
           configured=0
           while IFS= read -r raw_repository; do
             repository="$(printf '%s' "$raw_repository" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -380,17 +408,19 @@ jobs:
               echo "::error title=Invalid GitHub App private-module repository::'$repository' must be an unqualified repository name."
               exit 1
             fi
-            prefix="github.com/${PRIVATE_GIT_APP_OWNER}/${repository}"
-            # No trailing slash: Go asks Git to ls-remote the repository URL
-            # itself, so a rewrite that starts only at repository children
-            # would never authenticate that first request.
-            git config --global "url.https://${PRIVATE_GIT_APP_TOKEN}:x-oauth-basic@${prefix}.insteadOf" "https://${prefix}"
+            for repository_path in "$PRIVATE_GIT_APP_OWNER/$repository" "$PRIVATE_GIT_APP_OWNER/$repository.git"; do
+              printf 'protocol=https\nhost=github.com\npath=%s\nusername=x-access-token\npassword=%s\n\n' \
+                "$repository_path" "$PRIVATE_GIT_APP_TOKEN" | \
+                git credential-store --file "$credential_file" store
+            done
             configured=$((configured + 1))
           done < <(printf '%s\n' "$PRIVATE_GIT_APP_REPOSITORIES" | tr ',' '\n')
           if [ "$configured" -eq 0 ]; then
             echo "::error title=Missing GitHub App private-module repository::At least one repository is required."
             exit 1
           fi
+          git config --global credential.https://github.com.useHttpPath true
+          git config --global --add credential.helper "store --file=$credential_file"
 
       - name: Set GitHub access token for GOPRIVATE
         if: ${{ inputs.GOPRIVATE }}
@@ -399,14 +429,33 @@ jobs:
           PRIVATE_GIT_TOKEN: ${{ secrets.GH_TOKEN }}
           PRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
           PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
+          PRIVATE_GIT_APP_ENABLED: ${{ inputs.goprivate_github_app_client_id }}
         run: |
           set -euo pipefail
+          prefixes="$PRIVATE_GIT_HOSTS"
+          if [ -z "$prefixes" ]; then
+            if [ -n "$PRIVATE_GIT_APP_ENABLED" ]; then
+              # With App authentication enabled, the legacy token is installed
+              # only for explicitly supplied prefixes. This avoids restoring the
+              # historical host-wide default beside a repository-scoped token.
+              exit 0
+            fi
+            prefixes="$PRIVATE_GIT_HOST"
+          fi
           if [ -z "$PRIVATE_GIT_TOKEN" ]; then
-            echo "::error title=Missing private-module token::GH_TOKEN is required when GOPRIVATE is set."
+            echo "::error title=Missing private-module token::GH_TOKEN is required when a legacy GOPRIVATE prefix is configured."
             exit 1
           fi
-          prefixes="${PRIVATE_GIT_HOSTS:-$PRIVATE_GIT_HOST}"
-          configured=0
+          git_config_global="${RUNNER_TEMP}/goprivate-${GITHUB_JOB}.gitconfig"
+          token_file="${RUNNER_TEMP}/goprivate-legacy-${GITHUB_JOB}.token"
+          prefix_file="${RUNNER_TEMP}/goprivate-legacy-${GITHUB_JOB}.prefixes"
+          helper_file="${RUNNER_TEMP}/goprivate-legacy-${GITHUB_JOB}-credential-helper"
+          umask 077
+          touch "$git_config_global"
+          printf '%s\n' "$PRIVATE_GIT_TOKEN" > "$token_file"
+          : > "$prefix_file"
+          export GIT_CONFIG_GLOBAL="$git_config_global"
+          echo "GIT_CONFIG_GLOBAL=$git_config_global" >> "$GITHUB_ENV"
           while IFS= read -r raw_prefix; do
             prefix="$(printf '%s' "$raw_prefix" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
             [ -z "$prefix" ] && continue
@@ -414,13 +463,44 @@ jobs:
               echo "::error title=Invalid goprivate_git_hosts entry::'$prefix' must be a host/owner URL prefix such as github.com/my-org; host-wide credential rewrites are not allowed."
               exit 1
             fi
-            git config --global "url.https://${PRIVATE_GIT_TOKEN}:x-oauth-basic@${prefix}/.insteadOf" "https://${prefix}/"
-            configured=$((configured + 1))
+            printf '%s\n' "$prefix" >> "$prefix_file"
           done < <(printf '%s\n' "$prefixes" | tr ',' '\n')
-          if [ "$configured" -eq 0 ]; then
+          if [ ! -s "$prefix_file" ]; then
             echo "::error title=Missing GOPRIVATE Git prefix::Set goprivate_git_hosts or goprivate_git_host when GOPRIVATE is set."
             exit 1
           fi
+          cat > "$helper_file" <<'CREDENTIAL_HELPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [ "${1:-}" = get ] || exit 0
+          protocol=
+          host=
+          path=
+          while IFS='=' read -r key value; do
+            case "$key" in
+              protocol) protocol="$value" ;;
+              host) host="$value" ;;
+              path) path="$value" ;;
+            esac
+          done
+          [ "$protocol" = https ] || exit 0
+          candidate="$host"
+          [ -z "$path" ] || candidate="$candidate/$path"
+          token_file="${RUNNER_TEMP}/goprivate-legacy-${GITHUB_JOB}.token"
+          prefix_file="${RUNNER_TEMP}/goprivate-legacy-${GITHUB_JOB}.prefixes"
+          while IFS= read -r prefix; do
+            case "$candidate" in
+              "$prefix"|"$prefix.git"|"$prefix"/*)
+                printf 'username=x-access-token\npassword='
+                cat "$token_file"
+                exit 0
+                ;;
+            esac
+          done < "$prefix_file"
+          CREDENTIAL_HELPER
+          chmod 700 "$helper_file"
+          git config --global credential.https://github.com.useHttpPath true
+          git config --global --add credential.helper "$helper_file"
 
       - name: Download dependencies
         run: go mod download all
@@ -526,6 +606,7 @@ jobs:
           key: go-cache-${{ runner.os }}-${{ runner.arch }}-go1.26-cgo${{ inputs.cgo_enabled && '1' || '0' }}-${{ hashFiles(format('{0}/go.sum', inputs.working_directory)) }}
 
       - name: Validate scoped GitHub App configuration
+        id: goprivate_app_config
         if: ${{ inputs.goprivate_github_app_client_id != '' || inputs.goprivate_github_app_owner != '' || inputs.goprivate_github_app_repositories != '' }}
         shell: bash
         env:
@@ -539,6 +620,26 @@ jobs:
             echo "::error title=Incomplete GitHub App private-module configuration::client ID, private key, owner, and at least one repository are required together."
             exit 1
           fi
+          if ! [[ "$PRIVATE_GIT_APP_OWNER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error title=Invalid GitHub App private-module owner::'$PRIVATE_GIT_APP_OWNER' is not a GitHub owner name."
+            exit 1
+          fi
+          repositories=()
+          while IFS= read -r raw_repository; do
+            repository="$(printf '%s' "$raw_repository" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$repository" ] && continue
+            if ! [[ "$repository" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "::error title=Invalid GitHub App private-module repository::'$repository' must be an unqualified repository name."
+              exit 1
+            fi
+            repositories+=("$repository")
+          done < <(printf '%s\n' "$PRIVATE_GIT_APP_REPOSITORIES" | tr ',' '\n')
+          if [ "${#repositories[@]}" -eq 0 ]; then
+            echo "::error title=Missing GitHub App private-module repository::At least one syntactically valid repository is required before a token is minted."
+            exit 1
+          fi
+          normalized_repositories="$(IFS=,; printf '%s' "${repositories[*]}")"
+          echo "repositories=$normalized_repositories" >> "$GITHUB_OUTPUT"
 
       - name: Mint scoped GitHub App token for GOPRIVATE
         id: goprivate_app_token
@@ -548,7 +649,7 @@ jobs:
           client-id: ${{ inputs.goprivate_github_app_client_id }}
           private-key: ${{ secrets.GOPRIVATE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ inputs.goprivate_github_app_owner }}
-          repositories: ${{ inputs.goprivate_github_app_repositories }}
+          repositories: ${{ steps.goprivate_app_config.outputs.repositories }}
           permission-contents: read
 
       - name: Set scoped GitHub App access for GOPRIVATE
@@ -557,13 +658,20 @@ jobs:
         env:
           PRIVATE_GIT_APP_TOKEN: ${{ steps.goprivate_app_token.outputs.token }}
           PRIVATE_GIT_APP_OWNER: ${{ inputs.goprivate_github_app_owner }}
-          PRIVATE_GIT_APP_REPOSITORIES: ${{ inputs.goprivate_github_app_repositories }}
+          PRIVATE_GIT_APP_REPOSITORIES: ${{ steps.goprivate_app_config.outputs.repositories }}
         run: |
           set -euo pipefail
-          if [ -z "$PRIVATE_GIT_APP_TOKEN" ] || ! [[ "$PRIVATE_GIT_APP_OWNER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [ -z "$PRIVATE_GIT_APP_REPOSITORIES" ]; then
+          if [ -z "$PRIVATE_GIT_APP_TOKEN" ]; then
             echo "::error title=Invalid GitHub App private-module configuration::client ID, private key, owner, and at least one repository are required together."
             exit 1
           fi
+          git_config_global="${RUNNER_TEMP}/goprivate-${GITHUB_JOB}.gitconfig"
+          credential_file="${RUNNER_TEMP}/goprivate-app-${GITHUB_JOB}.credentials"
+          umask 077
+          touch "$git_config_global"
+          : > "$credential_file"
+          export GIT_CONFIG_GLOBAL="$git_config_global"
+          echo "GIT_CONFIG_GLOBAL=$git_config_global" >> "$GITHUB_ENV"
           configured=0
           while IFS= read -r raw_repository; do
             repository="$(printf '%s' "$raw_repository" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -572,17 +680,19 @@ jobs:
               echo "::error title=Invalid GitHub App private-module repository::'$repository' must be an unqualified repository name."
               exit 1
             fi
-            prefix="github.com/${PRIVATE_GIT_APP_OWNER}/${repository}"
-            # No trailing slash: Go asks Git to ls-remote the repository URL
-            # itself, so a rewrite that starts only at repository children
-            # would never authenticate that first request.
-            git config --global "url.https://${PRIVATE_GIT_APP_TOKEN}:x-oauth-basic@${prefix}.insteadOf" "https://${prefix}"
+            for repository_path in "$PRIVATE_GIT_APP_OWNER/$repository" "$PRIVATE_GIT_APP_OWNER/$repository.git"; do
+              printf 'protocol=https\nhost=github.com\npath=%s\nusername=x-access-token\npassword=%s\n\n' \
+                "$repository_path" "$PRIVATE_GIT_APP_TOKEN" | \
+                git credential-store --file "$credential_file" store
+            done
             configured=$((configured + 1))
           done < <(printf '%s\n' "$PRIVATE_GIT_APP_REPOSITORIES" | tr ',' '\n')
           if [ "$configured" -eq 0 ]; then
             echo "::error title=Missing GitHub App private-module repository::At least one repository is required."
             exit 1
           fi
+          git config --global credential.https://github.com.useHttpPath true
+          git config --global --add credential.helper "store --file=$credential_file"
 
       - name: Set GitHub access token for GOPRIVATE
         if: ${{ inputs.GOPRIVATE }}
@@ -591,14 +701,33 @@ jobs:
           PRIVATE_GIT_TOKEN: ${{ secrets.GH_TOKEN }}
           PRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
           PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
+          PRIVATE_GIT_APP_ENABLED: ${{ inputs.goprivate_github_app_client_id }}
         run: |
           set -euo pipefail
+          prefixes="$PRIVATE_GIT_HOSTS"
+          if [ -z "$prefixes" ]; then
+            if [ -n "$PRIVATE_GIT_APP_ENABLED" ]; then
+              # With App authentication enabled, the legacy token is installed
+              # only for explicitly supplied prefixes. This avoids restoring the
+              # historical host-wide default beside a repository-scoped token.
+              exit 0
+            fi
+            prefixes="$PRIVATE_GIT_HOST"
+          fi
           if [ -z "$PRIVATE_GIT_TOKEN" ]; then
-            echo "::error title=Missing private-module token::GH_TOKEN is required when GOPRIVATE is set."
+            echo "::error title=Missing private-module token::GH_TOKEN is required when a legacy GOPRIVATE prefix is configured."
             exit 1
           fi
-          prefixes="${PRIVATE_GIT_HOSTS:-$PRIVATE_GIT_HOST}"
-          configured=0
+          git_config_global="${RUNNER_TEMP}/goprivate-${GITHUB_JOB}.gitconfig"
+          token_file="${RUNNER_TEMP}/goprivate-legacy-${GITHUB_JOB}.token"
+          prefix_file="${RUNNER_TEMP}/goprivate-legacy-${GITHUB_JOB}.prefixes"
+          helper_file="${RUNNER_TEMP}/goprivate-legacy-${GITHUB_JOB}-credential-helper"
+          umask 077
+          touch "$git_config_global"
+          printf '%s\n' "$PRIVATE_GIT_TOKEN" > "$token_file"
+          : > "$prefix_file"
+          export GIT_CONFIG_GLOBAL="$git_config_global"
+          echo "GIT_CONFIG_GLOBAL=$git_config_global" >> "$GITHUB_ENV"
           while IFS= read -r raw_prefix; do
             prefix="$(printf '%s' "$raw_prefix" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
             [ -z "$prefix" ] && continue
@@ -606,13 +735,44 @@ jobs:
               echo "::error title=Invalid goprivate_git_hosts entry::'$prefix' must be a host/owner URL prefix such as github.com/my-org; host-wide credential rewrites are not allowed."
               exit 1
             fi
-            git config --global "url.https://${PRIVATE_GIT_TOKEN}:x-oauth-basic@${prefix}/.insteadOf" "https://${prefix}/"
-            configured=$((configured + 1))
+            printf '%s\n' "$prefix" >> "$prefix_file"
           done < <(printf '%s\n' "$prefixes" | tr ',' '\n')
-          if [ "$configured" -eq 0 ]; then
+          if [ ! -s "$prefix_file" ]; then
             echo "::error title=Missing GOPRIVATE Git prefix::Set goprivate_git_hosts or goprivate_git_host when GOPRIVATE is set."
             exit 1
           fi
+          cat > "$helper_file" <<'CREDENTIAL_HELPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [ "${1:-}" = get ] || exit 0
+          protocol=
+          host=
+          path=
+          while IFS='=' read -r key value; do
+            case "$key" in
+              protocol) protocol="$value" ;;
+              host) host="$value" ;;
+              path) path="$value" ;;
+            esac
+          done
+          [ "$protocol" = https ] || exit 0
+          candidate="$host"
+          [ -z "$path" ] || candidate="$candidate/$path"
+          token_file="${RUNNER_TEMP}/goprivate-legacy-${GITHUB_JOB}.token"
+          prefix_file="${RUNNER_TEMP}/goprivate-legacy-${GITHUB_JOB}.prefixes"
+          while IFS= read -r prefix; do
+            case "$candidate" in
+              "$prefix"|"$prefix.git"|"$prefix"/*)
+                printf 'username=x-access-token\npassword='
+                cat "$token_file"
+                exit 0
+                ;;
+            esac
+          done < "$prefix_file"
+          CREDENTIAL_HELPER
+          chmod 700 "$helper_file"
+          git config --global credential.https://github.com.useHttpPath true
+          git config --global --add credential.helper "$helper_file"
 
       - name: Download dependencies
         run: go mod download all
