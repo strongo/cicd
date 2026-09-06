@@ -74,6 +74,60 @@ surface and is not part of this reusable-workflow timing policy. It uses `go
 mod download all` rather than `go get ./...`, so CI never rewrites a consumer's
 dependency requirements.
 
+## Reuse exact pull-request validation after merge
+
+`workflow.yml` can reuse successful same-repository pull-request validation
+when the exact tested tree lands on `main`. This is disabled by default. An
+opted-in pull-request run publishes a small GitHub Actions artifact only after
+both **Lint** and **Build & test** succeed. A subsequent `main` run verifies:
+
+- the landed commit names exactly one merged, same-repository pull request;
+- the receipt belongs to exactly one successful run of the same caller workflow;
+- the artifact's GitHub-reported SHA-256 digest matches its downloaded bytes;
+- repository, pull-request identity, landed Git tree, reusable-workflow
+  revision, every non-secret workflow-call input, and both required job
+  conclusions match exactly.
+
+The publisher also requires its checkout's `HEAD` to equal GitHub's trusted
+`${{ github.sha }}` before recording the actual checkout SHA. GitHub's run and
+job APIs expose the pull-request head SHA rather than the temporary synthetic
+merge SHA after that ref expires, so the landed `HEAD^{tree}` comparison is the
+reusable security binding. The recorded checkout SHA remains audit evidence;
+it is not treated as independently recoverable evidence after GitHub deletes
+the temporary merge commit.
+
+Missing permissions, API failures, forks, expired artifacts, changed policy,
+tree drift, and ambiguous runs all select the existing full validation path.
+Only an explicit verified receipt skips lint, vet, tests, and coverage. The
+Build & test job still checks out `main`, installs Go, runs `build_command`, and
+uploads the configured artifact, so binaries that embed `${GITHUB_SHA}` and
+deploy workflows that require the main-run artifact keep their current contract.
+
+Opt in only from a caller that runs this reusable workflow for both
+`pull_request` and pushes to `main`:
+
+```yaml
+permissions:
+  actions: read
+  contents: write
+  pull-requests: read
+
+jobs:
+  ci:
+    uses: strongo/cicd/.github/workflows/workflow.yml@<exact-release-containing-this-feature>
+    with:
+      reuse_exact_tree_validation: true
+    secrets:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+`contents: write` remains required by this reusable workflow's existing,
+statically declared version-bump job even when a caller disables bumping.
+`actions: read` and `pull-requests: read` let the main preflight authenticate
+the prior run and its receipt. Receipt retention defaults to seven days and is
+configurable with `validation_receipt_retention_days`; expiry safely causes a
+full revalidation.
+
 ## Private Go modules from multiple owners
 
 Set `GOPRIVATE` to the private module prefixes and `goprivate_git_hosts` to the
