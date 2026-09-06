@@ -226,10 +226,6 @@ jobs:
     # The optimization itself is never a new gate. A checkout, setup, API, or
     # verifier failure leaves outputs empty and the existing full jobs run.
     continue-on-error: true
-    permissions:
-      actions: read
-      contents: read
-      pull-requests: read
     outputs:
       reuse_valid: ${{ steps.resolve.outputs.reuse_valid }}
       receipt_run_id: ${{ steps.resolve.outputs.receipt_run_id }}
@@ -604,9 +600,6 @@ jobs:
           needs.go_test_build.result == 'success' && needs.go_lint.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
-    permissions:
-      actions: read
-      contents: read
     steps:
       - name: Checkout validated pull-request source
         uses: actions/checkout@v7

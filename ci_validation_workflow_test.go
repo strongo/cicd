@@ -13,7 +13,6 @@ func TestGoCIWorkflowExactTreeReuseIsOptInAndFailClosed(t *testing.T) {
 		"or ambiguous receipts fall back to the existing full validation path",
 		"CI_POLICY_EXACT_TREE_VALIDATION_REUSE: ${{ inputs.reuse_exact_tree_validation }}",
 		"if: ${{ inputs.reuse_exact_tree_validation && github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
-		"actions: read\n      contents: read\n      pull-requests: read",
 		"timeout-minutes: 3\n    # The optimization itself is never a new gate",
 		"continue-on-error: true",
 		"repository: ${{ job.workflow_repository }}",
@@ -36,6 +35,10 @@ func TestGoCIWorkflowExactTreeReuseIsOptInAndFailClosed(t *testing.T) {
 	inputEnd := strings.Index(workflow[inputStart:], "\n      validation_receipt_retention_days:")
 	if inputEnd == -1 || !strings.Contains(workflow[inputStart:inputStart+inputEnd], "default: false") {
 		t.Fatal("exact-tree validation reuse must remain disabled by default")
+	}
+	resolver := workflowJob(t, workflow, "validation_reuse", "go_lint")
+	if strings.Contains(resolver, "\n    permissions:\n") {
+		t.Fatal("resolver must inherit caller permissions so default-off callers do not fail workflow startup")
 	}
 
 	lint := workflowJob(t, workflow, "go_lint", "go_test_build")
