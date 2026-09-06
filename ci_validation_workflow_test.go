@@ -235,6 +235,17 @@ func TestGoCIWorkflowRoutesExactAppAndLegacyCredentials(t *testing.T) {
 	assertCredentialPassword(t, tempDir, "credential-test", "acme/repo", "APP_TOKEN")
 	assertCredentialPassword(t, tempDir, "credential-test", "acme/repo.git", "APP_TOKEN")
 	assertCredentialPassword(t, tempDir, "credential-test", "acme/repo-tools", "LEGACY_TOKEN")
+
+	customHostEnv := cloneEnvironment(common)
+	customHostEnv["GITHUB_JOB"] = "custom-host-test"
+	customHostEnv["PRIVATE_GIT_TOKEN"] = "CUSTOM_HOST_TOKEN"
+	customHostEnv["PRIVATE_GIT_HOST"] = "ghe.example.com"
+	customHostEnv["PRIVATE_GIT_HOSTS"] = "ghe.example.com/acme"
+	if combined, err := runWorkflowBash(legacyConfig, customHostEnv); err != nil {
+		t.Fatalf("custom-host credential setup failed: %v\n%s", err, combined)
+	}
+	assertCredentialPasswordAtHost(t, tempDir, "custom-host-test", "ghe.example.com", "acme/repo", "CUSTOM_HOST_TOKEN")
+	assertNoCredentialAtHost(t, tempDir, "custom-host-test", "ghe.example.com", "another/repo")
 }
 
 func workflowJob(t *testing.T, workflow, name, next string) string {
@@ -307,7 +318,12 @@ func cloneEnvironment(source map[string]string) map[string]string {
 
 func assertCredentialPassword(t *testing.T, tempDir, job, path, want string) {
 	t.Helper()
-	password, ok := credentialPassword(tempDir, job, path)
+	assertCredentialPasswordAtHost(t, tempDir, job, "github.com", path, want)
+}
+
+func assertCredentialPasswordAtHost(t *testing.T, tempDir, job, host, path, want string) {
+	t.Helper()
+	password, ok := credentialPassword(tempDir, job, host, path)
 	if !ok {
 		t.Fatalf("no credential returned for %s", path)
 	}
@@ -318,12 +334,17 @@ func assertCredentialPassword(t *testing.T, tempDir, job, path, want string) {
 
 func assertNoCredential(t *testing.T, tempDir, job, path string) {
 	t.Helper()
-	if password, ok := credentialPassword(tempDir, job, path); ok {
+	assertNoCredentialAtHost(t, tempDir, job, "github.com", path)
+}
+
+func assertNoCredentialAtHost(t *testing.T, tempDir, job, host, path string) {
+	t.Helper()
+	if password, ok := credentialPassword(tempDir, job, host, path); ok {
 		t.Fatalf("unexpected credential for %s: %q", path, password)
 	}
 }
 
-func credentialPassword(tempDir, job, path string) (string, bool) {
+func credentialPassword(tempDir, job, host, path string) (string, bool) {
 	command := exec.Command("git", "credential", "fill")
 	command.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
@@ -332,7 +353,7 @@ func credentialPassword(tempDir, job, path string) (string, bool) {
 		"GITHUB_JOB=" + job,
 		"RUNNER_TEMP=" + tempDir,
 	}
-	command.Stdin = strings.NewReader("protocol=https\nhost=github.com\npath=" + path + "\n\n")
+	command.Stdin = strings.NewReader("protocol=https\nhost=" + host + "\npath=" + path + "\n\n")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return "", false
