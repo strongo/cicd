@@ -62,7 +62,6 @@ type PullRequest struct {
 	Number  int    `json:"number"`
 	HeadRef string `json:"head_ref"`
 	HeadSHA string `json:"head_sha"`
-	BaseSHA string `json:"base_sha"`
 }
 
 type Checkout struct {

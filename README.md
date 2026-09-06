@@ -84,7 +84,7 @@ both **Lint** and **Build & test** succeed. A subsequent `main` run verifies:
 - the landed commit names exactly one merged, same-repository pull request;
 - the receipt belongs to exactly one successful run of the same caller workflow;
 - the artifact's GitHub-reported SHA-256 digest matches its downloaded bytes;
-- repository, pull-request head/base, landed Git tree, reusable-workflow
+- repository, pull-request identity, landed Git tree, reusable-workflow
   revision, every non-secret workflow-call input, and both required job
   conclusions match exactly.
 

@@ -628,7 +628,6 @@ jobs:
           CI_RECEIPT_PR_NUMBER: ${{ github.event.pull_request.number }}
           CI_RECEIPT_PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           CI_RECEIPT_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          CI_RECEIPT_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           CI_RECEIPT_WORKFLOW_REVISION: ${{ job.workflow_sha }}
           CI_RECEIPT_RUN_ID: ${{ github.run_id }}
           CI_RECEIPT_RUN_ATTEMPT: ${{ github.run_attempt }}

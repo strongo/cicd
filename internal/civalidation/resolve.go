@@ -147,7 +147,7 @@ func (r resolver) resolve(ctx context.Context) (Decision, error) {
 
 	expected := Receipt{
 		Repository:  r.cfg.Repository,
-		PullRequest: PullRequest{Number: pr.Number, HeadRef: pr.Head.Ref, HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA},
+		PullRequest: PullRequest{Number: pr.Number, HeadRef: pr.Head.Ref, HeadSHA: pr.Head.SHA},
 		Checkout:    Checkout{Tree: r.cfg.LandedTree},
 		Workflow:    Workflow{Revision: r.cfg.WorkflowRevision, RunID: candidate.run.ID, RunAttempt: candidate.run.RunAttempt, WorkflowID: currentRun.WorkflowID},
 		Policy:      PolicyBinding{Digest: r.cfg.PolicyDigest},

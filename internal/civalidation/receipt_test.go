@@ -18,7 +18,6 @@ const (
 	testLandedSHA    = "1111111111111111111111111111111111111111"
 	testLandedTree   = "2222222222222222222222222222222222222222"
 	testHeadSHA      = "3333333333333333333333333333333333333333"
-	testBaseSHA      = "4444444444444444444444444444444444444444"
 	testCheckoutSHA  = "5555555555555555555555555555555555555555"
 	testWorkflowSHA  = "6666666666666666666666666666666666666666"
 	testPolicyDigest = "sha256:7777777777777777777777777777777777777777777777777777777777777777"
@@ -70,6 +69,23 @@ func TestResolveReusesOneAuthenticatedExactReceipt(t *testing.T) {
 	}
 }
 
+func TestResolveReusesReceiptAfterPostMergeBaseDrift(t *testing.T) {
+	fixture := newResolveFixture(t)
+	// GitHub's pull-request API reports the current base ref. Once the PR has
+	// landed, that SHA is the landed main commit (or a newer main commit), not
+	// the pre-merge SHA observed by the pull-request validation run. The target
+	// branch and exact landed tree provide the stable post-merge binding.
+	fixture.pulls[0]["base"].(map[string]any)["sha"] = testLandedSHA
+
+	decision, err := resolveFixture(t, fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Reuse || decision.ReceiptRunID != 123 {
+		t.Fatalf("decision = %+v", decision)
+	}
+}
+
 func TestResolveRefusesEveryUnprovedBoundary(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -92,8 +108,8 @@ func TestResolveRefusesEveryUnprovedBoundary(t *testing.T) {
 			f.artifacts[123]["artifacts"].([]map[string]any)[0]["digest"] = "sha256:" + strings.Repeat("0", 64)
 		}, want: "digest mismatch"},
 		{name: "repository mismatch", mutate: func(f *resolveFixtureData) { f.receipt.Repository = "other/repository"; f.rebuildArchive(t) }, want: "repository mismatch"},
-		{name: "head or base mismatch", mutate: func(f *resolveFixtureData) {
-			f.receipt.PullRequest.BaseSHA = strings.Repeat("8", 40)
+		{name: "head mismatch", mutate: func(f *resolveFixtureData) {
+			f.receipt.PullRequest.HeadSHA = strings.Repeat("8", 40)
 			f.rebuildArchive(t)
 		}, want: "pull request identity mismatch"},
 		{name: "landed tree mismatch", mutate: func(f *resolveFixtureData) { f.receipt.Checkout.Tree = strings.Repeat("8", 40); f.rebuildArchive(t) }, want: "landed tree mismatch"},
@@ -151,10 +167,10 @@ type resolveFixtureData struct {
 
 func newResolveFixture(t *testing.T) *resolveFixtureData {
 	t.Helper()
-	receipt := Receipt{Schema: ReceiptSchema, Repository: testRepository, PullRequest: PullRequest{Number: 9, HeadRef: "feature", HeadSHA: testHeadSHA, BaseSHA: testBaseSHA}, Checkout: Checkout{SHA: testCheckoutSHA, Tree: testLandedTree}, Workflow: Workflow{Revision: testWorkflowSHA, RunID: 123, RunAttempt: 1, WorkflowID: 77}, Policy: PolicyBinding{Digest: testPolicyDigest}, RequiredJobs: map[string]string{"go_lint": "success", "go_test_build": "success"}}
+	receipt := Receipt{Schema: ReceiptSchema, Repository: testRepository, PullRequest: PullRequest{Number: 9, HeadRef: "feature", HeadSHA: testHeadSHA}, Checkout: Checkout{SHA: testCheckoutSHA, Tree: testLandedTree}, Workflow: Workflow{Revision: testWorkflowSHA, RunID: 123, RunAttempt: 1, WorkflowID: 77}, Policy: PolicyBinding{Digest: testPolicyDigest}, RequiredJobs: map[string]string{"go_lint": "success", "go_test_build": "success"}}
 	f := &resolveFixtureData{
 		t:          t,
-		pulls:      []map[string]any{{"number": 9, "merged_at": "2026-09-06T00:00:00Z", "merge_commit_sha": testLandedSHA, "base": map[string]any{"ref": "main", "sha": testBaseSHA}, "head": map[string]any{"ref": "feature", "sha": testHeadSHA, "repo": map[string]any{"full_name": testRepository}}}},
+		pulls:      []map[string]any{{"number": 9, "merged_at": "2026-09-06T00:00:00Z", "merge_commit_sha": testLandedSHA, "base": map[string]any{"ref": "main", "sha": "4444444444444444444444444444444444444444"}, "head": map[string]any{"ref": "feature", "sha": testHeadSHA, "repo": map[string]any{"full_name": testRepository}}}},
 		currentRun: map[string]any{"id": 456, "workflow_id": 77},
 		runs:       map[string]any{"total_count": 1, "workflow_runs": []map[string]any{{"id": int64(123), "workflow_id": 77, "run_attempt": 1, "event": "pull_request", "conclusion": "success", "head_branch": "feature", "head_sha": testHeadSHA, "head_repository": map[string]any{"full_name": testRepository}}}},
 		artifacts:  map[int64]map[string]any{123: {"total_count": 1, "artifacts": []map[string]any{{"id": int64(321), "name": ReceiptName, "expired": false}}}},

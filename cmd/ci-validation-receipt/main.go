@@ -72,7 +72,7 @@ func create() {
 	receipt := civalidation.Receipt{
 		Schema:       civalidation.ReceiptSchema,
 		Repository:   required("GITHUB_REPOSITORY"),
-		PullRequest:  civalidation.PullRequest{Number: prNumber, HeadRef: required("CI_RECEIPT_PR_HEAD_REF"), HeadSHA: required("CI_RECEIPT_PR_HEAD_SHA"), BaseSHA: required("CI_RECEIPT_PR_BASE_SHA")},
+		PullRequest:  civalidation.PullRequest{Number: prNumber, HeadRef: required("CI_RECEIPT_PR_HEAD_REF"), HeadSHA: required("CI_RECEIPT_PR_HEAD_SHA")},
 		Checkout:     civalidation.Checkout{SHA: checkoutSHA, Tree: checkoutTree},
 		Workflow:     civalidation.Workflow{Revision: required("CI_RECEIPT_WORKFLOW_REVISION"), RunID: runID, RunAttempt: runAttempt, WorkflowID: workflowID},
 		Policy:       civalidation.PolicyBinding{Digest: digest},
