@@ -156,6 +156,31 @@ available on `release.yml`.
 historical `github.com` default is preserved for backward compatibility, but
 new and migrated callers should use the scoped plural input.
 
+For private modules in another organization, prefer a short-lived GitHub App
+installation token over extending a user token across organizations. The App
+must have only `Contents: read` and must be installed only on the repositories
+listed by the caller. Each parallel job mints and revokes its own token:
+
+```yaml
+jobs:
+  ci:
+    uses: strongo/cicd/.github/workflows/workflow.yml@<exact-release-containing-this-feature>
+    with:
+      GOPRIVATE: github.com/sneat-co,github.com/sneat-dev
+      goprivate_git_hosts: github.com/sneat-co
+      goprivate_github_app_client_id: ${{ vars.WORKBENCH_GITHUB_OAUTH_CLIENT_ID }}
+      goprivate_github_app_owner: sneat-dev
+      goprivate_github_app_repositories: workbench-gh-app
+    secrets:
+      GH_TOKEN: ${{ secrets.SNEAT_CI_READWRITE_TOKEN }}
+      GOPRIVATE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.WORKBENCH_GITHUB_APP_PRIVATE_KEY }}
+```
+
+The installation and minted token are both repository-scoped. The workflow
+also fixes the token permission to `Contents: read`; it never requests write
+access for dependency downloads. The private key stays a secret and is not
+included in exact-tree validation receipts.
+
 ## Releasing with `release.yml`
 
 `release.yml` runs the GoReleaser flow: checkout (full history) → setup-go →

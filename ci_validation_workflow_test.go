@@ -102,6 +102,43 @@ func TestGoCIWorkflowPolicyDigestCoversEveryWorkflowCallInput(t *testing.T) {
 	}
 }
 
+func TestGoCIWorkflowMintsRepositoryScopedGitHubAppTokenPerJob(t *testing.T) {
+	workflow := readGoCIWorkflow(t)
+	for _, jobName := range []string{"go_lint", "go_test_build"} {
+		next := "go_test_build"
+		if jobName == "go_test_build" {
+			next = "publish_validation_receipt"
+		}
+		job := workflowJob(t, workflow, jobName, next)
+		for _, required := range []string{
+			"name: Validate scoped GitHub App configuration",
+			"PRIVATE_GIT_APP_PRIVATE_KEY: ${{ secrets.GOPRIVATE_GITHUB_APP_PRIVATE_KEY }}",
+			"Incomplete GitHub App private-module configuration",
+			"uses: actions/create-github-app-token@v3",
+			"client-id: ${{ inputs.goprivate_github_app_client_id }}",
+			"private-key: ${{ secrets.GOPRIVATE_GITHUB_APP_PRIVATE_KEY }}",
+			"owner: ${{ inputs.goprivate_github_app_owner }}",
+			"repositories: ${{ inputs.goprivate_github_app_repositories }}",
+			"permission-contents: read",
+			"PRIVATE_GIT_APP_TOKEN: ${{ steps.goprivate_app_token.outputs.token }}",
+			"prefix=\"github.com/${PRIVATE_GIT_APP_OWNER}/${repository}\"",
+			"must be an unqualified repository name",
+			".insteadOf\" \"https://${prefix}\"",
+		} {
+			if !strings.Contains(job, required) {
+				t.Errorf("%s is missing scoped GitHub App dependency contract %q", jobName, required)
+			}
+		}
+		appConfig := workflowStep(t, job, "Set scoped GitHub App access for GOPRIVATE", "Set GitHub access token for GOPRIVATE")
+		if strings.Contains(appConfig, ".insteadOf\" \"https://${prefix}/\"") {
+			t.Errorf("%s app rewrite starts below the repository URL used by git ls-remote", jobName)
+		}
+	}
+	if strings.Count(workflow, "uses: actions/create-github-app-token@v3") != 2 {
+		t.Fatal("each parallel dependency-consuming job must mint its own short-lived token")
+	}
+}
+
 func workflowJob(t *testing.T, workflow, name, next string) string {
 	t.Helper()
 	startToken := "\n  " + name + ":\n"

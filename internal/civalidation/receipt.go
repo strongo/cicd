@@ -29,6 +29,9 @@ type Policy struct {
 	GoPrivate                             string `json:"goprivate"`
 	GoPrivateGitHost                      string `json:"goprivate_git_host"`
 	GoPrivateGitHosts                     string `json:"goprivate_git_hosts"`
+	GoPrivateGitHubAppClientID            string `json:"goprivate_github_app_client_id"`
+	GoPrivateGitHubAppOwner               string `json:"goprivate_github_app_owner"`
+	GoPrivateGitHubAppRepositories        string `json:"goprivate_github_app_repositories"`
 	AdditionalGoTestPath                  string `json:"additional_go_test_path"`
 	MinimumTestCoveragePercent            string `json:"min_test_coverage_percent"`
 	CoverPackage                          string `json:"coverpkg"`
@@ -169,6 +172,9 @@ func PolicyFromEnvironment() (Policy, error) {
 		GoPrivate:                             os.Getenv("CI_POLICY_GOPRIVATE"),
 		GoPrivateGitHost:                      os.Getenv("CI_POLICY_GOPRIVATE_GIT_HOST"),
 		GoPrivateGitHosts:                     os.Getenv("CI_POLICY_GOPRIVATE_GIT_HOSTS"),
+		GoPrivateGitHubAppClientID:            os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_CLIENT_ID"),
+		GoPrivateGitHubAppOwner:               os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_OWNER"),
+		GoPrivateGitHubAppRepositories:        os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_REPOSITORIES"),
 		AdditionalGoTestPath:                  os.Getenv("CI_POLICY_ADDITIONAL_GO_TEST_PATH"),
 		MinimumTestCoveragePercent:            minimumCoverage,
 		CoverPackage:                          os.Getenv("CI_POLICY_COVERPKG"),
