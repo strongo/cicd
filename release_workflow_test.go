@@ -1797,10 +1797,42 @@ func TestReleaseWorkflowWatchdogsReturnPromptlyAndKillTimeouts(t *testing.T) {
 				`printf 'status=%s\n' "$status"`,
 			}, "\n")
 			started := time.Now()
-			output, wrapperPID, err := runBashInNewProcessGroup(workspace, timeoutProgram, watchdogPIDs.environment())
+			wrapperPID, wait := startBashInNewProcessGroup(t, workspace, timeoutProgram, watchdogPIDs.environment())
 			if wrapperPID > 0 {
-				t.Cleanup(func() { killProcessGroup(wrapperPID) })
+				t.Cleanup(func() {
+					// Reaps the wrapper bash process started above (and
+					// anything it spawns without its own job control) — NOT
+					// the timed fixture itself. `run_with_timeout`'s
+					// `set -m` puts the timed command's leader in its OWN
+					// process group, distinct from this wrapper's, so it is
+					// unreachable from here; that group is reaped via
+					// parentPID below instead.
+					killProcessGroup(wrapperPID)
+				})
 			}
+
+			// Register the fixture's own cleanup immediately, before any
+			// assertion that could fail and skip straight to Cleanup: the
+			// leader writes PARENT_PID_FILE (and the grandchild
+			// CHILD_PID_FILE) within microseconds of starting, so a short
+			// poll here — running concurrently with the still-executing
+			// command below — reliably captures both before `wait` blocks
+			// on the 1s timeout plus TERM/KILL grace.
+			parentPID := pollForPID(watchdogPIDs.parentPIDFile, 3*time.Second, 20*time.Millisecond)
+			childPID := pollForPID(watchdogPIDs.childPIDFile, 3*time.Second, 20*time.Millisecond)
+			t.Cleanup(func() {
+				// Kill by process group first (parentPID is the job's own
+				// pgid leader under `set -m`), then fall back to killing
+				// each PID directly so neither survives even if the group
+				// kill fails for some reason. Tolerant of a zero/missing
+				// PID (killProcessGroup/killProcess are no-ops for pid<=0
+				// and ESRCH).
+				killProcessGroup(parentPID)
+				killProcess(parentPID)
+				killProcess(childPID)
+			})
+
+			output, err := wait()
 			elapsed := time.Since(started)
 			if err != nil {
 				t.Fatalf("timed command: %v\n%s", err, output)
@@ -1811,17 +1843,12 @@ func TestReleaseWorkflowWatchdogsReturnPromptlyAndKillTimeouts(t *testing.T) {
 			if !strings.HasPrefix(string(output), "status=") || string(output) == "status=0\n" {
 				t.Fatalf("timed command must be killed, got %q", output)
 			}
-			parentPID := readPID(t, watchdogPIDs.parentPIDFile)
-			childPID := readPID(t, watchdogPIDs.childPIDFile)
-			t.Cleanup(func() {
-				// Kill by process group first (parentPID is the job's own
-				// pgid leader under `set -m`), then fall back to killing
-				// each PID directly so neither survives even if the group
-				// kill fails for some reason.
-				killProcessGroup(parentPID)
-				killProcess(parentPID)
-				killProcess(childPID)
-			})
+			if parentPID == 0 {
+				t.Fatalf("parent PID file %s never appeared", watchdogPIDs.parentPIDFile)
+			}
+			if childPID == 0 {
+				t.Fatalf("child PID file %s never appeared", watchdogPIDs.childPIDFile)
+			}
 			if processIsAlive(parentPID) {
 				t.Fatalf("timed command's own leader process %d survived the process-group kill", parentPID)
 			}
@@ -1833,6 +1860,67 @@ func TestReleaseWorkflowWatchdogsReturnPromptlyAndKillTimeouts(t *testing.T) {
 				t.Fatalf("timeout marker = %v, %v; want one marker", matches, err)
 			}
 		})
+	}
+}
+
+// TestReleaseWorkflowWatchdogFixtureReapedWithoutRelyingOnTimeoutHelper is
+// the negative-test safety net for the fix above: it proves the fixture
+// leader and grandchild get reaped from cleanup registered immediately
+// after Start() even when nothing resembling the production
+// run_with_timeout helper ever runs a kill step — e.g. because this test
+// process itself was killed before the helper's own TERM/KILL grace period
+// elapsed, the exact 2026-08-31 orphan scenario. The inner subtest starts
+// the fixture, captures its PIDs, registers their cleanup, and returns
+// without ever calling `wait` (nothing would make it return); the outer
+// test then asserts — using only `processIsAlive`, never the broken
+// helper — that both processes are gone once the subtest's t.Cleanup has
+// run.
+func TestReleaseWorkflowWatchdogFixtureReapedWithoutRelyingOnTimeoutHelper(t *testing.T) {
+	workspace := t.TempDir()
+	parentPIDFile := filepath.Join(workspace, "parent-pid")
+	childPIDFile := filepath.Join(workspace, "child-pid")
+	variables := map[string]string{
+		"PARENT_PID_FILE": parentPIDFile,
+		"CHILD_PID_FILE":  childPIDFile,
+	}
+	fixture := `trap "" TERM; printf "%s\n" "$$" > "$PARENT_PID_FILE"; (trap "" TERM; while :; do :; done) & printf "%s\n" "$!" > "$CHILD_PID_FILE"; while :; do :; done`
+
+	var parentPID, childPID int
+	t.Run("fixture_leader_outlives_a_broken_timeout_helper", func(t *testing.T) {
+		wrapperPID, wait := startBashInNewProcessGroup(t, workspace, fixture, variables)
+		if wrapperPID > 0 {
+			t.Cleanup(func() { killProcessGroup(wrapperPID) })
+		}
+		parentPID = pollForPID(parentPIDFile, 3*time.Second, 20*time.Millisecond)
+		childPID = pollForPID(childPIDFile, 3*time.Second, 20*time.Millisecond)
+		t.Cleanup(func() {
+			killProcessGroup(parentPID)
+			killProcess(parentPID)
+			killProcess(childPID)
+		})
+		if parentPID == 0 {
+			t.Fatal("parent PID file never appeared")
+		}
+		if childPID == 0 {
+			t.Fatal("child PID file never appeared")
+		}
+		if !processIsAlive(parentPID) || !processIsAlive(childPID) {
+			t.Fatalf("fixture leader %d / child %d exited before the subtest's cleanup could prove the safety net", parentPID, childPID)
+		}
+		// Deliberately never called: this stands in for a broken/absent
+		// timeout helper, so nothing ever sends TERM/KILL through the
+		// normal path. Only t.Cleanup, registered above, reaps this.
+		_ = wait
+	})
+
+	if parentPID == 0 || childPID == 0 {
+		t.Fatal("subtest did not capture fixture PIDs")
+	}
+	if processIsAlive(parentPID) {
+		t.Fatalf("fixture leader %d survived past its subtest's cleanup", parentPID)
+	}
+	if processIsAlive(childPID) {
+		t.Fatalf("fixture grandchild %d survived past its subtest's cleanup", childPID)
 	}
 }
 
@@ -2003,7 +2091,46 @@ func processIsAlive(pid int) bool {
 }
 
 func killProcess(pid int) {
+	if pid <= 0 {
+		// pid 0 means "no PID was ever captured" (e.g. its file never
+		// appeared); `kill -KILL 0` would signal this process's own group.
+		return
+	}
 	_ = exec.Command("kill", "-KILL", fmt.Sprint(pid)).Run()
+}
+
+// pollForPID retries reading a single PID from path until it appears (a
+// fixture typically writes its PID file within microseconds of starting) or
+// the deadline passes. It never fails the test itself: callers that need
+// the PID to have appeared must check for a 0 return and fail explicitly,
+// after registering whatever cleanup they can with what was captured.
+func pollForPID(path string, timeout, interval time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	for {
+		if pid, ok := readPIDBestEffort(path); ok {
+			return pid
+		}
+		if time.Now().After(deadline) {
+			return 0
+		}
+		time.Sleep(interval)
+	}
+}
+
+func readPIDBestEffort(path string) (int, bool) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(content))
+	if len(fields) != 1 {
+		return 0, false
+	}
+	var pid int
+	if _, err := fmt.Sscanf(fields[0], "%d", &pid); err != nil {
+		return 0, false
+	}
+	return pid, true
 }
 
 // killProcessGroup sends SIGKILL to the process GROUP led by pid (i.e. all
@@ -2109,14 +2236,20 @@ func runBash(dir, program string, variables map[string]string) ([]byte, error) {
 	return command.CombinedOutput()
 }
 
-// runBashInNewProcessGroup runs program like runBash, except the wrapper
-// bash process (and, without an intervening `set -m`, everything it
+// startBashInNewProcessGroup starts program like runBash, except the
+// wrapper bash process (and, without an intervening `set -m`, everything it
 // backgrounds) is placed in a fresh OS process group instead of inheriting
-// this test binary's own group. It returns that wrapper's PID (0 if it
-// never started) so the caller can reap the whole group with
-// killProcessGroup even if this test process itself is killed before its
-// own t.Cleanup would otherwise run.
-func runBashInNewProcessGroup(dir, program string, variables map[string]string) ([]byte, int, error) {
+// this test binary's own group. Unlike runBash it returns as soon as
+// Start() completes — not after the command finishes — specifically so a
+// caller can register t.Cleanup for the wrapper's PID (and poll for any PID
+// files a long-running fixture writes) before ever blocking on the
+// returned wait function. That ordering matters because the command this
+// is used for can run for seconds while ignoring termination signals:
+// cleanup registered only after waiting would never run on the exact
+// failure paths (an assertion t.Fatal, or this test binary being killed)
+// that make the fixture leak.
+func startBashInNewProcessGroup(t *testing.T, dir, program string, variables map[string]string) (wrapperPID int, wait func() ([]byte, error)) {
+	t.Helper()
 	command := exec.Command("bash", "-c", program)
 	command.Dir = dir
 	command.Env = os.Environ()
@@ -2128,11 +2261,13 @@ func runBashInNewProcessGroup(dir, program string, variables map[string]string) 
 	command.Stdout = &combined
 	command.Stderr = &combined
 	if err := command.Start(); err != nil {
-		return nil, 0, err
+		return 0, func() ([]byte, error) { return nil, err }
 	}
 	pid := command.Process.Pid
-	err := command.Wait()
-	return combined.Bytes(), pid, err
+	return pid, func() ([]byte, error) {
+		err := command.Wait()
+		return combined.Bytes(), err
+	}
 }
 
 func githubOutput(t *testing.T, outputFile, key string) string {
