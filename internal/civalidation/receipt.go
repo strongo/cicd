@@ -48,6 +48,7 @@ type Policy struct {
 	ArtifactRetentionDays                 string `json:"artifact_retention_days"`
 	ArtifactOnMainOnly                    bool   `json:"artifact_on_main_only"`
 	ExactTreeValidationReuse              bool   `json:"exact_tree_validation_reuse"`
+	ValidateOnMain                        bool   `json:"validate_on_main"`
 	ValidationReceiptRetentionDays        string `json:"validation_receipt_retention_days"`
 }
 
@@ -95,6 +96,14 @@ func PolicyFromEnvironment() (Policy, error) {
 		}
 		return parsed, nil
 	}
+	// Unset means the workflow default, which for this one input is true:
+	// an absent or mis-plumbed value must never silently disable validation.
+	booleanDefaultTrue := func(name string) (bool, error) {
+		if strings.TrimSpace(os.Getenv(name)) == "" {
+			return true, nil
+		}
+		return boolean(name)
+	}
 	number := func(name string) (string, error) {
 		value := strings.TrimSpace(os.Getenv(name))
 		if value == "" {
@@ -140,6 +149,10 @@ func PolicyFromEnvironment() (Policy, error) {
 		return Policy{}, err
 	}
 	reuse, err := boolean("CI_POLICY_EXACT_TREE_VALIDATION_REUSE")
+	if err != nil {
+		return Policy{}, err
+	}
+	validateOnMain, err := booleanDefaultTrue("CI_POLICY_VALIDATE_ON_MAIN")
 	if err != nil {
 		return Policy{}, err
 	}
@@ -191,6 +204,7 @@ func PolicyFromEnvironment() (Policy, error) {
 		ArtifactRetentionDays:                 artifactRetention,
 		ArtifactOnMainOnly:                    artifactOnMainOnly,
 		ExactTreeValidationReuse:              reuse,
+		ValidateOnMain:                        validateOnMain,
 		ValidationReceiptRetentionDays:        receiptRetention,
 	}, nil
 }

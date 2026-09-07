@@ -149,32 +149,35 @@ func TestResolveReturnsAPIFailureForFailClosedWrapper(t *testing.T) {
 		http.Error(response, "denied", http.StatusForbidden)
 	}))
 	defer server.Close()
-	_, err := Resolve(context.Background(), server.Client(), ResolveConfig{APIURL: server.URL, Token: "token", Repository: testRepository, LandedSHA: testLandedSHA, LandedTree: testLandedTree, TargetBranch: "main", CurrentRunID: 456, WorkflowRevision: testWorkflowSHA, PolicyDigest: testPolicyDigest})
+	_, err := Resolve(context.Background(), server.Client(), ResolveConfig{APIURL: server.URL, Token: "token", Repository: testRepository, LandedSHA: testLandedSHA, LandedTree: testLandedTree, TargetBranch: "main", CurrentRunID: 456, WorkflowRevision: testWorkflowSHA, PolicyDigest: testPolicyDigest, ExactTreeReuse: true})
 	if err == nil || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 type resolveFixtureData struct {
-	t          *testing.T
-	pulls      []map[string]any
-	currentRun map[string]any
-	runs       map[string]any
-	artifacts  map[int64]map[string]any
-	archives   map[int64][]byte
-	receipt    Receipt
+	t                    *testing.T
+	exactTreeReuse       bool
+	skipValidationOnMain bool
+	pulls                []map[string]any
+	currentRun           map[string]any
+	runs                 map[string]any
+	artifacts            map[int64]map[string]any
+	archives             map[int64][]byte
+	receipt              Receipt
 }
 
 func newResolveFixture(t *testing.T) *resolveFixtureData {
 	t.Helper()
 	receipt := Receipt{Schema: ReceiptSchema, Repository: testRepository, PullRequest: PullRequest{Number: 9, HeadRef: "feature", HeadSHA: testHeadSHA}, Checkout: Checkout{SHA: testCheckoutSHA, Tree: testLandedTree}, Workflow: Workflow{Revision: testWorkflowSHA, RunID: 123, RunAttempt: 1, WorkflowID: 77}, Policy: PolicyBinding{Digest: testPolicyDigest}, RequiredJobs: map[string]string{"go_lint": "success", "go_test_build": "success"}}
 	f := &resolveFixtureData{
-		t:          t,
-		pulls:      []map[string]any{{"number": 9, "merged_at": "2026-09-06T00:00:00Z", "merge_commit_sha": testLandedSHA, "base": map[string]any{"ref": "main", "sha": "4444444444444444444444444444444444444444"}, "head": map[string]any{"ref": "feature", "sha": testHeadSHA, "repo": map[string]any{"full_name": testRepository}}}},
-		currentRun: map[string]any{"id": 456, "workflow_id": 77},
-		runs:       map[string]any{"total_count": 1, "workflow_runs": []map[string]any{{"id": int64(123), "workflow_id": 77, "run_attempt": 1, "event": "pull_request", "conclusion": "success", "head_branch": "feature", "head_sha": testHeadSHA, "head_repository": map[string]any{"full_name": testRepository}}}},
-		artifacts:  map[int64]map[string]any{123: {"total_count": 1, "artifacts": []map[string]any{{"id": int64(321), "name": ReceiptName, "expired": false}}}},
-		archives:   map[int64][]byte{}, receipt: receipt,
+		t:              t,
+		exactTreeReuse: true,
+		pulls:          []map[string]any{{"number": 9, "merged_at": "2026-09-06T00:00:00Z", "merge_commit_sha": testLandedSHA, "base": map[string]any{"ref": "main", "sha": "4444444444444444444444444444444444444444"}, "head": map[string]any{"ref": "feature", "sha": testHeadSHA, "repo": map[string]any{"full_name": testRepository}}}},
+		currentRun:     map[string]any{"id": 456, "workflow_id": 77},
+		runs:           map[string]any{"total_count": 1, "workflow_runs": []map[string]any{{"id": int64(123), "workflow_id": 77, "run_attempt": 1, "event": "pull_request", "conclusion": "success", "head_branch": "feature", "head_sha": testHeadSHA, "head_repository": map[string]any{"full_name": testRepository}}}},
+		artifacts:      map[int64]map[string]any{123: {"total_count": 1, "artifacts": []map[string]any{{"id": int64(321), "name": ReceiptName, "expired": false}}}},
+		archives:       map[int64][]byte{}, receipt: receipt,
 	}
 	f.rebuildArchive(t)
 	return f
@@ -235,7 +238,7 @@ func resolveFixture(t *testing.T, fixture *resolveFixtureData) (Decision, error)
 		}
 	}))
 	defer server.Close()
-	return Resolve(context.Background(), server.Client(), ResolveConfig{APIURL: server.URL, Token: "token", Repository: testRepository, LandedSHA: testLandedSHA, LandedTree: testLandedTree, TargetBranch: "main", CurrentRunID: 456, WorkflowRevision: testWorkflowSHA, PolicyDigest: testPolicyDigest})
+	return Resolve(context.Background(), server.Client(), ResolveConfig{APIURL: server.URL, Token: "token", Repository: testRepository, LandedSHA: testLandedSHA, LandedTree: testLandedTree, TargetBranch: "main", CurrentRunID: 456, WorkflowRevision: testWorkflowSHA, PolicyDigest: testPolicyDigest, ExactTreeReuse: fixture.exactTreeReuse, SkipValidationOnMain: fixture.skipValidationOnMain})
 }
 
 func receiptArchive(t *testing.T, receipt Receipt) []byte {
@@ -281,5 +284,109 @@ func setMinimumPolicyEnvironment(t *testing.T) {
 	}
 	for _, name := range []string{"CI_POLICY_GOLANGCI_LINT_CACHE_INVALIDATION_INTERVAL", "CI_POLICY_ARTIFACT_RETENTION_DAYS", "CI_POLICY_VALIDATION_RECEIPT_RETENTION_DAYS"} {
 		t.Setenv(name, "7")
+	}
+}
+
+// A merge commit's tree legitimately differs from the validated pull-request
+// tree whenever main moved, which is the common case. A caller that protects
+// main behind required pull-request checks may delegate validation to the
+// green pull-request run instead of repeating it after the merge.
+func TestResolveDelegatesMainValidationToTheGreenPullRequestRun(t *testing.T) {
+	fixture := newResolveFixture(t)
+	fixture.exactTreeReuse = false
+	fixture.skipValidationOnMain = true
+	fixture.artifacts = map[int64]map[string]any{}
+
+	decision, err := resolveFixture(t, fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Reuse || decision.ReceiptRunID != 123 {
+		t.Fatalf("decision = %+v", decision)
+	}
+	if !strings.Contains(decision.Reason, "#9") {
+		t.Fatalf("reason %q does not name the validated pull request", decision.Reason)
+	}
+}
+
+func TestResolveFallsBackFromTreeDriftToDelegatedValidation(t *testing.T) {
+	fixture := newResolveFixture(t)
+	fixture.skipValidationOnMain = true
+	fixture.receipt.Checkout.Tree = strings.Repeat("8", 40)
+	fixture.rebuildArchive(t)
+
+	decision, err := resolveFixture(t, fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Reuse || !strings.Contains(decision.Reason, "validated green before merge") {
+		t.Fatalf("decision = %+v", decision)
+	}
+}
+
+func TestResolveRefusesDelegationWithoutExactlyOneGreenPullRequestRun(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*resolveFixtureData)
+		want   string
+	}{
+		{name: "direct push to main", mutate: func(f *resolveFixtureData) { f.pulls = []map[string]any{} }, want: "pull request for landed SHA, found 0"},
+		{name: "no green run for the head", mutate: func(f *resolveFixtureData) {
+			f.runs["workflow_runs"] = []map[string]any{}
+			f.runs["total_count"] = 0
+		}, want: "validation run, found 0"},
+		{name: "ambiguous green runs", mutate: addSecondReceiptCandidate, want: "validation run, found 2"},
+		{name: "no reuse mode enabled", mutate: func(f *resolveFixtureData) { f.skipValidationOnMain = false }, want: "no validation reuse mode is enabled"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newResolveFixture(t)
+			fixture.exactTreeReuse = false
+			fixture.skipValidationOnMain = true
+			tc.mutate(fixture)
+			decision, err := resolveFixture(t, fixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.Reuse {
+				t.Fatalf("unproved boundary was reused: %+v", decision)
+			}
+			if !strings.Contains(decision.Reason, tc.want) {
+				t.Fatalf("reason %q does not contain %q", decision.Reason, tc.want)
+			}
+		})
+	}
+}
+
+// An absent or mis-plumbed CI_POLICY_VALIDATE_ON_MAIN must read as the safe
+// workflow default, never as "skip validation".
+func TestPolicyValidatesOnMainUnlessExplicitlyDisabled(t *testing.T) {
+	setMinimumPolicyEnvironment(t)
+	unset, err := PolicyFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unset.ValidateOnMain {
+		t.Fatal("unset validate_on_main must keep main validation enabled")
+	}
+	unsetDigest, err := PolicyDigest(unset)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("CI_POLICY_VALIDATE_ON_MAIN", "false")
+	disabled, err := PolicyFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.ValidateOnMain {
+		t.Fatal("explicit false must disable main validation")
+	}
+	disabledDigest, err := PolicyDigest(disabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabledDigest == unsetDigest {
+		t.Fatal("changing the main-validation policy must change the policy digest")
 	}
 }

@@ -15,7 +15,7 @@ func TestGoCIWorkflowExactTreeReuseIsOptInAndFailClosed(t *testing.T) {
 		"reuse_exact_tree_validation:\n        type: boolean",
 		"or ambiguous receipts fall back to the existing full validation path",
 		"CI_POLICY_EXACT_TREE_VALIDATION_REUSE: ${{ inputs.reuse_exact_tree_validation }}",
-		"if: ${{ inputs.reuse_exact_tree_validation && github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
+		"if: ${{ (inputs.reuse_exact_tree_validation || !inputs.validate_on_main) && github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
 		"timeout-minutes: 3\n    # The optimization itself is never a new gate",
 		"continue-on-error: true",
 		"repository: ${{ job.workflow_repository }}",
@@ -75,6 +75,42 @@ func TestGoCIWorkflowExactTreeReuseIsOptInAndFailClosed(t *testing.T) {
 	} {
 		if !strings.Contains(bump, required) {
 			t.Fatalf("version bump continuity is missing %q", required)
+		}
+	}
+}
+
+func TestGoCIWorkflowKeepsMainValidationOnByDefault(t *testing.T) {
+	workflow := readGoCIWorkflow(t)
+
+	inputStart := strings.Index(workflow, "\n      validate_on_main:\n")
+	if inputStart == -1 {
+		t.Fatal("validate_on_main input is missing")
+	}
+	inputEnd := strings.Index(workflow[inputStart:], "\n      reuse_exact_tree_validation:")
+	if inputEnd == -1 {
+		t.Fatal("validate_on_main must be declared before the exact-tree reuse input")
+	}
+	input := workflow[inputStart : inputStart+inputEnd]
+	if !strings.Contains(input, "type: boolean") || !strings.Contains(input, "default: true") {
+		t.Fatal("main validation must stay enabled unless a caller opts out")
+	}
+	if !strings.Contains(input, "A direct push to main") || !strings.Contains(input, "semantic conflict") {
+		t.Fatal("the weaker guarantee and its boundaries must stay documented on the input")
+	}
+	if !strings.Contains(workflow, "CI_POLICY_VALIDATE_ON_MAIN: ${{ inputs.validate_on_main }}") {
+		t.Fatal("main-validation policy must bind into the receipt policy digest")
+	}
+
+	// Opting out changes which validation runs, never whether the deployable is
+	// produced: both the caller's build command and the artifact upload stay
+	// outside every reuse guard, exactly as under exact-tree reuse.
+	build := workflowJob(t, workflow, "go_test_build", "publish_validation_receipt")
+	for _, step := range []struct{ name, next string }{
+		{"Build", "Set up Java JRE 24"},
+		{"Upload build artifact", "Save Go dependencies and build cache"},
+	} {
+		if strings.Contains(workflowStep(t, build, step.name, step.next), "reuse_valid") {
+			t.Fatalf("%q must never be skipped by validation reuse", step.name)
 		}
 	}
 }

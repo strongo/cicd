@@ -129,6 +129,7 @@ func resolve() {
 		APIURL: os.Getenv("GITHUB_API_URL"), Token: required("GITHUB_TOKEN"), Repository: required("GITHUB_REPOSITORY"),
 		LandedSHA: required("GITHUB_SHA"), LandedTree: tree, TargetBranch: required("GITHUB_REF_NAME"), CurrentRunID: runID,
 		WorkflowRevision: required("CI_RECEIPT_WORKFLOW_REVISION"), PolicyDigest: digest,
+		ExactTreeReuse: policy.ExactTreeValidationReuse, SkipValidationOnMain: !policy.ValidateOnMain,
 	})
 	if err != nil {
 		decision = civalidation.Decision{Reason: "receipt lookup failed: " + err.Error()}
