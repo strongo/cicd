@@ -128,6 +128,54 @@ the prior run and its receipt. Receipt retention defaults to seven days and is
 configurable with `validation_receipt_retention_days`; expiry safely causes a
 full revalidation.
 
+## Skip revalidation on main after a green pull request
+
+Exact-tree reuse only fires when the landed tree is byte-identical to the
+validated one. With merge commits that happens only while `main` has not moved
+since the pull request was last updated, so in an active repository the merge
+run almost always revalidates the same code for a second time before the deploy
+can start.
+
+`validate_on_main: false` addresses that directly. The push-to-`main` run then
+skips **Lint** and the test and coverage steps, and only builds and uploads the
+artifact, provided the resolver can prove that the landed commit is the merge
+commit of exactly one same-repository pull request whose head this same workflow
+already concluded successfully. A direct push to `main`, an unmatched or
+unmerged pull request, an ambiguous set of runs, and any API or resolver failure
+all keep the full validation.
+
+```yaml
+jobs:
+  ci:
+    uses: strongo/cicd/.github/workflows/workflow.yml@<exact-release-containing-this-feature>
+    with:
+      validate_on_main: false
+    secrets:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+The main-run resolver authenticates the prior run through the API, so the
+caller needs the same `actions: read` and `pull-requests: read` permissions
+listed for exact-tree reuse above.
+
+This is a weaker guarantee than exact-tree reuse, deliberately: the merged tree
+itself was never linted or tested. `build_command` still compiles the merged
+tree on `main`, so a merge that does not compile is still caught before the
+artifact is published, but a *semantic* conflict — the pull request renames a
+function while `main` adds a caller, and each side is green alone — reaches the
+artifact and would have been caught by a second validation. Only enable it where
+`main` is protected and this workflow is a required pull-request check, and
+prefer requiring branches to be up to date before merging: that makes the merge
+tree equal to the validated tree, and exact-tree reuse then applies with its
+full guarantee.
+
+The two inputs compose. With both set, a matching receipt wins and reports exact
+reuse; ordinary tree drift after `main` moves falls through to the delegated
+path instead of revalidating. Either input alone enables the main-run resolver;
+`validate_on_main` participates in the policy digest, so changing it invalidates
+existing receipts rather than silently reusing validation performed under a
+different policy.
+
 ## Private Go modules from multiple owners
 
 Set `GOPRIVATE` to the private module prefixes and `goprivate_git_hosts` to the

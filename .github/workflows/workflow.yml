@@ -186,6 +186,23 @@ on:
         required: false
         default: false
 
+      validate_on_main:
+        type: boolean
+        description: >-
+          Run lint and tests again on the push to main. Set false only when main
+          is protected and the same checks are required on pull requests: the
+          push-to-main run then skips lint and tests and only builds and
+          publishes the artifact, provided the landed commit is the merge commit
+          of exactly one same-repository pull request whose head this workflow
+          already concluded successfully. A direct push to main, an unmatched or
+          unmerged pull request, an ambiguous run, or any resolver failure keeps
+          the full validation. Weaker than reuse_exact_tree_validation, which
+          proves the landed tree itself was validated: the merged tree is only
+          compiled here (build_command), so a semantic conflict between main and
+          the pull request can still reach the artifact.
+        required: false
+        default: true
+
       reuse_exact_tree_validation:
         type: boolean
         description: >-
@@ -234,14 +251,15 @@ env:
   CI_POLICY_ARTIFACT_PATH: ${{ inputs.artifact_path }}
   CI_POLICY_ARTIFACT_RETENTION_DAYS: ${{ inputs.artifact_retention_days }}
   CI_POLICY_ARTIFACT_ON_MAIN_ONLY: ${{ inputs.artifact_on_main_only }}
+  CI_POLICY_VALIDATE_ON_MAIN: ${{ inputs.validate_on_main }}
   CI_POLICY_EXACT_TREE_VALIDATION_REUSE: ${{ inputs.reuse_exact_tree_validation }}
   CI_POLICY_VALIDATION_RECEIPT_RETENTION_DAYS: ${{ inputs.validation_receipt_retention_days }}
 
 jobs:
 
   validation_reuse:
-    name: Resolve exact-tree validation receipt
-    if: ${{ inputs.reuse_exact_tree_validation && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    name: Resolve reusable pull-request validation
+    if: ${{ (inputs.reuse_exact_tree_validation || !inputs.validate_on_main) && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     # The optimization itself is never a new gate. A checkout, setup, API, or

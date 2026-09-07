@@ -25,6 +25,17 @@ type ResolveConfig struct {
 	CurrentRunID     int64
 	WorkflowRevision string
 	PolicyDigest     string
+	// ExactTreeReuse enables the receipt path: reuse the pull-request
+	// validation only when the landed tree is byte-identical to the tree that
+	// was validated.
+	ExactTreeReuse bool
+	// SkipValidationOnMain enables the delegated path: the caller has declared
+	// that `main` is protected behind required pull-request checks, so a merge
+	// whose pull-request head was validated green by this same workflow does
+	// not need to be lint-ed and tested a second time. Weaker than the receipt
+	// path -- the merged tree itself was never validated -- and therefore
+	// opt-in per caller.
+	SkipValidationOnMain bool
 }
 
 type Decision struct {
@@ -71,6 +82,9 @@ func Resolve(ctx context.Context, client *http.Client, cfg ResolveConfig) (Decis
 }
 
 func (r resolver) resolve(ctx context.Context) (Decision, error) {
+	if !r.cfg.ExactTreeReuse && !r.cfg.SkipValidationOnMain {
+		return Decision{Reason: "no validation reuse mode is enabled"}, nil
+	}
 	var pulls []apiPullRequest
 	if err := r.getJSON(ctx, fmt.Sprintf("/repos/%s/commits/%s/pulls?per_page=100", r.cfg.Repository, r.cfg.LandedSHA), &pulls); err != nil {
 		return Decision{}, fmt.Errorf("list associated pull requests: %w", err)
@@ -81,6 +95,8 @@ func (r resolver) resolve(ctx context.Context) (Decision, error) {
 			matchingPulls = append(matchingPulls, pr)
 		}
 	}
+	// A direct push to the target branch matches no merged pull request, so it
+	// is never eligible for either reuse path: nothing validated that commit.
 	if len(matchingPulls) != 1 {
 		return Decision{Reason: fmt.Sprintf("expected one merged same-repository pull request for landed SHA, found %d", len(matchingPulls))}, nil
 	}
@@ -106,16 +122,48 @@ func (r resolver) resolve(ctx context.Context) (Decision, error) {
 	if runs.TotalCount > len(runs.Runs) {
 		return Decision{Reason: "pull request run result is paginated and therefore ambiguous"}, nil
 	}
+	validatedRuns := make([]apiRun, 0, 1)
+	for _, run := range runs.Runs {
+		if run.Event != "pull_request" || run.Conclusion != "success" || run.HeadBranch != pr.Head.Ref || run.HeadSHA != pr.Head.SHA || run.HeadRepository.FullName != r.cfg.Repository {
+			continue
+		}
+		validatedRuns = append(validatedRuns, run)
+	}
 
+	if r.cfg.ExactTreeReuse {
+		decision, err := r.resolveExactTree(ctx, pr, currentRun.WorkflowID, validatedRuns)
+		if err != nil {
+			return Decision{}, err
+		}
+		// The receipt path proves more than the delegated one, so it decides
+		// alone whenever it is the only enabled path. When both are enabled a
+		// legitimate tree difference -- the ordinary case after `main` moves --
+		// falls through to the caller's weaker, explicitly chosen policy.
+		if decision.Reuse || !r.cfg.SkipValidationOnMain {
+			return decision, nil
+		}
+	}
+
+	if len(validatedRuns) != 1 {
+		return Decision{Reason: fmt.Sprintf("expected one successful pull request validation run, found %d", len(validatedRuns))}, nil
+	}
+	return Decision{
+		Reuse:        true,
+		Reason:       fmt.Sprintf("caller disabled validation on %s; pull request #%d was validated green before merge", r.cfg.TargetBranch, pr.Number),
+		ReceiptRunID: validatedRuns[0].ID,
+	}, nil
+}
+
+// resolveExactTree reuses a pull-request validation only when the landed tree,
+// the workflow revision, the policy digest, and the recorded job conclusions
+// all match an authenticated receipt published by that run.
+func (r resolver) resolveExactTree(ctx context.Context, pr apiPullRequest, workflowID int64, validatedRuns []apiRun) (Decision, error) {
 	type validationCandidate struct {
 		run      apiRun
 		artifact apiArtifact
 	}
 	candidates := make([]validationCandidate, 0, 1)
-	for _, run := range runs.Runs {
-		if run.Event != "pull_request" || run.Conclusion != "success" || run.HeadBranch != pr.Head.Ref || run.HeadSHA != pr.Head.SHA || run.HeadRepository.FullName != r.cfg.Repository {
-			continue
-		}
+	for _, run := range validatedRuns {
 		var artifacts apiArtifacts
 		if err := r.getJSON(ctx, fmt.Sprintf("/repos/%s/actions/runs/%d/artifacts?name=%s&per_page=100", r.cfg.Repository, run.ID, ReceiptName), &artifacts); err != nil {
 			return Decision{}, fmt.Errorf("list receipt artifacts for run %d: %w", run.ID, err)
@@ -149,7 +197,7 @@ func (r resolver) resolve(ctx context.Context) (Decision, error) {
 		Repository:  r.cfg.Repository,
 		PullRequest: PullRequest{Number: pr.Number, HeadRef: pr.Head.Ref, HeadSHA: pr.Head.SHA},
 		Checkout:    Checkout{Tree: r.cfg.LandedTree},
-		Workflow:    Workflow{Revision: r.cfg.WorkflowRevision, RunID: candidate.run.ID, RunAttempt: candidate.run.RunAttempt, WorkflowID: currentRun.WorkflowID},
+		Workflow:    Workflow{Revision: r.cfg.WorkflowRevision, RunID: candidate.run.ID, RunAttempt: candidate.run.RunAttempt, WorkflowID: workflowID},
 		Policy:      PolicyBinding{Digest: r.cfg.PolicyDigest},
 	}
 	if err := ValidateReceipt(receipt, expected); err != nil {
