@@ -130,6 +130,7 @@ func resolve() {
 		LandedSHA: required("GITHUB_SHA"), LandedTree: tree, TargetBranch: required("GITHUB_REF_NAME"), CurrentRunID: runID,
 		WorkflowRevision: required("CI_RECEIPT_WORKFLOW_REVISION"), PolicyDigest: digest,
 		ExactTreeReuse: policy.ExactTreeValidationReuse, SkipValidationOnMain: !policy.ValidateOnMain,
+		WaitFor: receiptWait,
 	})
 	if err != nil {
 		decision = civalidation.Decision{Reason: "receipt lookup failed: " + err.Error()}
@@ -141,6 +142,15 @@ func resolve() {
 	}
 	writeDecision(decision)
 }
+
+// receiptWait is how long the resolver keeps re-checking while the
+// pull-request run it depends on is visibly still finishing. The merge run
+// starts the moment auto-merge fires, which is when the required checks pass
+// and before the receipt job that follows them has published anything, so
+// without this the optimization loses a race with itself on every merge.
+// Comfortably inside the job's three-minute timeout, and only ever spent when
+// there is something concrete to wait for.
+const receiptWait = 90 * time.Second
 
 func gitIdentity(directory string) (string, string) {
 	resolve := func(revision string) string {

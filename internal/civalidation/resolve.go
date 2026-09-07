@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type ResolveConfig struct {
@@ -36,12 +37,21 @@ type ResolveConfig struct {
 	// path -- the merged tree itself was never validated -- and therefore
 	// opt-in per caller.
 	SkipValidationOnMain bool
+	// WaitFor bounds how long to keep re-checking while GitHub has not yet
+	// caught up with the pull-request run this decision depends on. Zero
+	// decides on the first look.
+	WaitFor time.Duration
 }
 
 type Decision struct {
 	Reuse        bool
 	Reason       string
 	ReceiptRunID int64
+	// Pending marks a refusal that only reflects what GitHub has indexed so
+	// far -- the run or its receipt exists but is not visible yet -- and can
+	// therefore turn into a reuse if asked again. A genuine mismatch never
+	// sets it.
+	Pending bool
 }
 
 type resolver struct {
@@ -67,6 +77,21 @@ func LookupWorkflowID(ctx context.Context, client *http.Client, apiURL, token, r
 	return run.WorkflowID, nil
 }
 
+// pollInterval is how often a pending decision is re-checked. Overridden in
+// tests.
+var pollInterval = 5 * time.Second
+
+// Resolve decides whether the landed commit may reuse its pull request's
+// validation.
+//
+// The merge run starts the instant the merge lands, while the pull-request
+// run is still finishing: its receipt is published after the required checks
+// pass, which is exactly when auto-merge fires. Measured on sneat-co/sneat-go
+// (run 34165753334): the receipt artifact appeared at 22:11:13, the
+// pull-request run concluded at 22:11:18, and this resolver asked at
+// 22:11:21 and was told there were no successful runs. The optimization was
+// losing a race with the very run it depends on, on every single merge. So
+// when the evidence is visibly still arriving, wait for it -- and only then.
 func Resolve(ctx context.Context, client *http.Client, cfg ResolveConfig) (Decision, error) {
 	if client == nil {
 		client = http.DefaultClient
@@ -78,7 +103,21 @@ func Resolve(ctx context.Context, client *http.Client, cfg ResolveConfig) (Decis
 		return Decision{}, fmt.Errorf("incomplete resolver configuration")
 	}
 	r := resolver{client: client, cfg: cfg}
-	return r.resolve(ctx)
+	deadline := time.Now().Add(cfg.WaitFor)
+	for {
+		decision, err := r.resolve(ctx)
+		if err != nil {
+			return Decision{}, err
+		}
+		if decision.Reuse || !decision.Pending || !time.Now().Before(deadline) {
+			return decision, nil
+		}
+		select {
+		case <-ctx.Done():
+			return decision, nil
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 func (r resolver) resolve(ctx context.Context) (Decision, error) {
@@ -98,6 +137,9 @@ func (r resolver) resolve(ctx context.Context) (Decision, error) {
 	// A direct push to the target branch matches no merged pull request, so it
 	// is never eligible for either reuse path: nothing validated that commit.
 	if len(matchingPulls) != 1 {
+		// Not pending: the merge/pull-request association is what performed the
+		// merge, and a direct push will never gain one. Waiting here would only
+		// tax every direct push to the target branch.
 		return Decision{Reason: fmt.Sprintf("expected one merged same-repository pull request for landed SHA, found %d", len(matchingPulls))}, nil
 	}
 	pr := matchingPulls[0]
@@ -113,7 +155,9 @@ func (r resolver) resolve(ctx context.Context) (Decision, error) {
 	query := url.Values{}
 	query.Set("event", "pull_request")
 	query.Set("head_sha", pr.Head.SHA)
-	query.Set("status", "success")
+	// Deliberately unfiltered by status: a run that is still finishing is the
+	// signal that waiting is worthwhile, and a server-side status filter hides
+	// exactly that.
 	query.Set("per_page", "100")
 	var runs apiRuns
 	if err := r.getJSON(ctx, fmt.Sprintf("/repos/%s/actions/workflows/%d/runs?%s", r.cfg.Repository, currentRun.WorkflowID, query.Encode()), &runs); err != nil {
@@ -123,15 +167,22 @@ func (r resolver) resolve(ctx context.Context) (Decision, error) {
 		return Decision{Reason: "pull request run result is paginated and therefore ambiguous"}, nil
 	}
 	validatedRuns := make([]apiRun, 0, 1)
+	stillRunning := false
 	for _, run := range runs.Runs {
-		if run.Event != "pull_request" || run.Conclusion != "success" || run.HeadBranch != pr.Head.Ref || run.HeadSHA != pr.Head.SHA || run.HeadRepository.FullName != r.cfg.Repository {
+		if run.Event != "pull_request" || run.HeadBranch != pr.Head.Ref || run.HeadSHA != pr.Head.SHA || run.HeadRepository.FullName != r.cfg.Repository {
 			continue
 		}
-		validatedRuns = append(validatedRuns, run)
+		if run.Conclusion == "success" {
+			validatedRuns = append(validatedRuns, run)
+			continue
+		}
+		if run.Conclusion == "" || run.Status != "completed" {
+			stillRunning = true
+		}
 	}
 
 	if r.cfg.ExactTreeReuse {
-		decision, err := r.resolveExactTree(ctx, pr, currentRun.WorkflowID, validatedRuns)
+		decision, err := r.resolveExactTree(ctx, pr, currentRun.WorkflowID, validatedRuns, stillRunning)
 		if err != nil {
 			return Decision{}, err
 		}
@@ -145,7 +196,10 @@ func (r resolver) resolve(ctx context.Context) (Decision, error) {
 	}
 
 	if len(validatedRuns) != 1 {
-		return Decision{Reason: fmt.Sprintf("expected one successful pull request validation run, found %d", len(validatedRuns))}, nil
+		return Decision{
+			Reason:  fmt.Sprintf("expected one successful pull request validation run, found %d", len(validatedRuns)),
+			Pending: len(validatedRuns) == 0 && stillRunning,
+		}, nil
 	}
 	return Decision{
 		Reuse:        true,
@@ -157,7 +211,7 @@ func (r resolver) resolve(ctx context.Context) (Decision, error) {
 // resolveExactTree reuses a pull-request validation only when the landed tree,
 // the workflow revision, the policy digest, and the recorded job conclusions
 // all match an authenticated receipt published by that run.
-func (r resolver) resolveExactTree(ctx context.Context, pr apiPullRequest, workflowID int64, validatedRuns []apiRun) (Decision, error) {
+func (r resolver) resolveExactTree(ctx context.Context, pr apiPullRequest, workflowID int64, validatedRuns []apiRun, stillRunning bool) (Decision, error) {
 	type validationCandidate struct {
 		run      apiRun
 		artifact apiArtifact
@@ -178,7 +232,13 @@ func (r resolver) resolveExactTree(ctx context.Context, pr apiPullRequest, workf
 		}
 	}
 	if len(candidates) != 1 {
-		return Decision{Reason: fmt.Sprintf("expected one successful pull request validation receipt, found %d", len(candidates))}, nil
+		// The receipt is published by a job that only starts once lint and
+		// tests have passed, so on a fresh merge it is routinely the last
+		// thing to exist. Absent is worth waiting on; a second one never is.
+		return Decision{
+			Reason:  fmt.Sprintf("expected one successful pull request validation receipt, found %d", len(candidates)),
+			Pending: len(candidates) == 0 && (stillRunning || len(validatedRuns) > 0),
+		}, nil
 	}
 	candidate := candidates[0]
 	archive, err := r.getBytes(ctx, fmt.Sprintf("/repos/%s/actions/artifacts/%d/zip", r.cfg.Repository, candidate.artifact.ID))
@@ -302,6 +362,7 @@ type apiRun struct {
 	WorkflowID     int64  `json:"workflow_id"`
 	RunAttempt     int    `json:"run_attempt"`
 	Event          string `json:"event"`
+	Status         string `json:"status"`
 	Conclusion     string `json:"conclusion"`
 	HeadBranch     string `json:"head_branch"`
 	HeadSHA        string `json:"head_sha"`

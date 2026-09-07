@@ -96,6 +96,20 @@ reusable security binding. The recorded checkout SHA remains audit evidence;
 it is not treated as independently recoverable evidence after GitHub deletes
 the temporary merge commit.
 
+The merge run starts the moment auto-merge fires -- when the required checks
+pass -- while the receipt is published by a job that only runs *after* them.
+The resolver therefore waits, up to 90 seconds, whenever the evidence is
+visibly still arriving: a pull-request run for that head which has not
+concluded yet, or a successful run whose receipt has not appeared. Nothing
+else waits. A direct push, a failed run, a tree mismatch and every other
+settled refusal is decided on the first look, so a genuine miss never costs
+the merge run more than the resolver's own runtime.
+
+(Measured on sneat-co/sneat-go before this existed: receipt artifact created
+at 22:11:13, pull-request run concluded at 22:11:18, resolver asked at
+22:11:21 and was told there were no successful runs. The optimization was
+losing a race with the very run it depends on, on every merge.)
+
 Missing permissions, API failures, forks, expired artifacts, changed policy,
 tree drift, and ambiguous runs all select the existing full validation path.
 Only an explicit verified receipt skips lint, vet, tests, and coverage. The

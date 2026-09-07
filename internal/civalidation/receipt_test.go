@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -159,12 +160,16 @@ type resolveFixtureData struct {
 	t                    *testing.T
 	exactTreeReuse       bool
 	skipValidationOnMain bool
-	pulls                []map[string]any
-	currentRun           map[string]any
-	runs                 map[string]any
-	artifacts            map[int64]map[string]any
-	archives             map[int64][]byte
-	receipt              Receipt
+	waitFor              time.Duration
+	// beforeRunsQuery lets a test change what GitHub reports between looks,
+	// the way a finishing run does.
+	beforeRunsQuery func()
+	pulls           []map[string]any
+	currentRun      map[string]any
+	runs            map[string]any
+	artifacts       map[int64]map[string]any
+	archives        map[int64][]byte
+	receipt         Receipt
 }
 
 func newResolveFixture(t *testing.T) *resolveFixtureData {
@@ -211,6 +216,9 @@ func resolveFixture(t *testing.T, fixture *resolveFixtureData) (Decision, error)
 		case strings.HasSuffix(path, "/actions/runs/456"):
 			writeFixtureJSON(t, response, fixture.currentRun)
 		case strings.Contains(path, "/actions/workflows/77/runs"):
+			if fixture.beforeRunsQuery != nil {
+				fixture.beforeRunsQuery()
+			}
 			writeFixtureJSON(t, response, fixture.runs)
 		case strings.Contains(path, "/actions/runs/") && strings.HasSuffix(path, "/artifacts"):
 			parts := strings.Split(path, "/")
@@ -238,7 +246,7 @@ func resolveFixture(t *testing.T, fixture *resolveFixtureData) (Decision, error)
 		}
 	}))
 	defer server.Close()
-	return Resolve(context.Background(), server.Client(), ResolveConfig{APIURL: server.URL, Token: "token", Repository: testRepository, LandedSHA: testLandedSHA, LandedTree: testLandedTree, TargetBranch: "main", CurrentRunID: 456, WorkflowRevision: testWorkflowSHA, PolicyDigest: testPolicyDigest, ExactTreeReuse: fixture.exactTreeReuse, SkipValidationOnMain: fixture.skipValidationOnMain})
+	return Resolve(context.Background(), server.Client(), ResolveConfig{APIURL: server.URL, Token: "token", Repository: testRepository, LandedSHA: testLandedSHA, LandedTree: testLandedTree, TargetBranch: "main", CurrentRunID: 456, WorkflowRevision: testWorkflowSHA, PolicyDigest: testPolicyDigest, ExactTreeReuse: fixture.exactTreeReuse, SkipValidationOnMain: fixture.skipValidationOnMain, WaitFor: fixture.waitFor})
 }
 
 func receiptArchive(t *testing.T, receipt Receipt) []byte {
@@ -388,5 +396,82 @@ func TestPolicyValidatesOnMainUnlessExplicitlyDisabled(t *testing.T) {
 	}
 	if disabledDigest == unsetDigest {
 		t.Fatal("changing the main-validation policy must change the policy digest")
+	}
+}
+
+// The merge run starts the moment auto-merge fires -- when the required
+// checks pass, and before the receipt job that follows them has published
+// anything. Measured on sneat-co/sneat-go: receipt at 22:11:13, pull-request
+// run concluded 22:11:18, this resolver asked at 22:11:21 and was told there
+// were no successful runs. Evidence that is visibly still arriving must be
+// waited for, or the optimization loses a race with itself on every merge.
+func TestResolveWaitsForEvidenceStillArriving(t *testing.T) {
+	restore := pollInterval
+	pollInterval = time.Millisecond
+	defer func() { pollInterval = restore }()
+
+	fixture := newResolveFixture(t)
+	ready := fixture.runs
+	// First look: the run is still finishing and has published no receipt.
+	running := cloneMap(ready["workflow_runs"].([]map[string]any)[0])
+	running["status"] = "in_progress"
+	running["conclusion"] = nil
+	fixture.runs = map[string]any{"total_count": 1, "workflow_runs": []map[string]any{running}}
+	pendingArtifacts := fixture.artifacts
+	fixture.artifacts = map[int64]map[string]any{123: {"total_count": 0, "artifacts": []map[string]any{}}}
+
+	looks := 0
+	fixture.beforeRunsQuery = func() {
+		if looks++; looks == 2 {
+			fixture.runs, fixture.artifacts = ready, pendingArtifacts
+		}
+	}
+
+	fixture.waitFor = time.Second
+	decision, err := resolveFixture(t, fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Reuse || decision.ReceiptRunID != 123 {
+		t.Fatalf("a receipt that arrived moments later was not waited for: %+v", decision)
+	}
+	if looks < 2 {
+		t.Fatalf("decided after %d look(s); it must re-check", looks)
+	}
+}
+
+// Waiting is only ever justified by evidence in flight. A refusal that can
+// never change must not spend the merge run's time.
+func TestResolveDoesNotWaitOnASettledRefusal(t *testing.T) {
+	restore := pollInterval
+	pollInterval = time.Hour // any wait at all would hang the test
+	defer func() { pollInterval = restore }()
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*resolveFixtureData)
+	}{
+		{name: "direct push to main", mutate: func(f *resolveFixtureData) { f.pulls = []map[string]any{} }},
+		{name: "the run failed", mutate: func(f *resolveFixtureData) {
+			run := f.runs["workflow_runs"].([]map[string]any)[0]
+			run["status"], run["conclusion"] = "completed", "failure"
+		}},
+		{name: "landed tree mismatch", mutate: func(f *resolveFixtureData) {
+			f.receipt.Checkout.Tree = strings.Repeat("8", 40)
+			f.rebuildArchive(t)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newResolveFixture(t)
+			tc.mutate(fixture)
+			fixture.waitFor = time.Hour
+			decision, err := resolveFixture(t, fixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.Reuse || decision.Pending {
+				t.Fatalf("decision = %+v", decision)
+			}
+		})
 	}
 }
