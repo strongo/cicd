@@ -1,11 +1,13 @@
 package go_ci_action
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1779,15 +1781,26 @@ func TestReleaseWorkflowWatchdogsReturnPromptlyAndKillTimeouts(t *testing.T) {
 			}
 			runParentExitWithBackgroundChild(t, workspace, watchdog, watchdogPIDs)
 
+			// This fixture deliberately ignores SIGTERM at two levels (the
+			// leader and a backgrounded grandchild) and has previously
+			// escaped as an orphaned, 100%-CPU process pair (observed
+			// 2026-08-31, PIDs 43481/43483, reparented to launchd, alive for
+			// ~7 days) when whatever ran this test was killed before its
+			// t.Cleanup could run. Launch the wrapper in its own OS process
+			// group so this test owns and can always reap the whole tree,
+			// not just the production watchdog's direct child.
 			timeoutProgram := strings.Join([]string{
 				"set +e",
 				watchdog,
-				`run_with_timeout 1 bash -c 'trap "" TERM; (trap "" TERM; while :; do :; done) & printf '%s\n' "$!" > "$CHILD_PID_FILE"; while :; do :; done'`,
+				`run_with_timeout 1 bash -c 'trap "" TERM; printf "%s\n" "$$" > "$PARENT_PID_FILE"; (trap "" TERM; while :; do :; done) & printf '%s\n' "$!" > "$CHILD_PID_FILE"; while :; do :; done'`,
 				"status=$?",
 				`printf 'status=%s\n' "$status"`,
 			}, "\n")
 			started := time.Now()
-			output, err := runBash(workspace, timeoutProgram, watchdogPIDs.environment())
+			output, wrapperPID, err := runBashInNewProcessGroup(workspace, timeoutProgram, watchdogPIDs.environment())
+			if wrapperPID > 0 {
+				t.Cleanup(func() { killProcessGroup(wrapperPID) })
+			}
 			elapsed := time.Since(started)
 			if err != nil {
 				t.Fatalf("timed command: %v\n%s", err, output)
@@ -1798,8 +1811,20 @@ func TestReleaseWorkflowWatchdogsReturnPromptlyAndKillTimeouts(t *testing.T) {
 			if !strings.HasPrefix(string(output), "status=") || string(output) == "status=0\n" {
 				t.Fatalf("timed command must be killed, got %q", output)
 			}
+			parentPID := readPID(t, watchdogPIDs.parentPIDFile)
 			childPID := readPID(t, watchdogPIDs.childPIDFile)
-			t.Cleanup(func() { killProcess(childPID) })
+			t.Cleanup(func() {
+				// Kill by process group first (parentPID is the job's own
+				// pgid leader under `set -m`), then fall back to killing
+				// each PID directly so neither survives even if the group
+				// kill fails for some reason.
+				killProcessGroup(parentPID)
+				killProcess(parentPID)
+				killProcess(childPID)
+			})
+			if processIsAlive(parentPID) {
+				t.Fatalf("timed command's own leader process %d survived the process-group kill", parentPID)
+			}
 			if processIsAlive(childPID) {
 				t.Fatalf("timed command's child process %d survived the process-group kill", childPID)
 			}
@@ -1881,6 +1906,7 @@ type watchdogHarness struct {
 	pythonPIDFile string
 	sleepPIDFile  string
 	childPIDFile  string
+	parentPIDFile string
 	readyFile     string
 	realPython    string
 }
@@ -1896,6 +1922,7 @@ func watchdogProcessHarness(t *testing.T, workspace string) watchdogHarness {
 		pythonPIDFile: filepath.Join(workspace, "python-pids"),
 		sleepPIDFile:  filepath.Join(workspace, "sleep-pids"),
 		childPIDFile:  filepath.Join(workspace, "child-pid"),
+		parentPIDFile: filepath.Join(workspace, "parent-pid"),
 		readyFile:     filepath.Join(workspace, "watchdog-ready"),
 		realPython:    realPython,
 	}
@@ -1916,6 +1943,7 @@ func (h watchdogHarness) environment() map[string]string {
 		"CICD_SLEEP_PID_FILE":      h.sleepPIDFile,
 		"CICD_WATCHDOG_READY_FILE": h.readyFile,
 		"CHILD_PID_FILE":           h.childPIDFile,
+		"PARENT_PID_FILE":          h.parentPIDFile,
 	}
 }
 
@@ -1976,6 +2004,16 @@ func processIsAlive(pid int) bool {
 
 func killProcess(pid int) {
 	_ = exec.Command("kill", "-KILL", fmt.Sprint(pid)).Run()
+}
+
+// killProcessGroup sends SIGKILL to the process GROUP led by pid (i.e. all
+// processes sharing that pgid), not just pid itself. Best-effort: a missing
+// group is not an error, it means everything already exited.
+func killProcessGroup(pid int) {
+	if pid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
 func releaseWorkflowRunBlock(t *testing.T, stepName string) string {
@@ -2069,6 +2107,32 @@ func runBash(dir, program string, variables map[string]string) ([]byte, error) {
 		command.Env = append(command.Env, key+"="+value)
 	}
 	return command.CombinedOutput()
+}
+
+// runBashInNewProcessGroup runs program like runBash, except the wrapper
+// bash process (and, without an intervening `set -m`, everything it
+// backgrounds) is placed in a fresh OS process group instead of inheriting
+// this test binary's own group. It returns that wrapper's PID (0 if it
+// never started) so the caller can reap the whole group with
+// killProcessGroup even if this test process itself is killed before its
+// own t.Cleanup would otherwise run.
+func runBashInNewProcessGroup(dir, program string, variables map[string]string) ([]byte, int, error) {
+	command := exec.Command("bash", "-c", program)
+	command.Dir = dir
+	command.Env = os.Environ()
+	for key, value := range variables {
+		command.Env = append(command.Env, key+"="+value)
+	}
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var combined bytes.Buffer
+	command.Stdout = &combined
+	command.Stderr = &combined
+	if err := command.Start(); err != nil {
+		return nil, 0, err
+	}
+	pid := command.Process.Pid
+	err := command.Wait()
+	return combined.Bytes(), pid, err
 }
 
 func githubOutput(t *testing.T, outputFile, key string) string {

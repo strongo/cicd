@@ -1270,6 +1270,10 @@ jobs:
               done
               if process_group_exists "$cmd_pid"; then
                 kill -KILL -- "-$cmd_pid" 2>/dev/null
+                local kill_deadline=$((SECONDS + 2))
+                while process_group_exists "$cmd_pid" && [ "$SECONDS" -lt "$kill_deadline" ]; do
+                  sleep 0.05
+                done
               fi
             fi
             kill "$watchdog_pid" 2>/dev/null
