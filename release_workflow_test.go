@@ -1765,7 +1765,17 @@ func TestPublishedArtifactWorkflowIsReadOnlyAndNonPublishing(t *testing.T) {
 	if strings.Contains(releaseWorkflow, "existing_artifact_tag") {
 		t.Fatal("write-capable release workflow must not expose historical validation mode")
 	}
-	if !strings.Contains(releaseWorkflow, "contents: write   # required for GoReleaser to push GitHub releases") {
+	// The `release` job no longer declares its own permissions. A called
+	// workflow's job-level permissions NARROW the caller's grant, which
+	// silently dropped `actions: read` on private consumers the day
+	// require_workflow_success shipped -- see
+	// TestReleaseJobDoesNotNarrowTheCallersPermissions. Write capability is
+	// now the caller's grant, so the assertion moves from "this file declares
+	// it" to "this file still REQUIRES it, in writing, and is not read-only".
+	if !strings.Contains(releaseWorkflow, "GoReleaser needs to push releases") {
+		t.Fatal("release workflow must still state that its callers grant contents: write for GoReleaser")
+	}
+	if !strings.Contains(releaseWorkflow, "contents: write") {
 		t.Fatal("normal release workflow lost its required write permission")
 	}
 }
@@ -2397,4 +2407,48 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 			t.Fatalf("failure must report the timeout:\n%s", out)
 		}
 	})
+}
+
+// The release job must NOT re-declare a permissions block. A called workflow's
+// job-level permissions NARROW the caller's grant rather than adding to it, so
+// re-declaring `contents: write` here throws away every other scope a caller
+// passed in.
+//
+// That is not hypothetical. It shipped broken in v1.18.0: require_workflow_success
+// needs `actions: read` to read another workflow's runs, callers granted it, and
+// this job's own permissions block discarded it. Public repositories hid the bug
+// entirely, because reading a public repo's Actions API needs no actions scope —
+// so it failed only on private consumers, after release.
+func TestReleaseJobDoesNotNarrowTheCallersPermissions(t *testing.T) {
+	workflow := readReleaseWorkflow(t)
+
+	start := strings.Index(workflow, "\n  release:\n")
+	if start < 0 {
+		t.Fatal("release workflow must contain an inspectable release job")
+	}
+	end := strings.Index(workflow[start+1:], "\n  macos_verify_and_promote:\n")
+	if end < 0 {
+		t.Fatal("release job must be followed by macos_verify_and_promote")
+	}
+	job := workflow[start : start+1+end]
+
+	// Only the job's OWN permissions matter; steps may of course mention the word.
+	for _, line := range strings.Split(job, "\n") {
+		if strings.TrimRight(line, " ") == "    permissions:" {
+			t.Fatal("the release job must not declare its own permissions: a called " +
+				"workflow's job-level permissions narrow the caller's grant, which " +
+				"silently drops scopes such as actions: read that the guard needs")
+		}
+	}
+
+	// The guard must still explain that requirement to callers, since it is now
+	// entirely their job to grant it.
+	for _, required := range []string{
+		"actions: read",
+		"Missing actions:read permission",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("release workflow must still document the caller's actions:read requirement, missing %q", required)
+		}
+	}
 }

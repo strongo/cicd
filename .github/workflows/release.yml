@@ -354,8 +354,19 @@ jobs:
     # promote below verifies the real published bytes and gates PUBLIC
     # visibility, not this job's build. See the comment on that job.
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # required for GoReleaser to push GitHub releases
+    # No `permissions:` block, deliberately. A called workflow's job-level
+    # permissions NARROW what the caller granted, they do not add to it, so
+    # re-declaring `contents: write` here silently dropped every OTHER scope a
+    # caller passed in. That broke require_workflow_success on private repos
+    # the day it shipped: the guard needs `actions: read` to see another
+    # workflow's runs, callers granted it, and this block threw it away. Public
+    # repos hid the bug, because reading a public repo's Actions API needs no
+    # actions scope at all.
+    #
+    # Omitting the block means the job runs with exactly what the caller's job
+    # granted. Every caller already declares `contents: write` there, which
+    # GoReleaser needs to push releases, so this is what they had before.
+    # Callers wanting the release gate add `actions: read` alongside it.
     outputs:
       tag: ${{ steps.tag.outputs.new_tag }}
       # JSON list of {owner, name, branch, pre_sha, post_sha} for each
