@@ -291,6 +291,44 @@ on:
           certificate plus App Store Connect API credentials wired into the
           release job — see the "macOS notarization" section of this repo's
           README), to make that guarantee binding going forward.
+      require_workflow_success:
+        type: string
+        required: false
+        default: ''
+        description: >-
+          Name of a workflow in the CALLING repository that must have
+          concluded successfully for this exact commit before anything is
+          tagged or published. Matches the workflow's `name:` (e.g.
+          'Go CI'), not its filename. Empty (the default) keeps today's
+          behaviour: the release runs regardless of any other workflow.
+
+          Release is a separate workflow from the quality gates and is
+          triggered by the same push, so nothing makes it observe them.
+          That is not theoretical: datatug/datatug-cli published v0.13.2
+          from a commit whose `go build ./...` was red, and those binaries
+          shipped against the wrong dependency major. Set this to the
+          quality workflow's name to make a red suite block the tag.
+
+          The guard waits for that workflow, since it usually starts on the
+          same push as this one. A commit for which the workflow produced
+          no run at all (its `paths:` filters excluded it) passes with a
+          notice. A name matching no workflow in the repository FAILS, so a
+          typo can never quietly disable the gate. The most recent run for
+          the commit decides, so re-running a red suite can clear it.
+
+          Reading another workflow's result needs the `actions: read`
+          permission on the job that calls this workflow. Public
+          repositories already allow it; private ones must add it next to
+          `contents: write`.
+      require_workflow_success_timeout_seconds:
+        type: number
+        required: false
+        default: 1800
+        description: >-
+          How long to wait for `require_workflow_success` to finish before
+          giving up and failing the release. Ignored when that input is
+          empty. Raise it for repositories whose suite runs longer than the
+          30-minute default.
     outputs:
       tag:
         description: >-
@@ -356,6 +394,103 @@ jobs:
             echo "::error::MACOS_SIGN_P12 is set but require_notarized_macos is false; refusing to tag or publish without the macOS verify-and-promote gate active. Set require_notarized_macos: true."
             exit 1
           fi
+
+      # This workflow is a SIBLING of the caller's quality workflows, not a
+      # dependant: the same push starts both, and GitHub gives us no
+      # cross-workflow `needs:`. So a red test suite cannot stop a release on
+      # its own. datatug/datatug-cli published v0.13.2 from a commit whose
+      # `go build ./...` was red, and the binaries shipped against the wrong
+      # dependency major. When the caller names a required workflow, observe
+      # it here and refuse BEFORE the tag step below mutates anything.
+      #
+      # Fails closed on a red, cancelled or timed-out run, and on a name that
+      # matches no workflow — a guard that quietly no-ops is worse than none,
+      # which is why the moving @v1 tag was retired. Passes when the required
+      # workflow legitimately produced no run for this commit, so a
+      # paths-filtered docs merge still releases.
+      - name: Require the caller's quality workflow to be green before tagging
+        if: ${{ inputs.require_workflow_success != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          WF_NAME: ${{ inputs.require_workflow_success }}
+          TIMEOUT: ${{ inputs.require_workflow_success_timeout_seconds }}
+        run: |
+          set -euo pipefail
+          GRACE=180
+          POLL=15
+
+          # Resolve the workflow by its `name:`. A 403 here means the caller
+          # opted in without granting `actions: read`; say so, rather than
+          # reporting the workflow as missing.
+          if ! workflows="$(gh api "repos/$REPO/actions/workflows" --paginate \
+                --jq '.workflows[] | "\(.id)\t\(.name)"' 2>./wf_err)"; then
+            if grep -qiE '403|not accessible|Resource not accessible' ./wf_err; then
+              echo "::error title=Missing actions:read permission::require_workflow_success is set, but this job cannot read workflow runs in $REPO. Add 'actions: read' to the permissions of the job that calls this workflow."
+            else
+              echo "::error title=Cannot list workflows::Failed to read workflows in $REPO:"
+              cat ./wf_err
+            fi
+            rm -f ./wf_err
+            exit 1
+          fi
+          rm -f ./wf_err
+
+          wf_id="$(printf '%s\n' "$workflows" | awk -F'\t' -v n="$WF_NAME" '$2 == n {print $1; exit}')"
+          if [ -z "$wf_id" ]; then
+            echo "::error title=Unknown required workflow::No workflow named '$WF_NAME' exists in $REPO. require_workflow_success matches a workflow's 'name:', not its filename. Available:"
+            printf '%s\n' "$workflows" | awk -F'\t' '{print "  " $2}'
+            exit 1
+          fi
+          echo "required workflow '$WF_NAME' resolved to id $wf_id"
+
+          runs_for_sha() {
+            gh api "repos/$REPO/actions/workflows/$wf_id/runs?head_sha=$SHA&per_page=100" \
+              --jq '[.workflow_runs[] | {id, status, conclusion, created_at, html_url}]
+                    | sort_by(.created_at) | reverse'
+          }
+
+          # The required workflow is usually triggered by the same push as this
+          # release, so its run may not be registered yet. Wait that race out
+          # before concluding it simply does not apply to this commit.
+          waited=0
+          while :; do
+            runs="$(runs_for_sha)"
+            [ "$(printf '%s' "$runs" | jq 'length')" -gt 0 ] && break
+            if [ "$waited" -ge "$GRACE" ]; then
+              echo "::notice title=Required workflow did not run::'$WF_NAME' produced no run for $SHA within ${GRACE}s, so it does not apply to this commit (paths filters). Continuing."
+              exit 0
+            fi
+            sleep "$POLL"; waited=$((waited + POLL))
+          done
+
+          # Newest run wins, so re-running a red suite can clear this gate.
+          run_id="$(printf '%s' "$runs" | jq -r '.[0].id')"
+          run_url="$(printf '%s' "$runs" | jq -r '.[0].html_url')"
+          echo "gating this release on $run_url"
+
+          waited=0
+          while :; do
+            read -r status conclusion <<<"$(gh api "repos/$REPO/actions/runs/$run_id" --jq '"\(.status) \(.conclusion // "-")"')"
+            if [ "$status" = "completed" ]; then
+              case "$conclusion" in
+                success|skipped)
+                  echo "::notice title=Required workflow green::'$WF_NAME' concluded $conclusion for $SHA."
+                  exit 0 ;;
+                *)
+                  echo "::error title=Required workflow not green::'$WF_NAME' concluded '$conclusion' for $SHA; refusing to tag or publish. See $run_url"
+                  exit 1 ;;
+              esac
+            fi
+            if [ "$waited" -ge "$TIMEOUT" ]; then
+              echo "::error title=Required workflow timed out::'$WF_NAME' was still '$status' for $SHA after ${TIMEOUT}s; refusing to tag or publish. See $run_url"
+              exit 1
+            fi
+            echo "  '$WF_NAME' is $status; waited ${waited}s of ${TIMEOUT}s"
+            sleep "$POLL"; waited=$((waited + POLL))
+          done
 
       # Authenticate private-module fetches (GoReleaser's `go mod tidy` hook runs
       # BEFORE the build and will fail to reach private deps otherwise). No-op for
