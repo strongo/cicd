@@ -2452,3 +2452,79 @@ func TestReleaseJobDoesNotNarrowTheCallersPermissions(t *testing.T) {
 		}
 	}
 }
+
+// require_workflow_success accepts several workflow names, comma-separated,
+// and EVERY one must be green. A repository with more than one quality
+// workflow that could only name a single one would leave the others free to
+// be red while the release proceeded.
+func TestReleaseWorkflowGatesOnEveryNamedWorkflow(t *testing.T) {
+	script := releaseWorkflowRunBlock(t,
+		"Require the caller's quality workflow to be green before tagging")
+
+	// Stub `gh`: two workflows exist; each run's conclusion is keyed by id, so
+	// one can be green while the other is red.
+	stub := func(t *testing.T, greenID, redID string) string {
+		t.Helper()
+		dir := t.TempDir()
+		runs := func(id string) string {
+			return `[{"id":` + id + `,"status":"completed","conclusion":"x",` +
+				`"created_at":"2026-09-09T07:49:09Z","html_url":"https://example.test/run/` + id + `"}]`
+		}
+		body := "#!/usr/bin/env bash\nprev=\"\"\nfor arg in \"$@\"; do\n" +
+			"  case \"$arg\" in\n" +
+			"    repos/*/actions/workflows) printf '11\\tAlpha CI\\n22\\tBeta CI\\n'; exit 0 ;;\n" +
+			"    repos/*/actions/workflows/11/runs*) cat <<'J'\n" + runs("111") + "\nJ\n exit 0 ;;\n" +
+			"    repos/*/actions/workflows/22/runs*) cat <<'J'\n" + runs("222") + "\nJ\n exit 0 ;;\n" +
+			"    repos/*/actions/runs/" + greenID + ") echo 'completed success'; exit 0 ;;\n" +
+			"    repos/*/actions/runs/" + redID + ") echo 'completed failure'; exit 0 ;;\n" +
+			"  esac\ndone\nexit 1\n"
+		if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	env := map[string]string{
+		"GH_TOKEN": "stub", "REPO": "acme/widget",
+		"SHA":     "a913de4fd6455e35d2cf9b4f54c4bb5ed36bb4fe",
+		"WF_NAME": "Alpha CI, Beta CI", "TIMEOUT": "1",
+	}
+
+	t.Run("every named workflow green passes", func(t *testing.T) {
+		dir := stub(t, "111", "999") // 222 unmatched would exit 1, so make both green
+		body, err := os.ReadFile(filepath.Join(dir, "gh"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Make the second run green too.
+		green := strings.Replace(string(body), "repos/*/actions/runs/999", "repos/*/actions/runs/222", 1)
+		green = strings.Replace(green, "echo 'completed failure'", "echo 'completed success'", 1)
+		if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(green), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env); err != nil {
+			t.Fatalf("all-green must pass: %v\n%s", err, out)
+		}
+	})
+
+	// The whole point: a second named workflow being red must block, even
+	// though the first one passed.
+	t.Run("one red among several blocks and names it", func(t *testing.T) {
+		dir := stub(t, "111", "222") // Alpha green, Beta red
+		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env)
+		if err == nil {
+			t.Fatalf("a red workflow among several must fail the release:\n%s", out)
+		}
+		text := string(out)
+		if !strings.Contains(text, "'Beta CI'") {
+			t.Fatalf("failure must name the workflow that was not green:\n%s", text)
+		}
+		if !strings.Contains(text, "Refusing to release") {
+			t.Fatalf("failure must say the release is refused:\n%s", text)
+		}
+		// It must not stop at the first name: the green one is still reported,
+		// so one run shows the whole picture.
+		if !strings.Contains(text, "'Alpha CI' concluded success") {
+			t.Fatalf("every named workflow must be checked, not just up to the first failure:\n%s", text)
+		}
+	})
+}

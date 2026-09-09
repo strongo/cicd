@@ -318,6 +318,8 @@ jobs:
     uses: strongo/cicd/.github/workflows/release.yml@v1.18.0
     with:
       require_workflow_success: 'Go CI'   # the workflow's `name:`, not its filename
+      # Several, comma-separated, are allowed and ALL must be green:
+      #   require_workflow_success: 'Go CI, Integration tests'
       # require_workflow_success_timeout_seconds: 1800   # optional, default 30 min
 ```
 
@@ -329,6 +331,7 @@ Behaviour, all of it fail-closed:
 | Concluded `failure`, `cancelled`, `timed_out` | **refused before any tag is cut** |
 | Still running | waited for, then refused on timeout |
 | Name matches no workflow in the repo | **refused** — a typo must not quietly disable the gate |
+| Several workflows named, any one not green | **refused**, and the error names every one that was not green |
 | Workflow produced no run for this commit (`paths:` filtered it out) | proceeds, with a notice |
 
 The guard waits, because your quality workflow usually starts on the same push
