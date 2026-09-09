@@ -2284,3 +2284,117 @@ func githubOutput(t *testing.T, outputFile, key string) string {
 	t.Fatalf("%s missing from GITHUB_OUTPUT:\n%s", key, output)
 	return ""
 }
+
+// A release must not be able to publish from a commit whose quality workflow
+// went red. Release is a SIBLING workflow of those gates, started by the same
+// push, so GitHub offers no cross-workflow `needs:` and nothing makes this
+// workflow observe them. datatug/datatug-cli published v0.13.2 from a commit
+// whose `go build ./...` was red; the binaries shipped against go-github v90
+// while go.mod declared v91. The `require_workflow_success` guard closes that,
+// opt-in, and these subtests exercise the real script against a stubbed `gh`.
+func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testing.T) {
+	const stepName = "Require the caller's quality workflow to be green before tagging"
+	script := releaseWorkflowRunBlock(t, stepName)
+	workflow := readReleaseWorkflow(t)
+
+	// Opt-in: an unset input must leave every existing consumer untouched.
+	if !strings.Contains(workflow, "if: ${{ inputs.require_workflow_success != '' }}") {
+		t.Fatal("the required-workflow guard must be skipped when require_workflow_success is empty")
+	}
+	// It must refuse BEFORE anything is mutated, exactly like the signing guard.
+	guardIndex := strings.Index(workflow, stepName)
+	tagIndex := strings.Index(workflow, "Determine and push guarded tag")
+	if guardIndex < 0 || tagIndex < 0 || guardIndex > tagIndex {
+		t.Fatal("the required-workflow guard must run before the guarded tag step")
+	}
+
+	// Stub `gh` so the script's two API shapes are answered from fixtures:
+	// the workflow listing, then a run listing and a single-run lookup.
+	stub := func(t *testing.T, runsJSON, runStatus string) string {
+		t.Helper()
+		dir := t.TempDir()
+		gh := filepath.Join(dir, "gh")
+		script := "#!/usr/bin/env bash\nfor arg in \"$@\"; do\n" +
+			"  case \"$arg\" in\n" +
+			"    repos/*/actions/workflows) echo '181342652\tGo CI'; echo '220477002\tRelease'; exit 0 ;;\n" +
+			"    repos/*/actions/workflows/*/runs*) cat <<'JSON'\n" + runsJSON + "\nJSON\n exit 0 ;;\n" +
+			"    repos/*/actions/runs/*) echo '" + runStatus + "'; exit 0 ;;\n" +
+			"  esac\ndone\nexit 1\n"
+		if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	const oneRun = `[{"id":1,"status":"completed","conclusion":"x","created_at":"2026-09-09T07:49:09Z","html_url":"https://example.test/run/1"}]`
+
+	env := func(extra map[string]string) map[string]string {
+		base := map[string]string{
+			"GH_TOKEN": "stub", "REPO": "datatug/datatug-cli",
+			"SHA":     "a913de4fd6455e35d2cf9b4f54c4bb5ed36bb4fe",
+			"WF_NAME": "Go CI", "TIMEOUT": "1",
+		}
+		for k, v := range extra {
+			base[k] = v
+		}
+		return base
+	}
+
+	t.Run("red required workflow blocks the release", func(t *testing.T) {
+		dir := stub(t, oneRun, "completed failure")
+		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env(nil))
+		if err == nil {
+			t.Fatalf("a red required workflow must fail the release, got success:\n%s", out)
+		}
+		if !strings.Contains(string(out), "refusing to tag or publish") {
+			t.Fatalf("failure must say the release is refused:\n%s", out)
+		}
+	})
+
+	t.Run("green required workflow allows the release", func(t *testing.T) {
+		dir := stub(t, oneRun, "completed success")
+		if out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env(nil)); err != nil {
+			t.Fatalf("a green required workflow must not block the release: %v\n%s", err, out)
+		}
+	})
+
+	// A guard that quietly does nothing is worse than no guard: that is how
+	// the moving @v1 tag let require_notarized_macos no-op. A name matching
+	// no workflow is a typo, not a pass.
+	t.Run("unknown workflow name fails loudly instead of no-oping", func(t *testing.T) {
+		dir := stub(t, oneRun, "completed success")
+		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env(map[string]string{"WF_NAME": "Go-CI"}))
+		if err == nil {
+			t.Fatalf("an unknown required workflow name must fail, got success:\n%s", out)
+		}
+		if !strings.Contains(string(out), "Unknown required workflow") {
+			t.Fatalf("failure must name the misconfiguration:\n%s", out)
+		}
+	})
+
+	// A docs-only merge filtered out by the required workflow's `paths:` must
+	// still be releasable, or this guard would red every such release.
+	t.Run("a commit the required workflow never ran for still releases", func(t *testing.T) {
+		dir := stub(t, `[]`, "completed success")
+		out, err := runBash(dir, "GRACE_OVERRIDE=1\nPATH="+dir+":$PATH\n"+
+			strings.Replace(script, "GRACE=180", "GRACE=0", 1), env(nil))
+		if err != nil {
+			t.Fatalf("a commit with no run for the required workflow must not block: %v\n%s", err, out)
+		}
+		if !strings.Contains(string(out), "does not apply to this commit") {
+			t.Fatalf("the pass must be explained as not applicable:\n%s", out)
+		}
+	})
+
+	// Still running when the budget runs out is not a pass.
+	t.Run("a required workflow that never finishes blocks the release", func(t *testing.T) {
+		dir := stub(t, oneRun, "in_progress -")
+		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+
+			strings.Replace(script, "POLL=15", "POLL=1", 1), env(nil))
+		if err == nil {
+			t.Fatalf("an unfinished required workflow must fail the release, got success:\n%s", out)
+		}
+		if !strings.Contains(string(out), "timed out") {
+			t.Fatalf("failure must report the timeout:\n%s", out)
+		}
+	})
+}

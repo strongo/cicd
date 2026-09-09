@@ -294,6 +294,53 @@ macOS signing (`xcrun`/`codesign`) — cannot run here. Keep them as a small
 per-repo job (`needs:` this one) and add `--skip=chocolatey,snapcraft` via
 `goreleaser_extra_args` so this job doesn't try to run them.
 
+## Gate the release on your quality workflow (`require_workflow_success`)
+
+**The incident this exists for (2026-09):** `datatug-cli` published `v0.13.2`
+from a commit whose `go build ./...` was red. Two Renovate pull requests for
+the same `go-github` v90→v91 bump interleaved, leaving `go.mod` requiring v91
+while every source file still imported v90. `Go CI` went red and said so. The
+release shipped six binaries and a Homebrew cask anyway, because
+GoReleaser's `go mod tidy` before-hook silently re-added v90 in the runner. The
+published binaries were built against **v90** while the tagged `go.mod`
+declared **v91**.
+
+`release.yml` is a **sibling** of your quality workflows, not a dependant. The
+same push starts both, and GitHub has no cross-workflow `needs:`, so a red test
+suite cannot stop a release by itself. Name the workflow that must be green:
+
+```yaml
+jobs:
+  release:
+    permissions:
+      contents: write
+      actions: read          # required: this reads another workflow's result
+    uses: strongo/cicd/.github/workflows/release.yml@v1.18.0
+    with:
+      require_workflow_success: 'Go CI'   # the workflow's `name:`, not its filename
+      # require_workflow_success_timeout_seconds: 1800   # optional, default 30 min
+```
+
+Behaviour, all of it fail-closed:
+
+| Situation | Result |
+|---|---|
+| Required workflow concluded `success` (or `skipped`) | release proceeds |
+| Concluded `failure`, `cancelled`, `timed_out` | **refused before any tag is cut** |
+| Still running | waited for, then refused on timeout |
+| Name matches no workflow in the repo | **refused** — a typo must not quietly disable the gate |
+| Workflow produced no run for this commit (`paths:` filtered it out) | proceeds, with a notice |
+
+The guard waits, because your quality workflow usually starts on the same push
+as the release. The newest run for the commit decides, so re-running a red
+suite can clear the gate. Leaving the input unset keeps the previous
+behaviour exactly.
+
+Note the `actions: read` permission. A reusable workflow cannot grant itself
+more than its caller allows, so it must be added on **your** calling job. Public
+repositories already permit the read; private ones fail closed with a message
+naming this line.
+
 ## Post-release artifact smoke test
 
 **The incident this exists for (2026-07):** `specscore-cli` v0.24.0 released
