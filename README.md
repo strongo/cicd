@@ -624,6 +624,32 @@ after the `extends`.
 
 ## Automatic version tagging
 
+### Conventional pull request title gate
+
+Release-producing repositories that squash merge can enforce a conventional
+pull request title in the required `Lint` job:
+
+```yaml
+jobs:
+  strongo_workflow:
+    uses: strongo/cicd/.github/workflows/workflow.yml@v1.20.0
+    with:
+      require_conventional_pr_title: true
+```
+
+The input defaults to `false` so adopting a new shared-workflow version does not
+silently change an existing repository's merge policy. When enabled, pull
+request titles must use
+`<type>(<optional-scope>)<optional-!>: <description>`. The failure names the
+invalid title, accepted types and examples, explains the release consequence,
+and prints an exact `gh pr edit` command. Pushes to `main` and tag workflows are
+unchanged.
+
+Use `fix:`, `feat:`, `perf:`, or a breaking `!` type when a runtime change must
+produce a release. Syntactically valid `docs:`, `chore:`, `ci:`, `test:`, or
+`refactor:` changes may intentionally produce no release when `default_bump` is
+`false`.
+
 On a push/merge to `main`, the `go_bump` job (workflow) / tag step (action) uses
 [git-cliff] to calculate a new SemVer version from **conventional commits since
 the last matching tag**. The shared workflow then applies its guard and pushes

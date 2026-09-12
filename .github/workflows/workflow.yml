@@ -143,6 +143,15 @@ on:
           messages (no release for docs/chore/ci-only changes).
         required: false
         default: 'patch'
+      require_conventional_pr_title:
+        type: boolean
+        description: >-
+          Require pull request titles to use Conventional Commits syntax. This
+          protects squash-merge release history because GitHub uses the pull
+          request title as the landed commit subject. Disabled by default for a
+          migration-safe rollout; release-producing repositories should enable it.
+        required: false
+        default: false
       build_command:
         type: string
         description: >-
@@ -246,6 +255,7 @@ env:
   CI_POLICY_ALLOW_MAJOR_VERSION_BUMP: ${{ inputs.allow_major_version_bump }}
   CI_POLICY_GO_VERSION: ${{ inputs.go_version }}
   CI_POLICY_DEFAULT_BUMP: ${{ inputs.default_bump }}
+  CI_POLICY_REQUIRE_CONVENTIONAL_PR_TITLE: ${{ inputs.require_conventional_pr_title }}
   CI_POLICY_BUILD_COMMAND: ${{ inputs.build_command }}
   CI_POLICY_ARTIFACT_NAME: ${{ inputs.artifact_name }}
   CI_POLICY_ARTIFACT_PATH: ${{ inputs.artifact_path }}
@@ -312,6 +322,51 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Validate conventional pull request title
+        if: ${{ inputs.require_conventional_pr_title && github.event_name == 'pull_request' }}
+        shell: bash
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DEFAULT_BUMP: ${{ inputs.default_bump }}
+        run: |
+          set -euo pipefail
+
+          pattern='^(feat|fix|perf|refactor|docs|ci|chore|test|build|revert)(\([a-z0-9]+([._/-][a-z0-9]+)*\))?(!)?: [^[:space:]](.*[^[:space:]])?$'
+          if [[ "$PR_TITLE" =~ $pattern ]]; then
+            exit 0
+          fi
+
+          echo "::error title=Invalid pull request title::Pull request #${PR_NUMBER} must use Conventional Commits syntax before it can merge."
+          printf 'Invalid title: %q\n' "$PR_TITLE" >&2
+          cat >&2 <<EOF
+
+          Expected format:
+            <type>(<optional-scope>)<optional-!>: <description>
+
+          Allowed types:
+            feat, fix, perf, refactor, docs, ci, chore, test, build, revert
+
+          Valid examples:
+            fix(cli): preserve ACL blockers
+            feat(auth): add principal bindings
+            feat(auth)!: replace legacy principal identifiers
+
+          How to fix this pull request:
+            gh pr edit ${PR_NUMBER} --repo ${GITHUB_REPOSITORY} --title "fix(scope): describe the change"
+
+          Choose a type that describes the result. For a runtime change that
+          must publish a release, use fix:, feat:, perf:, or a breaking ! type.
+          With default_bump=${DEFAULT_BUMP}, docs:, chore:, ci:, test:, and
+          refactor: may intentionally produce no release.
+
+          Why this is required:
+            A squash merge uses the pull request title as the commit subject.
+            Release automation reads that subject; an unrecognized title can
+            make an otherwise successful runtime merge publish no version.
+          EOF
+          exit 1
 
       - name: Install Go
         uses: actions/setup-go@v7

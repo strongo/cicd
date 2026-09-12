@@ -287,7 +287,7 @@ func writeFixtureJSON(t *testing.T, response http.ResponseWriter, value any) {
 
 func setMinimumPolicyEnvironment(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{"CI_POLICY_CODE_COVERAGE", "CI_POLICY_DISABLE_VERSION_BUMPING", "CI_POLICY_INSTALL_FIREBASE_TOOLS", "CI_POLICY_GOLANGCI_LINT_CACHE", "CI_POLICY_RUN_GORELEASER", "CI_POLICY_CGO_ENABLED", "CI_POLICY_ALLOW_MAJOR_VERSION_BUMP", "CI_POLICY_ARTIFACT_ON_MAIN_ONLY", "CI_POLICY_EXACT_TREE_VALIDATION_REUSE"} {
+	for _, name := range []string{"CI_POLICY_CODE_COVERAGE", "CI_POLICY_DISABLE_VERSION_BUMPING", "CI_POLICY_INSTALL_FIREBASE_TOOLS", "CI_POLICY_GOLANGCI_LINT_CACHE", "CI_POLICY_RUN_GORELEASER", "CI_POLICY_CGO_ENABLED", "CI_POLICY_ALLOW_MAJOR_VERSION_BUMP", "CI_POLICY_ARTIFACT_ON_MAIN_ONLY", "CI_POLICY_EXACT_TREE_VALIDATION_REUSE", "CI_POLICY_REQUIRE_CONVENTIONAL_PR_TITLE"} {
 		t.Setenv(name, "false")
 	}
 	for _, name := range []string{"CI_POLICY_GOLANGCI_LINT_CACHE_INVALIDATION_INTERVAL", "CI_POLICY_ARTIFACT_RETENTION_DAYS", "CI_POLICY_VALIDATION_RECEIPT_RETENTION_DAYS"} {
@@ -396,6 +396,37 @@ func TestPolicyValidatesOnMainUnlessExplicitlyDisabled(t *testing.T) {
 	}
 	if disabledDigest == unsetDigest {
 		t.Fatal("changing the main-validation policy must change the policy digest")
+	}
+}
+
+func TestPolicyDigestBindsConventionalPullRequestTitleRequirement(t *testing.T) {
+	setMinimumPolicyEnvironment(t)
+	disabled, err := PolicyFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.RequireConventionalPullRequestTitle {
+		t.Fatal("conventional pull request title validation must default to disabled")
+	}
+	disabledDigest, err := PolicyDigest(disabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("CI_POLICY_REQUIRE_CONVENTIONAL_PR_TITLE", "true")
+	enabled, err := PolicyFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enabled.RequireConventionalPullRequestTitle {
+		t.Fatal("explicit true must require conventional pull request titles")
+	}
+	enabledDigest, err := PolicyDigest(enabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabledDigest == disabledDigest {
+		t.Fatal("changing the title-validation policy must change the policy digest")
 	}
 }
 
