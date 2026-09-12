@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestGoCIWorkflowConventionalPullRequestTitleIsOptIn(t *testing.T) {
+func TestGoCIWorkflowConventionalPullRequestTitleIsEnabledByDefault(t *testing.T) {
 	workflow := readGoCIWorkflow(t)
 	inputStart := strings.Index(workflow, "\n      require_conventional_pr_title:\n")
 	if inputStart == -1 {
@@ -16,8 +16,8 @@ func TestGoCIWorkflowConventionalPullRequestTitleIsOptIn(t *testing.T) {
 		t.Fatal("title-validation input must be declared before build_command")
 	}
 	input := workflow[inputStart : inputStart+inputEnd]
-	if !strings.Contains(input, "type: boolean") || !strings.Contains(input, "default: false") {
-		t.Fatal("conventional title validation must remain opt-in for migration safety")
+	if !strings.Contains(input, "type: boolean") || !strings.Contains(input, "default: true") {
+		t.Fatal("conventional title validation must default to enabled and remain explicitly configurable")
 	}
 
 	for _, required := range []string{

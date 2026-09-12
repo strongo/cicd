@@ -148,10 +148,10 @@ on:
         description: >-
           Require pull request titles to use Conventional Commits syntax. This
           protects squash-merge release history because GitHub uses the pull
-          request title as the landed commit subject. Disabled by default for a
-          migration-safe rollout; release-producing repositories should enable it.
+          request title as the landed commit subject. Enabled by default; callers
+          with a different title policy can explicitly opt out.
         required: false
-        default: false
+        default: true
       build_command:
         type: string
         description: >-
