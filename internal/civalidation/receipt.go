@@ -42,6 +42,7 @@ type Policy struct {
 	AllowMajorVersionBump                 bool   `json:"allow_major_version_bump"`
 	GoVersion                             string `json:"go_version"`
 	DefaultBump                           string `json:"default_bump"`
+	RequireConventionalPullRequestTitle   bool   `json:"require_conventional_pr_title"`
 	BuildCommand                          string `json:"build_command"`
 	ArtifactName                          string `json:"artifact_name"`
 	ArtifactPath                          string `json:"artifact_path"`
@@ -156,6 +157,10 @@ func PolicyFromEnvironment() (Policy, error) {
 	if err != nil {
 		return Policy{}, err
 	}
+	requireConventionalPullRequestTitle, err := boolean("CI_POLICY_REQUIRE_CONVENTIONAL_PR_TITLE")
+	if err != nil {
+		return Policy{}, err
+	}
 	lintCacheDays, err := number("CI_POLICY_GOLANGCI_LINT_CACHE_INVALIDATION_INTERVAL")
 	if err != nil {
 		return Policy{}, err
@@ -198,6 +203,7 @@ func PolicyFromEnvironment() (Policy, error) {
 		AllowMajorVersionBump:                 allowMajor,
 		GoVersion:                             os.Getenv("CI_POLICY_GO_VERSION"),
 		DefaultBump:                           os.Getenv("CI_POLICY_DEFAULT_BUMP"),
+		RequireConventionalPullRequestTitle:   requireConventionalPullRequestTitle,
 		BuildCommand:                          os.Getenv("CI_POLICY_BUILD_COMMAND"),
 		ArtifactName:                          os.Getenv("CI_POLICY_ARTIFACT_NAME"),
 		ArtifactPath:                          os.Getenv("CI_POLICY_ARTIFACT_PATH"),
