@@ -626,24 +626,27 @@ after the `extends`.
 
 ### Conventional pull request title gate
 
-Release-producing repositories that squash merge can enforce a conventional
-pull request title in the required `Lint` job:
+The reusable workflow enforces a conventional pull request title in its
+required `Lint` job by default:
 
 ```yaml
 jobs:
   strongo_workflow:
-    uses: strongo/cicd/.github/workflows/workflow.yml@v1.20.0
-    with:
-      require_conventional_pr_title: true
+    uses: strongo/cicd/.github/workflows/workflow.yml@v1.20.1
 ```
 
-The input defaults to `false` so adopting a new shared-workflow version does not
-silently change an existing repository's merge policy. When enabled, pull
-request titles must use
+Pull request titles must use
 `<type>(<optional-scope>)<optional-!>: <description>`. The failure names the
 invalid title, accepted types and examples, explains the release consequence,
 and prints an exact `gh pr edit` command. Pushes to `main` and tag workflows are
 unchanged.
+
+Callers with a different title policy can explicitly opt out:
+
+```yaml
+    with:
+      require_conventional_pr_title: false
+```
 
 Use `fix:`, `feat:`, `perf:`, or a breaking `!` type when a runtime change must
 produce a release. Syntactically valid `docs:`, `chore:`, `ci:`, `test:`, or
