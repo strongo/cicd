@@ -872,7 +872,7 @@ jobs:
         name: Set up Java JRE 24
         uses: actions/setup-java@v6
         with:
-          java-version: '24'
+          java-version: '25'
           java-package: 'jre'
           distribution: 'temurin'
 
