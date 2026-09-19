@@ -1072,7 +1072,7 @@ jobs:
       - if: ${{ github.ref == 'refs/heads/main' }}
         id: bump_dry
         name: Compute next version from Git history
-        uses: orhun/git-cliff-action@v4.9.0
+        uses: orhun/git-cliff-action@v4.9.1
         with:
           version: v2.13.1
           config: ${{ runner.temp }}/cicd-git-cliff.toml
