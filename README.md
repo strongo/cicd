@@ -277,6 +277,7 @@ jobs:
     uses: strongo/cicd/.github/workflows/release.yml@v1.14.15
     with:
       go_version: '1.26.5'                 # optional; defaults to '1.26'
+      # node_version: '24.15.0'            # optional; sets up Node (corepack/pnpm come from it) before GoReleaser before-hooks; empty = runner's Node
       # goreleaser_extra_args: '--skip=chocolatey,snapcraft'  # optional
     secrets:
       GORELEASER_GITHUB_TOKEN: ${{ secrets.MY_GORELEASER_PAT }}   # brew/scoop/winget

@@ -107,6 +107,18 @@ on:
           1.27.0 (running go 1.26.5; GOTOOLCHAIN=local)".) Set to match your
           module's go.mod (e.g. '1.26.5') when a release needs a specific,
           older toolchain.
+      node_version:
+        type: string
+        required: false
+        default: ''
+        description: >-
+          Optional Node.js version for actions/setup-node, e.g. '24.15.0' or
+          '22.22.3'. When non-empty, Node is set up before GoReleaser runs, so
+          the consumer's .goreleaser.yaml before-hooks (e.g. `corepack enable
+          pnpm && pnpm build` for an embedded web app) use that Node, and
+          corepack/pnpm come from it (Node 24 and earlier bundle corepack; from
+          Node 25 the hook must install it). Leave empty (the default) to keep
+          whatever Node the runner image ships; no step is added.
       goreleaser_extra_args:
         type: string
         required: false
@@ -396,6 +408,14 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: ${{ inputs.go_version }}
+
+      # Optional: pin Node for the consumer's GoReleaser before-hooks (see the
+      # node_version input). No step runs when node_version is empty.
+      - name: Set up Node.js
+        if: ${{ inputs.node_version != '' }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node_version }}
 
       # A signing secret must never silently activate Quill in a release that
       # did not opt into the macOS verification-and-promotion gate below
