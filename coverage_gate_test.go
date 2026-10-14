@@ -20,6 +20,7 @@ const goCIWorkflowPath = ".github/workflows/workflow.yml"
 // synthetic `go tool cover -func` transcript, shadowing `go` so no real
 // coverage profile is required.
 func TestGoCIWorkflowCoverageGateIgnoresFunctionsNamedLikeTotal(t *testing.T) {
+	t.Parallel()
 	script := goCIWorkflowRunBlock(t, "Check test coverage")
 	extraction := scriptAssignmentLine(t, script, "total_coverage=")
 
@@ -55,6 +56,7 @@ func TestGoCIWorkflowCoverageGateIgnoresFunctionsNamedLikeTotal(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			transcriptPath := filepath.Join(dir, "cover-func.txt")
 			if err := os.WriteFile(transcriptPath, []byte(tc.transcript), 0o644); err != nil {
@@ -75,6 +77,78 @@ func TestGoCIWorkflowCoverageGateIgnoresFunctionsNamedLikeTotal(t *testing.T) {
 			}
 			if string(output) != tc.want {
 				t.Fatalf("total_coverage = %q, want %q", output, tc.want)
+			}
+		})
+	}
+}
+
+func TestGoCIWorkflowCoverageGateRequiresZeroUncoveredStatementsAt100Percent(t *testing.T) {
+	t.Parallel()
+	script := goCIWorkflowRunBlock(t, "Check test coverage")
+
+	for _, tc := range []struct {
+		name      string
+		minPct    string
+		totalLine string
+		profile   string
+		wantErr   bool
+	}{
+		{
+			name:      "100% gate fails when a rounded 100.0% profile still has an uncovered block",
+			minPct:    "100",
+			totalLine: "total:\t\t\t\t\t(statements)\t\t100.0%\n",
+			profile: strings.Join([]string{
+				"mode: set",
+				"github.com/x/y/foo.go:10.1,20.2 2500 1",
+				"github.com/x/y/foo.go:22.1,24.2 1 0",
+			}, "\n") + "\n",
+			wantErr: true,
+		},
+		{
+			name:      "100% gate passes when all positive statement blocks are covered across packages",
+			minPct:    "100",
+			totalLine: "total:\t\t\t\t\t(statements)\t\t100.0%\n",
+			profile: strings.Join([]string{
+				"mode: set",
+				"github.com/x/y/foo.go:10.1,20.2 10 0",
+				"github.com/x/y/foo.go:10.1,20.2 10 1",
+				"github.com/x/y/foo.go:22.1,24.2 0 0",
+			}, "\n") + "\n",
+			wantErr: false,
+		},
+		{
+			name:      "below-100% gate allows uncovered blocks as long as total meets floor",
+			minPct:    "90",
+			totalLine: "total:\t\t\t\t\t(statements)\t\t100.0%\n",
+			profile: strings.Join([]string{
+				"mode: set",
+				"github.com/x/y/foo.go:10.1,20.2 2500 1",
+				"github.com/x/y/foo.go:22.1,24.2 1 0",
+			}, "\n") + "\n",
+			wantErr: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "profile.cov"), []byte(tc.profile), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			transcriptPath := filepath.Join(dir, "cover-func.txt")
+			if err := os.WriteFile(transcriptPath, []byte(tc.totalLine), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			rendered := strings.ReplaceAll(script, "${{ inputs.min_test_coverage_percent }}", tc.minPct)
+			program := "go() {\n" +
+				"  if [ \"$1\" = tool ] && [ \"$2\" = cover ]; then cat \"$COVER_FUNC_TRANSCRIPT\"; fi\n" +
+				"}\n" +
+				rendered
+			output, err := runBash(dir, program, map[string]string{"COVER_FUNC_TRANSCRIPT": transcriptPath})
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected failure, got success:\n%s", output)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v\n%s", err, output)
 			}
 		})
 	}

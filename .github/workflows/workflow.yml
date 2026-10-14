@@ -933,6 +933,9 @@ jobs:
           total_coverage=$(go tool cover -func=profile.cov | awk '$1 == "total:" {print $3}' | sed 's/%//')
           echo "Total coverage: $total_coverage%"
           awk -v t="$total_coverage" -v m="${{ inputs.min_test_coverage_percent }}" 'BEGIN { if (t < m) { print "Coverage " t "% is below required " m "%"; exit 1 } }'
+          if awk -v m="${{ inputs.min_test_coverage_percent }}" 'BEGIN { exit !(m >= 100) }'; then
+            awk 'NR>1 && NF>=3 { b=$1; if (!(b in order)) { order[b]=++n; blocks[n]=b }; stmts[b]=$(NF-1)+0; hits[b]+=($NF+0) } END { for (i=1; i<=n; i++) { b=blocks[i]; if (stmts[b]>0 && hits[b]==0) { print b, stmts[b], 0; bad=1 } } if (bad) { print "100% coverage requires zero uncovered statements"; exit 1 } }' profile.cov
+          fi
 
       - if: ${{ needs.validation_reuse.outputs.reuse_valid != 'true' && inputs.min_test_coverage_percent != '' }}
         run: go tool cover -func=profile.cov | tail -n 1
