@@ -506,3 +506,31 @@ func TestResolveDoesNotWaitOnASettledRefusal(t *testing.T) {
 		})
 	}
 }
+
+func TestSecondaryInstallationIsBoundToPolicyReceipt(t *testing.T) {
+	setMinimumPolicyEnvironment(t)
+	first, err := PolicyFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := PolicyDigest(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CI_POLICY_GOPRIVATE_GITHUB_APP_SECONDARY_OWNER", "datatug")
+	t.Setenv("CI_POLICY_GOPRIVATE_GITHUB_APP_SECONDARY_REPOSITORIES", "datatug-core")
+	second, err := PolicyFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.GoPrivateGitHubAppSecondaryOwner != "datatug" || second.GoPrivateGitHubAppSecondaryRepositories != "datatug-core" {
+		t.Fatal("secondary policy inputs ignored")
+	}
+	changed, err := PolicyDigest(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == original {
+		t.Fatal("secondary installation did not change policy digest")
+	}
+}

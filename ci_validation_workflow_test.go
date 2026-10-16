@@ -182,7 +182,7 @@ func TestGoCIWorkflowMintsRepositoryScopedGitHubAppTokenPerJob(t *testing.T) {
 			t.Errorf("%s must not use prefix URL rewriting for private-module credentials", jobName)
 		}
 	}
-	if strings.Count(workflow, "uses: actions/create-github-app-token@v3") != 2 {
+	if strings.Count(workflow, "uses: actions/create-github-app-token@v3") != 4 {
 		t.Fatal("each parallel dependency-consuming job must mint its own short-lived token")
 	}
 }
@@ -400,4 +400,76 @@ func credentialPassword(tempDir, job, host, path string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func TestGoCISecondaryInstallationPreservesPrimaryExactCredentials(t *testing.T) {
+	workflow := readGoCIWorkflow(t)
+	for _, jobName := range []string{"go_lint", "go_test_build"} {
+		t.Run(jobName, func(t *testing.T) {
+			next := "go_test_build"
+			if jobName == next {
+				next = ""
+			}
+			job := workflowJob(t, workflow, jobName, next)
+			temp := t.TempDir()
+			env := map[string]string{"RUNNER_TEMP": temp, "GITHUB_ENV": filepath.Join(temp, "env"), "GITHUB_JOB": jobName, "PRIVATE_GIT_APP_TOKEN": "PRIMARY_TOKEN", "PRIVATE_GIT_APP_OWNER": "sneat-co", "PRIVATE_GIT_APP_REPOSITORIES": "private-one"}
+			primary := workflowStepRun(t, workflowStep(t, job, "Set scoped GitHub App access for GOPRIVATE", "Set secondary scoped GitHub App access for GOPRIVATE"))
+			secondary := workflowStepRun(t, workflowStep(t, job, "Set secondary scoped GitHub App access for GOPRIVATE", "Set GitHub access token for GOPRIVATE"))
+			if out, err := runWorkflowBash(primary, env); err != nil {
+				t.Fatalf("primary setup: %v %s", err, out)
+			}
+			env["PRIVATE_GIT_APP_TOKEN"] = "SECONDARY_TOKEN"
+			env["PRIVATE_GIT_APP_OWNER"] = "datatug"
+			env["PRIVATE_GIT_APP_REPOSITORIES"] = "datatug-core"
+			if out, err := runWorkflowBash(secondary, env); err != nil {
+				t.Fatalf("secondary setup: %v %s", err, out)
+			}
+			assertCredentialPassword(t, temp, jobName, "sneat-co/private-one", "PRIMARY_TOKEN")
+			assertCredentialPassword(t, temp, jobName, "datatug/datatug-core", "SECONDARY_TOKEN")
+			assertCredentialPassword(t, temp, jobName, "datatug/datatug-core.git", "SECONDARY_TOKEN")
+			assertNoCredential(t, temp, jobName, "datatug/datatug-core-tools")
+			assertNoCredential(t, temp, jobName, "other/datatug-core")
+			validate := workflowStepRun(t, workflowStep(t, job, "Validate secondary scoped GitHub App configuration", "Mint scoped GitHub App token for GOPRIVATE"))
+			for _, bad := range []string{"", ",", "other/repo", "repo\nrepositories=injected"} {
+				env["PRIVATE_GIT_APP_CLIENT_ID"] = "client"
+				env["PRIVATE_GIT_APP_PRIVATE_KEY"] = "test-key"
+				env["PRIVATE_GIT_APP_REPOSITORIES"] = bad
+				env["GITHUB_OUTPUT"] = filepath.Join(temp, "output")
+				if _, err := runWorkflowBash(validate, env); err == nil {
+					t.Fatalf("invalid secondary repos %q passed", bad)
+				}
+			}
+		})
+	}
+}
+
+func TestReleaseAppDependencyCredentialsRemainSeparateFromPublication(t *testing.T) {
+	workflow := readReleaseWorkflow(t)
+	validate := workflowStepRun(t, workflowStep(t, workflow, "Validate scoped GitHub App configuration", "Mint scoped GitHub App token for GOPRIVATE"))
+	temp := t.TempDir()
+	env := map[string]string{"PRIVATE_GIT_APP_CLIENT_ID": "client", "PRIVATE_GIT_APP_PRIVATE_KEY": "test-key", "PRIVATE_GIT_APP_OWNER": "datatug", "PRIVATE_GIT_APP_REPOSITORIES": " datatug-core,\n models ", "GITHUB_OUTPUT": filepath.Join(temp, "output")}
+	if out, err := runWorkflowBash(validate, env); err != nil {
+		t.Fatalf("valid release config: %v %s", err, out)
+	}
+	data, _ := os.ReadFile(env["GITHUB_OUTPUT"])
+	if string(data) != "repositories=datatug-core,models\n" {
+		t.Fatalf("normalized output %q", data)
+	}
+	env["PRIVATE_GIT_APP_OWNER"] = "datatug/other"
+	if _, err := runWorkflowBash(validate, env); err == nil {
+		t.Fatal("qualified owner accepted")
+	}
+	setup := workflowStepRun(t, workflowStep(t, workflow, "Set scoped GitHub App access for GOPRIVATE", "Set GitHub access token for GOPRIVATE"))
+	env = map[string]string{"RUNNER_TEMP": temp, "GITHUB_ENV": filepath.Join(temp, "env"), "GITHUB_JOB": "release", "PRIVATE_GIT_APP_TOKEN": "READ_TOKEN", "PRIVATE_GIT_APP_OWNER": "datatug", "PRIVATE_GIT_APP_REPOSITORIES": "datatug-core"}
+	if out, err := runWorkflowBash(setup, env); err != nil {
+		t.Fatalf("release dependency setup: %v %s", err, out)
+	}
+	assertCredentialPassword(t, temp, "release", "datatug/datatug-core", "READ_TOKEN")
+	assertNoCredential(t, temp, "release", "datatug/datatug")
+	if !strings.Contains(workflow, "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}") {
+		t.Fatal("release publication token changed")
+	}
+	if !strings.Contains(workflow, "if: ${{ inputs.GOPRIVATE && inputs.goprivate_github_app_client_id == '' }}") {
+		t.Fatal("legacy/default auth is not preserved")
+	}
 }
