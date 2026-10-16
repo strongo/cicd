@@ -779,3 +779,21 @@ We build with our own tooling:
 <!-- /dev-approach -->
 
 [`git-cliff`]: https://git-cliff.org/
+
+### Private modules from two GitHub installations
+
+The standard Go workflow accepts an optional second installation using
+`goprivate_github_app_secondary_owner` and
+`goprivate_github_app_secondary_repositories`. Set both together with the existing
+primary App client ID, owner, repositories, and `GOPRIVATE_GITHUB_APP_PRIVATE_KEY`.
+Both installations use the same App key, but each Build/Lint job mints separate
+contents-read tokens restricted to the listed repositories. Repository lists
+accept commas or newlines. Incomplete or invalid groups fail before minting;
+credentials match exact repository paths, including `.git`, rather than owner
+prefixes. The second installation is also bound into exact-tree policy receipts.
+
+The release workflow accepts the same primary `goprivate_github_app_client_id`,
+`goprivate_github_app_owner`, `goprivate_github_app_repositories`, and optional
+`GOPRIVATE_GITHUB_APP_PRIVATE_KEY` secret for private Go dependencies. This
+contents-read credential is separate from release publication credentials.
+Callers without App inputs retain their existing authentication behavior.

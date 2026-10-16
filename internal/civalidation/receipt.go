@@ -18,39 +18,41 @@ const (
 )
 
 type Policy struct {
-	Schema                                int    `json:"schema"`
-	CodeCoverage                          bool   `json:"code_coverage"`
-	DisableVersionBumping                 bool   `json:"disable_version_bumping"`
-	InstallFirebaseTools                  bool   `json:"install_firebase_tools"`
-	LintTimeout                           string `json:"lint_timeout"`
-	GolangCILintCache                     bool   `json:"golangci_lint_cache"`
-	GolangCILintCacheInvalidationInterval string `json:"golangci_lint_cache_invalidation_interval"`
-	GoogleApplicationCredentials          string `json:"google_application_credentials"`
-	GoPrivate                             string `json:"goprivate"`
-	GoPrivateGitHost                      string `json:"goprivate_git_host"`
-	GoPrivateGitHosts                     string `json:"goprivate_git_hosts"`
-	GoPrivateGitHubAppClientID            string `json:"goprivate_github_app_client_id"`
-	GoPrivateGitHubAppOwner               string `json:"goprivate_github_app_owner"`
-	GoPrivateGitHubAppRepositories        string `json:"goprivate_github_app_repositories"`
-	AdditionalGoTestPath                  string `json:"additional_go_test_path"`
-	MinimumTestCoveragePercent            string `json:"min_test_coverage_percent"`
-	CoverPackage                          string `json:"coverpkg"`
-	RunGoReleaser                         bool   `json:"run_goreleaser"`
-	CGOEnabled                            bool   `json:"cgo_enabled"`
-	TagPrefix                             string `json:"tag_prefix"`
-	WorkingDirectory                      string `json:"working_directory"`
-	AllowMajorVersionBump                 bool   `json:"allow_major_version_bump"`
-	GoVersion                             string `json:"go_version"`
-	DefaultBump                           string `json:"default_bump"`
-	RequireConventionalPullRequestTitle   bool   `json:"require_conventional_pr_title"`
-	BuildCommand                          string `json:"build_command"`
-	ArtifactName                          string `json:"artifact_name"`
-	ArtifactPath                          string `json:"artifact_path"`
-	ArtifactRetentionDays                 string `json:"artifact_retention_days"`
-	ArtifactOnMainOnly                    bool   `json:"artifact_on_main_only"`
-	ExactTreeValidationReuse              bool   `json:"exact_tree_validation_reuse"`
-	ValidateOnMain                        bool   `json:"validate_on_main"`
-	ValidationReceiptRetentionDays        string `json:"validation_receipt_retention_days"`
+	Schema                                  int    `json:"schema"`
+	CodeCoverage                            bool   `json:"code_coverage"`
+	DisableVersionBumping                   bool   `json:"disable_version_bumping"`
+	InstallFirebaseTools                    bool   `json:"install_firebase_tools"`
+	LintTimeout                             string `json:"lint_timeout"`
+	GolangCILintCache                       bool   `json:"golangci_lint_cache"`
+	GolangCILintCacheInvalidationInterval   string `json:"golangci_lint_cache_invalidation_interval"`
+	GoogleApplicationCredentials            string `json:"google_application_credentials"`
+	GoPrivate                               string `json:"goprivate"`
+	GoPrivateGitHost                        string `json:"goprivate_git_host"`
+	GoPrivateGitHosts                       string `json:"goprivate_git_hosts"`
+	GoPrivateGitHubAppClientID              string `json:"goprivate_github_app_client_id"`
+	GoPrivateGitHubAppOwner                 string `json:"goprivate_github_app_owner"`
+	GoPrivateGitHubAppRepositories          string `json:"goprivate_github_app_repositories"`
+	GoPrivateGitHubAppSecondaryOwner        string `json:"goprivate_github_app_secondary_owner"`
+	GoPrivateGitHubAppSecondaryRepositories string `json:"goprivate_github_app_secondary_repositories"`
+	AdditionalGoTestPath                    string `json:"additional_go_test_path"`
+	MinimumTestCoveragePercent              string `json:"min_test_coverage_percent"`
+	CoverPackage                            string `json:"coverpkg"`
+	RunGoReleaser                           bool   `json:"run_goreleaser"`
+	CGOEnabled                              bool   `json:"cgo_enabled"`
+	TagPrefix                               string `json:"tag_prefix"`
+	WorkingDirectory                        string `json:"working_directory"`
+	AllowMajorVersionBump                   bool   `json:"allow_major_version_bump"`
+	GoVersion                               string `json:"go_version"`
+	DefaultBump                             string `json:"default_bump"`
+	RequireConventionalPullRequestTitle     bool   `json:"require_conventional_pr_title"`
+	BuildCommand                            string `json:"build_command"`
+	ArtifactName                            string `json:"artifact_name"`
+	ArtifactPath                            string `json:"artifact_path"`
+	ArtifactRetentionDays                   string `json:"artifact_retention_days"`
+	ArtifactOnMainOnly                      bool   `json:"artifact_on_main_only"`
+	ExactTreeValidationReuse                bool   `json:"exact_tree_validation_reuse"`
+	ValidateOnMain                          bool   `json:"validate_on_main"`
+	ValidationReceiptRetentionDays          string `json:"validation_receipt_retention_days"`
 }
 
 type Receipt struct {
@@ -179,39 +181,41 @@ func PolicyFromEnvironment() (Policy, error) {
 	}
 
 	return Policy{
-		Schema:                                ReceiptSchema,
-		CodeCoverage:                          codeCoverage,
-		DisableVersionBumping:                 disableVersionBumping,
-		InstallFirebaseTools:                  installFirebaseTools,
-		LintTimeout:                           os.Getenv("CI_POLICY_LINT_TIMEOUT"),
-		GolangCILintCache:                     lintCache,
-		GolangCILintCacheInvalidationInterval: lintCacheDays,
-		GoogleApplicationCredentials:          os.Getenv("CI_POLICY_GOOGLE_APPLICATION_CREDENTIALS"),
-		GoPrivate:                             os.Getenv("CI_POLICY_GOPRIVATE"),
-		GoPrivateGitHost:                      os.Getenv("CI_POLICY_GOPRIVATE_GIT_HOST"),
-		GoPrivateGitHosts:                     os.Getenv("CI_POLICY_GOPRIVATE_GIT_HOSTS"),
-		GoPrivateGitHubAppClientID:            os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_CLIENT_ID"),
-		GoPrivateGitHubAppOwner:               os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_OWNER"),
-		GoPrivateGitHubAppRepositories:        os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_REPOSITORIES"),
-		AdditionalGoTestPath:                  os.Getenv("CI_POLICY_ADDITIONAL_GO_TEST_PATH"),
-		MinimumTestCoveragePercent:            minimumCoverage,
-		CoverPackage:                          os.Getenv("CI_POLICY_COVERPKG"),
-		RunGoReleaser:                         runGoReleaser,
-		CGOEnabled:                            cgoEnabled,
-		TagPrefix:                             os.Getenv("CI_POLICY_TAG_PREFIX"),
-		WorkingDirectory:                      os.Getenv("CI_POLICY_WORKING_DIRECTORY"),
-		AllowMajorVersionBump:                 allowMajor,
-		GoVersion:                             os.Getenv("CI_POLICY_GO_VERSION"),
-		DefaultBump:                           os.Getenv("CI_POLICY_DEFAULT_BUMP"),
-		RequireConventionalPullRequestTitle:   requireConventionalPullRequestTitle,
-		BuildCommand:                          os.Getenv("CI_POLICY_BUILD_COMMAND"),
-		ArtifactName:                          os.Getenv("CI_POLICY_ARTIFACT_NAME"),
-		ArtifactPath:                          os.Getenv("CI_POLICY_ARTIFACT_PATH"),
-		ArtifactRetentionDays:                 artifactRetention,
-		ArtifactOnMainOnly:                    artifactOnMainOnly,
-		ExactTreeValidationReuse:              reuse,
-		ValidateOnMain:                        validateOnMain,
-		ValidationReceiptRetentionDays:        receiptRetention,
+		Schema:                                  ReceiptSchema,
+		CodeCoverage:                            codeCoverage,
+		DisableVersionBumping:                   disableVersionBumping,
+		InstallFirebaseTools:                    installFirebaseTools,
+		LintTimeout:                             os.Getenv("CI_POLICY_LINT_TIMEOUT"),
+		GolangCILintCache:                       lintCache,
+		GolangCILintCacheInvalidationInterval:   lintCacheDays,
+		GoogleApplicationCredentials:            os.Getenv("CI_POLICY_GOOGLE_APPLICATION_CREDENTIALS"),
+		GoPrivate:                               os.Getenv("CI_POLICY_GOPRIVATE"),
+		GoPrivateGitHost:                        os.Getenv("CI_POLICY_GOPRIVATE_GIT_HOST"),
+		GoPrivateGitHosts:                       os.Getenv("CI_POLICY_GOPRIVATE_GIT_HOSTS"),
+		GoPrivateGitHubAppClientID:              os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_CLIENT_ID"),
+		GoPrivateGitHubAppOwner:                 os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_OWNER"),
+		GoPrivateGitHubAppRepositories:          os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_REPOSITORIES"),
+		GoPrivateGitHubAppSecondaryOwner:        os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_SECONDARY_OWNER"),
+		GoPrivateGitHubAppSecondaryRepositories: os.Getenv("CI_POLICY_GOPRIVATE_GITHUB_APP_SECONDARY_REPOSITORIES"),
+		AdditionalGoTestPath:                    os.Getenv("CI_POLICY_ADDITIONAL_GO_TEST_PATH"),
+		MinimumTestCoveragePercent:              minimumCoverage,
+		CoverPackage:                            os.Getenv("CI_POLICY_COVERPKG"),
+		RunGoReleaser:                           runGoReleaser,
+		CGOEnabled:                              cgoEnabled,
+		TagPrefix:                               os.Getenv("CI_POLICY_TAG_PREFIX"),
+		WorkingDirectory:                        os.Getenv("CI_POLICY_WORKING_DIRECTORY"),
+		AllowMajorVersionBump:                   allowMajor,
+		GoVersion:                               os.Getenv("CI_POLICY_GO_VERSION"),
+		DefaultBump:                             os.Getenv("CI_POLICY_DEFAULT_BUMP"),
+		RequireConventionalPullRequestTitle:     requireConventionalPullRequestTitle,
+		BuildCommand:                            os.Getenv("CI_POLICY_BUILD_COMMAND"),
+		ArtifactName:                            os.Getenv("CI_POLICY_ARTIFACT_NAME"),
+		ArtifactPath:                            os.Getenv("CI_POLICY_ARTIFACT_PATH"),
+		ArtifactRetentionDays:                   artifactRetention,
+		ArtifactOnMainOnly:                      artifactOnMainOnly,
+		ExactTreeValidationReuse:                reuse,
+		ValidateOnMain:                          validateOnMain,
+		ValidationReceiptRetentionDays:          receiptRetention,
 	}, nil
 }
 
