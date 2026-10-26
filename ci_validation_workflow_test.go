@@ -337,7 +337,7 @@ func workflowStepRun(t *testing.T, step string) string {
 
 func runWorkflowBash(script string, environment map[string]string) ([]byte, error) {
 	command := exec.Command("bash", "-c", script)
-	command.Env = []string{"PATH=" + os.Getenv("PATH")}
+	command.Env = []string{"PATH=" + os.Getenv("PATH"), "GIT_CONFIG_NOSYSTEM=1"}
 	for key, value := range environment {
 		command.Env = append(command.Env, key+"="+value)
 	}
@@ -386,6 +386,7 @@ func credentialPassword(tempDir, job, host, path string) (string, bool) {
 		"PATH=" + os.Getenv("PATH"),
 		"GIT_CONFIG_GLOBAL=" + filepath.Join(tempDir, "goprivate-"+job+".gitconfig"),
 		"GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_NOSYSTEM=1",
 		"GITHUB_JOB=" + job,
 		"RUNNER_TEMP=" + tempDir,
 	}
@@ -578,7 +579,7 @@ func TestGoCIWorkflowExactRepositoryConfigurationFailsClosed(t *testing.T) {
 			}
 			job := workflowJob(t, workflow, jobName, next)
 			script := workflowStepRun(t, workflowStep(t, job, "Set exact repository access for GOPRIVATE", "Set GitHub access token for GOPRIVATE"))
-			invalid := []string{"github.com", "github.com/owner", "https://github.com/owner/repo", "user@github.com/owner/repo", "github.com:443/owner/repo", "github.com/owner/repo/child", "github.com/owner/repo/", "github.com/owner/repo.git", "github.com/./repo", "github.com/owner/..", "github.com/owner/repo?x", "github.com/owner/repo#x", "github.com/owner/*", "github.com/owner/repo\nhelper=bad", ".github.com/owner/repo", "github..com/owner/repo", "github.com./owner/repo", "github.com/owner/repo\rinside"}
+			invalid := []string{"github.com", "github.com/owner", "https://github.com/owner/repo", "user@github.com/owner/repo", "github.com:443/owner/repo", "github.com/owner/repo/child", "github.com/owner/repo/", "github.com/owner/repo.git", "github.com/owner/repo.GIT", "github.com/./repo", "github.com/owner/..", "github.com/owner/repo?x", "github.com/owner/repo#x", "github.com/owner/*", "github.com/owner/repo\nhelper=bad", ".github.com/owner/repo", "github..com/owner/repo", "github.com./owner/repo", "github.com/owner/repo\rinside"}
 			for _, list := range invalid {
 				env := map[string]string{"RUNNER_TEMP": t.TempDir(), "GITHUB_ENV": filepath.Join(t.TempDir(), "env"), "GITHUB_JOB": jobName, "PRIVATE_GIT_REPOSITORIES": list, "PRIVATE_GIT_REPOSITORY_TOKEN": "EXACT_SYNTHETIC_SECRET", "PRIVATE_GIT_HOSTS": "", "PRIVATE_GIT_APP_ENABLED": "client-id", "PRIVATE_GIT_TOKEN": "LEGACY_MUST_NOT_BE_BORROWED"}
 				if out, err := runWorkflowBash(script, env); err == nil || strings.Contains(string(out), "EXACT_SYNTHETIC_SECRET") {
@@ -591,12 +592,19 @@ func TestGoCIWorkflowExactRepositoryConfigurationFailsClosed(t *testing.T) {
 					t.Fatalf("unpaired exact config accepted: %v %s", err, out)
 				}
 			}
-			for _, prefix := range []string{"github.com", "github.com/improveit-now", "github.com/improveit-now/improveit-go", "github.com/improveit-now/improveit-go/child", "github.com/improveit-now/improveit-go.git", "github.com/improveit-now/improveit-go.git/child", "github.com/other/../improveit-now"} {
+			for _, prefix := range []string{"github.com", "github.com/improveit-now", "github.com/improveit-now/improveit-go", "github.com/improveit-now/improveit-go/child", "github.com/improveit-now/improveit-go.git", "github.com/improveit-now/improveit-go.git/child", "github.com/other/../improveit-now", "github.com/IMPROVEIT-NOW", "github.com/improveit-now/IMPROVEIT-GO", "github.com/IMPROVEIT-NOW/IMPROVEIT-GO/child", "github.com/improveit-now/improveit-go.GIT/child", "GITHUB.COM/improveit-now"} {
 				env := map[string]string{"RUNNER_TEMP": t.TempDir(), "GITHUB_ENV": filepath.Join(t.TempDir(), "env"), "GITHUB_JOB": jobName, "PRIVATE_GIT_REPOSITORIES": "github.com/improveit-now/improveit-go", "PRIVATE_GIT_REPOSITORY_TOKEN": "EXACT_SYNTHETIC_SECRET", "PRIVATE_GIT_HOSTS": prefix}
 				if out, err := runWorkflowBash(script, env); err == nil {
 					t.Fatalf("unsafe mixed legacy prefix accepted: %q %s", prefix, out)
 				}
 			}
+			for _, exactList := range []string{"github.com/IMPROVEIT-NOW/improveit-go", "github.com/improveit-now/IMPROVEIT-GO"} {
+				env := map[string]string{"RUNNER_TEMP": t.TempDir(), "GITHUB_ENV": filepath.Join(t.TempDir(), "env"), "GITHUB_JOB": jobName, "PRIVATE_GIT_REPOSITORIES": exactList, "PRIVATE_GIT_REPOSITORY_TOKEN": "EXACT_SYNTHETIC_SECRET", "PRIVATE_GIT_HOSTS": "github.com/improveit-now/improveit-go.git/child"}
+				if out, err := runWorkflowBash(script, env); err == nil {
+					t.Fatalf("case alias exact recipient overlapped legacy path: %q %s", exactList, out)
+				}
+			}
+
 		})
 	}
 }

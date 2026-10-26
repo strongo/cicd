@@ -244,7 +244,8 @@ Exact mode, like App mode, disables the legacy single-host default. Existing
 explicit plural legacy prefixes remain available with their original token.
 Remove the exact recipients from that legacy list: mixed mode rejects any
 ancestor, equal or descendant legacy scope overlapping the bare or `.git`
-repository, as well as unsafe/host-wide mixed prefixes. It does not silently
+repository, comparing identity case-insensitively to cover GitHub aliases, as
+well as unsafe/host-wide mixed prefixes. It does not silently
 retain a broader route beside the exact credential. App repository routes stay
 unchanged. Each job stores the dedicated credential in a mode600 runner-temporary
 file and always removes its credential files/helper registration at job end;

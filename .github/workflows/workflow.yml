@@ -641,7 +641,8 @@ jobs:
           while IFS= read -r raw; do
             repository="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
             [ -z "$repository" ] && continue
-            if ! valid_route "$repository" || ! [[ "$repository" =~ ^[^/]+/[^/]+/[^/]+$ ]] || [[ "$repository" == *.git ]]; then
+            repository_key="$(printf '%s' "$repository" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+            if ! valid_route "$repository" || ! [[ "$repository" =~ ^[^/]+/[^/]+/[^/]+$ ]] || [[ "$repository_key" == *.git ]]; then
               echo "::error title=Invalid exact repository::Use canonical host/owner/repository entries only; no URL, port, dot segment or child path."
               exit 1
             fi
@@ -658,13 +659,15 @@ jobs:
               echo "::error title=Unsafe mixed credential scope::Legacy prefixes must be canonical host/owner paths in exact repository mode."
               exit 1
             fi
+            prefix_key="$(printf '%s' "$prefix" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
             for repository in "${exact[@]}"; do
               for target in "$repository" "$repository.git"; do
-                case "$prefix" in "$target"|"$target"/*)
+                target_key="$(printf '%s' "$target" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+                case "$prefix_key" in "$target_key"|"$target_key"/*)
                   echo "::error title=Overlapping credential scopes::Remove exact repository recipients and their related paths from goprivate_git_hosts."
                   exit 1 ;;
                 esac
-                case "$target" in "$prefix"|"$prefix"/*)
+                case "$target_key" in "$prefix_key"|"$prefix_key"/*)
                   echo "::error title=Overlapping credential scopes::Remove exact repository recipients and their related paths from goprivate_git_hosts."
                   exit 1 ;;
                 esac
@@ -1122,7 +1125,8 @@ jobs:
           while IFS= read -r raw; do
             repository="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
             [ -z "$repository" ] && continue
-            if ! valid_route "$repository" || ! [[ "$repository" =~ ^[^/]+/[^/]+/[^/]+$ ]] || [[ "$repository" == *.git ]]; then
+            repository_key="$(printf '%s' "$repository" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+            if ! valid_route "$repository" || ! [[ "$repository" =~ ^[^/]+/[^/]+/[^/]+$ ]] || [[ "$repository_key" == *.git ]]; then
               echo "::error title=Invalid exact repository::Use canonical host/owner/repository entries only; no URL, port, dot segment or child path."
               exit 1
             fi
@@ -1139,13 +1143,15 @@ jobs:
               echo "::error title=Unsafe mixed credential scope::Legacy prefixes must be canonical host/owner paths in exact repository mode."
               exit 1
             fi
+            prefix_key="$(printf '%s' "$prefix" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
             for repository in "${exact[@]}"; do
               for target in "$repository" "$repository.git"; do
-                case "$prefix" in "$target"|"$target"/*)
+                target_key="$(printf '%s' "$target" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+                case "$prefix_key" in "$target_key"|"$target_key"/*)
                   echo "::error title=Overlapping credential scopes::Remove exact repository recipients and their related paths from goprivate_git_hosts."
                   exit 1 ;;
                 esac
-                case "$target" in "$prefix"|"$prefix"/*)
+                case "$target_key" in "$prefix_key"|"$prefix_key"/*)
                   echo "::error title=Overlapping credential scopes::Remove exact repository recipients and their related paths from goprivate_git_hosts."
                   exit 1 ;;
                 esac
