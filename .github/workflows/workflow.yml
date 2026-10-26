@@ -5,6 +5,9 @@ on:
     secrets:
       GH_TOKEN:
         required: true
+      GOPRIVATE_GIT_REPOSITORY_TOKEN:
+        description: 'Optional dedicated contents-read token used only with exact goprivate_git_repositories recipients.'
+        required: false
       GOPRIVATE_GITHUB_APP_PRIVATE_KEY:
         description: 'Private key for the optional repository-scoped GitHub App dependency token.'
         required: false
@@ -60,6 +63,11 @@ on:
       goprivate_git_hosts:
         type: string
         description: 'Comma- or newline-separated host/owner URL prefixes authenticated with GH_TOKEN, e.g. github.com/my-org,github.com/another-org. Each entry must include an owner; host-wide entries are rejected.'
+        required: false
+        default: ''
+      goprivate_git_repositories:
+        type: string
+        description: 'Optional comma- or newline-separated canonical host/owner/repository recipients for GOPRIVATE_GIT_REPOSITORY_TOKEN. Requires the dedicated secret; suppresses the legacy single-host default and rejects overlapping explicit legacy prefixes.'
         required: false
         default: ''
       goprivate_github_app_client_id:
@@ -252,6 +260,7 @@ env:
   CI_POLICY_GOPRIVATE: ${{ inputs.GOPRIVATE }}
   CI_POLICY_GOPRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
   CI_POLICY_GOPRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
+  CI_POLICY_GOPRIVATE_GIT_REPOSITORIES: ${{ inputs.goprivate_git_repositories }}
   CI_POLICY_GOPRIVATE_GITHUB_APP_CLIENT_ID: ${{ inputs.goprivate_github_app_client_id }}
   CI_POLICY_GOPRIVATE_GITHUB_APP_OWNER: ${{ inputs.goprivate_github_app_owner }}
   CI_POLICY_GOPRIVATE_GITHUB_APP_REPOSITORIES: ${{ inputs.goprivate_github_app_repositories }}
@@ -595,6 +604,116 @@ jobs:
           fi
           git config --global credential.https://github.com.useHttpPath true
 
+      - name: Set exact repository access for GOPRIVATE
+        shell: bash
+        env:
+          PRIVATE_GIT_REPOSITORIES: ${{ inputs.goprivate_git_repositories }}
+          PRIVATE_GIT_REPOSITORY_TOKEN: ${{ secrets.GOPRIVATE_GIT_REPOSITORY_TOKEN }}
+          PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
+        run: |
+          set -euo pipefail
+          repositories="${PRIVATE_GIT_REPOSITORIES:-}"
+          token="${PRIVATE_GIT_REPOSITORY_TOKEN:-}"
+          if [ -z "$repositories" ] && [ -z "$token" ]; then exit 0; fi
+          if [ -z "$repositories" ] || [ -z "$token" ]; then
+            echo "::error title=Incomplete exact repository credentials::Set both goprivate_git_repositories and GOPRIVATE_GIT_REPOSITORY_TOKEN."
+            exit 1
+          fi
+          valid_host() {
+            local label
+            [[ "$1" =~ ^[a-z0-9.-]+$ ]] && [[ "$1" != .* && "$1" != *. && "$1" != *..* ]] || return 1
+            local labels
+            IFS='.' read -r -a labels <<< "$1"
+            for label in "${labels[@]}"; do
+              [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+            done
+          }
+          valid_route() {
+            local host="${1%%/*}" part
+            [[ "$1" == */* && "$1" != */ && "$1" != *//* ]] && valid_host "$host" || return 1
+            local parts
+            IFS='/' read -r -a parts <<< "${1#*/}"
+            for part in "${parts[@]}"; do
+              [[ "$part" =~ ^[A-Za-z0-9._-]+$ && "$part" != . && "$part" != .. ]] || return 1
+            done
+          }
+          exact=()
+          while IFS= read -r raw; do
+            repository="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$repository" ] && continue
+            repository_key="$(printf '%s' "$repository" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+            if ! valid_route "$repository" || ! [[ "$repository" =~ ^[^/]+/[^/]+/[^/]+$ ]] || [[ "$repository_key" == *.git ]]; then
+              echo "::error title=Invalid exact repository::Use canonical host/owner/repository entries only; no URL, port, dot segment or child path."
+              exit 1
+            fi
+            exact+=("$repository")
+          done < <(printf '%s\n' "$repositories" | tr ',' '\n')
+          if [ "${#exact[@]}" = 0 ]; then
+            echo "::error title=Missing exact repository::At least one canonical repository is required."
+            exit 1
+          fi
+          while IFS= read -r raw; do
+            prefix="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$prefix" ] && continue
+            if ! valid_route "$prefix"; then
+              echo "::error title=Unsafe mixed credential scope::Legacy prefixes must be canonical host/owner paths in exact repository mode."
+              exit 1
+            fi
+            prefix_key="$(printf '%s' "$prefix" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+            for repository in "${exact[@]}"; do
+              for target in "$repository" "$repository.git"; do
+                target_key="$(printf '%s' "$target" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+                case "$prefix_key" in "$target_key"|"$target_key"/*)
+                  echo "::error title=Overlapping credential scopes::Remove exact repository recipients and their related paths from goprivate_git_hosts."
+                  exit 1 ;;
+                esac
+                case "$target_key" in "$prefix_key"|"$prefix_key"/*)
+                  echo "::error title=Overlapping credential scopes::Remove exact repository recipients and their related paths from goprivate_git_hosts."
+                  exit 1 ;;
+                esac
+              done
+            done
+          done < <(printf '%s\n' "${PRIVATE_GIT_HOSTS:-}" | tr ',' '\n')
+          git_config_global="${RUNNER_TEMP}/goprivate-${GITHUB_JOB}.gitconfig"
+          token_file="${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.token"
+          repository_file="${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.repositories"
+          helper_file="${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}-credential-helper"
+          umask 077
+          touch "$git_config_global"
+          printf '%s\n' "$token" > "$token_file"
+          printf '%s\n' "${exact[@]}" > "$repository_file"
+          export GIT_CONFIG_GLOBAL="$git_config_global"
+          echo "GIT_CONFIG_GLOBAL=$git_config_global" >> "$GITHUB_ENV"
+          for repository in "${exact[@]}"; do
+            git config --global "credential.https://${repository%%/*}.useHttpPath" true
+          done
+          cat > "$helper_file" <<'CREDENTIAL_HELPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [ "${1:-}" = get ] || exit 0
+          protocol= host= path=
+          protocol_seen=0 host_seen=0 path_seen=0
+          while IFS='=' read -r key value; do
+            case "$key" in
+              protocol) [ "$protocol_seen" = 0 ] || exit 0; protocol_seen=1; protocol="$value" ;;
+              host) [ "$host_seen" = 0 ] || exit 0; host_seen=1; host="$value" ;;
+              path) [ "$path_seen" = 0 ] || exit 0; path_seen=1; path="$value" ;;
+            esac
+          done
+          [ "$protocol" = https ] || exit 0
+          candidate="$host/$path"
+          while IFS= read -r repository; do
+            case "$candidate" in
+              "$repository"|"$repository.git")
+                printf 'username=x-access-token\npassword='
+                cat "${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.token"
+                exit 0 ;;
+            esac
+          done < "${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.repositories"
+          CREDENTIAL_HELPER
+          chmod 700 "$helper_file"
+          git config --global --add credential.helper "$helper_file"
+
       - name: Set GitHub access token for GOPRIVATE
         if: ${{ inputs.GOPRIVATE }}
         shell: bash
@@ -603,12 +722,13 @@ jobs:
           PRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
           PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
           PRIVATE_GIT_APP_ENABLED: ${{ inputs.goprivate_github_app_client_id }}
+          PRIVATE_GIT_EXACT_ENABLED: ${{ inputs.goprivate_git_repositories }}
         run: |
           set -euo pipefail
           prefixes="$PRIVATE_GIT_HOSTS"
           if [ -z "$prefixes" ]; then
-            if [ -n "$PRIVATE_GIT_APP_ENABLED" ]; then
-              # With App authentication enabled, the legacy token is installed
+            if [ -n "$PRIVATE_GIT_APP_ENABLED" ] || [ -n "${PRIVATE_GIT_EXACT_ENABLED:-}" ]; then
+              # With App or exact authentication, the legacy token is installed
               # only for explicitly supplied prefixes. This avoids restoring the
               # historical host-wide default beside a repository-scoped token.
               exit 0
@@ -728,6 +848,18 @@ jobs:
 
           # Optional: if set to true then the action don't cache or restore ~/.cache/go-build.
           # skip-build-cache: true
+
+      - name: Remove exact repository dependency credentials
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper_file="${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}-credential-helper"
+          rm -f "${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.token" "${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.repositories" "$helper_file"
+          git_config_global="${RUNNER_TEMP}/goprivate-${GITHUB_JOB}.gitconfig"
+          if [ -f "$git_config_global" ]; then
+            GIT_CONFIG_GLOBAL="$git_config_global" git config --global --fixed-value --unset-all credential.helper "$helper_file" || [ "$?" = 5 ]
+          fi
 
   go_test_build:
     name: Build & test
@@ -956,6 +1088,116 @@ jobs:
           fi
           git config --global credential.https://github.com.useHttpPath true
 
+      - name: Set exact repository access for GOPRIVATE
+        shell: bash
+        env:
+          PRIVATE_GIT_REPOSITORIES: ${{ inputs.goprivate_git_repositories }}
+          PRIVATE_GIT_REPOSITORY_TOKEN: ${{ secrets.GOPRIVATE_GIT_REPOSITORY_TOKEN }}
+          PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
+        run: |
+          set -euo pipefail
+          repositories="${PRIVATE_GIT_REPOSITORIES:-}"
+          token="${PRIVATE_GIT_REPOSITORY_TOKEN:-}"
+          if [ -z "$repositories" ] && [ -z "$token" ]; then exit 0; fi
+          if [ -z "$repositories" ] || [ -z "$token" ]; then
+            echo "::error title=Incomplete exact repository credentials::Set both goprivate_git_repositories and GOPRIVATE_GIT_REPOSITORY_TOKEN."
+            exit 1
+          fi
+          valid_host() {
+            local label
+            [[ "$1" =~ ^[a-z0-9.-]+$ ]] && [[ "$1" != .* && "$1" != *. && "$1" != *..* ]] || return 1
+            local labels
+            IFS='.' read -r -a labels <<< "$1"
+            for label in "${labels[@]}"; do
+              [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+            done
+          }
+          valid_route() {
+            local host="${1%%/*}" part
+            [[ "$1" == */* && "$1" != */ && "$1" != *//* ]] && valid_host "$host" || return 1
+            local parts
+            IFS='/' read -r -a parts <<< "${1#*/}"
+            for part in "${parts[@]}"; do
+              [[ "$part" =~ ^[A-Za-z0-9._-]+$ && "$part" != . && "$part" != .. ]] || return 1
+            done
+          }
+          exact=()
+          while IFS= read -r raw; do
+            repository="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$repository" ] && continue
+            repository_key="$(printf '%s' "$repository" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+            if ! valid_route "$repository" || ! [[ "$repository" =~ ^[^/]+/[^/]+/[^/]+$ ]] || [[ "$repository_key" == *.git ]]; then
+              echo "::error title=Invalid exact repository::Use canonical host/owner/repository entries only; no URL, port, dot segment or child path."
+              exit 1
+            fi
+            exact+=("$repository")
+          done < <(printf '%s\n' "$repositories" | tr ',' '\n')
+          if [ "${#exact[@]}" = 0 ]; then
+            echo "::error title=Missing exact repository::At least one canonical repository is required."
+            exit 1
+          fi
+          while IFS= read -r raw; do
+            prefix="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$prefix" ] && continue
+            if ! valid_route "$prefix"; then
+              echo "::error title=Unsafe mixed credential scope::Legacy prefixes must be canonical host/owner paths in exact repository mode."
+              exit 1
+            fi
+            prefix_key="$(printf '%s' "$prefix" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+            for repository in "${exact[@]}"; do
+              for target in "$repository" "$repository.git"; do
+                target_key="$(printf '%s' "$target" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+                case "$prefix_key" in "$target_key"|"$target_key"/*)
+                  echo "::error title=Overlapping credential scopes::Remove exact repository recipients and their related paths from goprivate_git_hosts."
+                  exit 1 ;;
+                esac
+                case "$target_key" in "$prefix_key"|"$prefix_key"/*)
+                  echo "::error title=Overlapping credential scopes::Remove exact repository recipients and their related paths from goprivate_git_hosts."
+                  exit 1 ;;
+                esac
+              done
+            done
+          done < <(printf '%s\n' "${PRIVATE_GIT_HOSTS:-}" | tr ',' '\n')
+          git_config_global="${RUNNER_TEMP}/goprivate-${GITHUB_JOB}.gitconfig"
+          token_file="${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.token"
+          repository_file="${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.repositories"
+          helper_file="${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}-credential-helper"
+          umask 077
+          touch "$git_config_global"
+          printf '%s\n' "$token" > "$token_file"
+          printf '%s\n' "${exact[@]}" > "$repository_file"
+          export GIT_CONFIG_GLOBAL="$git_config_global"
+          echo "GIT_CONFIG_GLOBAL=$git_config_global" >> "$GITHUB_ENV"
+          for repository in "${exact[@]}"; do
+            git config --global "credential.https://${repository%%/*}.useHttpPath" true
+          done
+          cat > "$helper_file" <<'CREDENTIAL_HELPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [ "${1:-}" = get ] || exit 0
+          protocol= host= path=
+          protocol_seen=0 host_seen=0 path_seen=0
+          while IFS='=' read -r key value; do
+            case "$key" in
+              protocol) [ "$protocol_seen" = 0 ] || exit 0; protocol_seen=1; protocol="$value" ;;
+              host) [ "$host_seen" = 0 ] || exit 0; host_seen=1; host="$value" ;;
+              path) [ "$path_seen" = 0 ] || exit 0; path_seen=1; path="$value" ;;
+            esac
+          done
+          [ "$protocol" = https ] || exit 0
+          candidate="$host/$path"
+          while IFS= read -r repository; do
+            case "$candidate" in
+              "$repository"|"$repository.git")
+                printf 'username=x-access-token\npassword='
+                cat "${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.token"
+                exit 0 ;;
+            esac
+          done < "${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.repositories"
+          CREDENTIAL_HELPER
+          chmod 700 "$helper_file"
+          git config --global --add credential.helper "$helper_file"
+
       - name: Set GitHub access token for GOPRIVATE
         if: ${{ inputs.GOPRIVATE }}
         shell: bash
@@ -964,12 +1206,13 @@ jobs:
           PRIVATE_GIT_HOST: ${{ inputs.goprivate_git_host }}
           PRIVATE_GIT_HOSTS: ${{ inputs.goprivate_git_hosts }}
           PRIVATE_GIT_APP_ENABLED: ${{ inputs.goprivate_github_app_client_id }}
+          PRIVATE_GIT_EXACT_ENABLED: ${{ inputs.goprivate_git_repositories }}
         run: |
           set -euo pipefail
           prefixes="$PRIVATE_GIT_HOSTS"
           if [ -z "$prefixes" ]; then
-            if [ -n "$PRIVATE_GIT_APP_ENABLED" ]; then
-              # With App authentication enabled, the legacy token is installed
+            if [ -n "$PRIVATE_GIT_APP_ENABLED" ] || [ -n "${PRIVATE_GIT_EXACT_ENABLED:-}" ]; then
+              # With App or exact authentication, the legacy token is installed
               # only for explicitly supplied prefixes. This avoids restoring the
               # historical host-wide default beside a repository-scoped token.
               exit 0
@@ -1154,6 +1397,18 @@ jobs:
           # would save a cache under a key that the next clean checkout never
           # restores.
           key: ${{ steps.restore_go_cache.outputs.cache-primary-key }}
+
+      - name: Remove exact repository dependency credentials
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper_file="${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}-credential-helper"
+          rm -f "${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.token" "${RUNNER_TEMP}/goprivate-exact-${GITHUB_JOB}.repositories" "$helper_file"
+          git_config_global="${RUNNER_TEMP}/goprivate-${GITHUB_JOB}.gitconfig"
+          if [ -f "$git_config_global" ]; then
+            GIT_CONFIG_GLOBAL="$git_config_global" git config --global --fixed-value --unset-all credential.helper "$helper_file" || [ "$?" = 5 ]
+          fi
 
   publish_validation_receipt:
     name: Publish exact-tree validation receipt

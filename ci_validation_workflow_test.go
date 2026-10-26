@@ -337,7 +337,7 @@ func workflowStepRun(t *testing.T, step string) string {
 
 func runWorkflowBash(script string, environment map[string]string) ([]byte, error) {
 	command := exec.Command("bash", "-c", script)
-	command.Env = []string{"PATH=" + os.Getenv("PATH")}
+	command.Env = []string{"PATH=" + os.Getenv("PATH"), "GIT_CONFIG_NOSYSTEM=1"}
 	for key, value := range environment {
 		command.Env = append(command.Env, key+"="+value)
 	}
@@ -386,6 +386,7 @@ func credentialPassword(tempDir, job, host, path string) (string, bool) {
 		"PATH=" + os.Getenv("PATH"),
 		"GIT_CONFIG_GLOBAL=" + filepath.Join(tempDir, "goprivate-"+job+".gitconfig"),
 		"GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_NOSYSTEM=1",
 		"GITHUB_JOB=" + job,
 		"RUNNER_TEMP=" + tempDir,
 	}
@@ -471,5 +472,139 @@ func TestReleaseAppDependencyCredentialsRemainSeparateFromPublication(t *testing
 	}
 	if !strings.Contains(workflow, "if: ${{ inputs.GOPRIVATE && inputs.goprivate_github_app_client_id == '' }}") {
 		t.Fatal("legacy/default auth is not preserved")
+	}
+}
+
+func TestGoCIWorkflowDedicatedExactRepositoryCredentials(t *testing.T) {
+	workflow := readGoCIWorkflow(t)
+	for _, jobName := range []string{"go_lint", "go_test_build"} {
+		t.Run(jobName, func(t *testing.T) {
+			next := "go_test_build"
+			if jobName == next {
+				next = ""
+			}
+			job := workflowJob(t, workflow, jobName, next)
+			exact := workflowStepRun(t, workflowStep(t, job, "Set exact repository access for GOPRIVATE", "Set GitHub access token for GOPRIVATE"))
+			legacy := workflowStepRun(t, workflowStep(t, job, "Set GitHub access token for GOPRIVATE", "Download dependencies"))
+			temp := t.TempDir()
+			env := map[string]string{"RUNNER_TEMP": temp, "GITHUB_ENV": filepath.Join(temp, "env"), "GITHUB_JOB": jobName, "PRIVATE_GIT_REPOSITORIES": " github.com/improveit-now/improveit-go,\n ghe.example.com/team/module ", "PRIVATE_GIT_REPOSITORY_TOKEN": "EXACT_READ_ONLY", "PRIVATE_GIT_HOSTS": "github.com/sneat-co", "PRIVATE_GIT_HOST": "github.com"}
+			app := workflowStepRun(t, workflowStep(t, job, "Set scoped GitHub App access for GOPRIVATE", "Set secondary scoped GitHub App access for GOPRIVATE"))
+			appEnv := cloneEnvironment(env)
+			appEnv["PRIVATE_GIT_APP_TOKEN"] = "DATATUG_APP"
+			appEnv["PRIVATE_GIT_APP_OWNER"] = "datatug"
+			appEnv["PRIVATE_GIT_APP_REPOSITORIES"] = "datatug-core"
+			if out, err := runWorkflowBash(app, appEnv); err != nil {
+				t.Fatalf("App setup: %v %s", err, out)
+			}
+			if out, err := runWorkflowBash(exact, env); err != nil || strings.Contains(string(out), "EXACT_READ_ONLY") {
+				t.Fatalf("exact setup failed or leaked token: %v %s", err, out)
+			}
+			legacyEnv := cloneEnvironment(env)
+			legacyEnv["PRIVATE_GIT_TOKEN"] = "LEGACY_NAMESPACE"
+			legacyEnv["PRIVATE_GIT_APP_ENABLED"] = ""
+			legacyEnv["PRIVATE_GIT_EXACT_ENABLED"] = env["PRIVATE_GIT_REPOSITORIES"]
+			if out, err := runWorkflowBash(legacy, legacyEnv); err != nil {
+				t.Fatalf("legacy setup: %v %s", err, out)
+			}
+			assertCredentialPassword(t, temp, jobName, "improveit-now/improveit-go", "EXACT_READ_ONLY")
+			assertCredentialPassword(t, temp, jobName, "improveit-now/improveit-go.git", "EXACT_READ_ONLY")
+			assertCredentialPassword(t, temp, jobName, "sneat-co/existing-module", "LEGACY_NAMESPACE")
+			assertCredentialPassword(t, temp, jobName, "datatug/datatug-core", "DATATUG_APP")
+			assertNoCredential(t, temp, jobName, "datatug/datatug-core-child")
+			assertCredentialPasswordAtHost(t, temp, jobName, "ghe.example.com", "team/module.git", "EXACT_READ_ONLY")
+			for _, path := range []string{"improveit-now/improveit-go/child", "improveit-now/improveit-go.git/child", "improveit-now/improveit-go-suffix", "improveit-now/improveit-go.git.evil", "improveit-now/sibling", "improveit-now/improveit-go/../sibling", "improveit-now/improveit-go%2fchild"} {
+				assertNoCredential(t, temp, jobName, path)
+			}
+			assertNoCredentialAtHost(t, temp, jobName, "github.com.evil", "improveit-now/improveit-go")
+			assertNoCredentialAtHost(t, temp, jobName, "other.example", "improveit-now/improveit-go")
+			helper := filepath.Join(temp, "goprivate-exact-"+jobName+"-credential-helper")
+			for _, protocol := range []string{"http", "ssh"} {
+				cmd := exec.Command(helper, "get")
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "RUNNER_TEMP=" + temp, "GITHUB_JOB=" + jobName}
+				cmd.Stdin = strings.NewReader("protocol=" + protocol + "\nhost=github.com\npath=improveit-now/improveit-go\n\n")
+				if out, err := cmd.CombinedOutput(); err != nil || len(out) != 0 {
+					t.Fatalf("foreign protocol returned a credential: %v %s", err, out)
+				}
+			}
+			for _, name := range []string{"goprivate-exact-" + jobName + ".token", "goprivate-exact-" + jobName + ".repositories"} {
+				info, err := os.Stat(filepath.Join(temp, name))
+				if err != nil || info.Mode().Perm() != 0600 {
+					t.Fatalf("credential file permissions: %v %v", info, err)
+				}
+			}
+			cleanupStart := strings.Index(job, "      - name: Remove exact repository dependency credentials\n")
+			if cleanupStart < 0 {
+				t.Fatal("no always cleanup")
+			}
+			cleanup := job[cleanupStart:]
+			if !strings.Contains(cleanup, "if: ${{ always() }}") {
+				t.Fatal("cleanup is not unconditional")
+			}
+			if out, err := runWorkflowBash(workflowStepRun(t, cleanup), env); err != nil {
+				t.Fatalf("cleanup: %v %s", err, out)
+			}
+			if _, err := os.Stat(filepath.Join(temp, "goprivate-exact-"+jobName+".token")); !os.IsNotExist(err) {
+				t.Fatal("exact token retained after cleanup", err)
+			}
+			assertNoCredential(t, temp, jobName, "improveit-now/improveit-go")
+			assertCredentialPassword(t, temp, jobName, "sneat-co/existing-module", "LEGACY_NAMESPACE")
+			only := cloneEnvironment(env)
+			only["GITHUB_JOB"] = jobName + "-exact-only"
+			only["PRIVATE_GIT_HOSTS"] = ""
+			if out, err := runWorkflowBash(exact, only); err != nil {
+				t.Fatalf("exact-only setup: %v %s", err, out)
+			}
+			old := cloneEnvironment(only)
+			old["PRIVATE_GIT_TOKEN"] = "LEGACY_NAMESPACE"
+			old["PRIVATE_GIT_APP_ENABLED"] = ""
+			old["PRIVATE_GIT_EXACT_ENABLED"] = only["PRIVATE_GIT_REPOSITORIES"]
+			if out, err := runWorkflowBash(legacy, old); err != nil {
+				t.Fatalf("exact-only legacy suppression: %v %s", err, out)
+			}
+			assertCredentialPassword(t, temp, only["GITHUB_JOB"], "improveit-now/improveit-go", "EXACT_READ_ONLY")
+			assertNoCredential(t, temp, only["GITHUB_JOB"], "unrelated/repository")
+			assertNoCredential(t, temp, only["GITHUB_JOB"], "improveit-now/improveit-go/child")
+
+		})
+	}
+}
+
+func TestGoCIWorkflowExactRepositoryConfigurationFailsClosed(t *testing.T) {
+	workflow := readGoCIWorkflow(t)
+	for _, jobName := range []string{"go_lint", "go_test_build"} {
+		t.Run(jobName, func(t *testing.T) {
+			next := "go_test_build"
+			if jobName == next {
+				next = ""
+			}
+			job := workflowJob(t, workflow, jobName, next)
+			script := workflowStepRun(t, workflowStep(t, job, "Set exact repository access for GOPRIVATE", "Set GitHub access token for GOPRIVATE"))
+			invalid := []string{"github.com", "github.com/owner", "https://github.com/owner/repo", "user@github.com/owner/repo", "github.com:443/owner/repo", "github.com/owner/repo/child", "github.com/owner/repo/", "github.com/owner/repo.git", "github.com/owner/repo.GIT", "github.com/./repo", "github.com/owner/..", "github.com/owner/repo?x", "github.com/owner/repo#x", "github.com/owner/*", "github.com/owner/repo\nhelper=bad", ".github.com/owner/repo", "github..com/owner/repo", "github.com./owner/repo", "github.com/owner/repo\rinside"}
+			for _, list := range invalid {
+				env := map[string]string{"RUNNER_TEMP": t.TempDir(), "GITHUB_ENV": filepath.Join(t.TempDir(), "env"), "GITHUB_JOB": jobName, "PRIVATE_GIT_REPOSITORIES": list, "PRIVATE_GIT_REPOSITORY_TOKEN": "EXACT_SYNTHETIC_SECRET", "PRIVATE_GIT_HOSTS": "", "PRIVATE_GIT_APP_ENABLED": "client-id", "PRIVATE_GIT_TOKEN": "LEGACY_MUST_NOT_BE_BORROWED"}
+				if out, err := runWorkflowBash(script, env); err == nil || strings.Contains(string(out), "EXACT_SYNTHETIC_SECRET") {
+					t.Fatalf("invalid list admitted or token leaked: %q %v %s", list, err, out)
+				}
+			}
+			for _, pair := range [][2]string{{"github.com/owner/repo", ""}, {"", "EXACT_SYNTHETIC_SECRET"}, {" , \n ", "EXACT_SYNTHETIC_SECRET"}} {
+				env := map[string]string{"RUNNER_TEMP": t.TempDir(), "GITHUB_ENV": filepath.Join(t.TempDir(), "env"), "GITHUB_JOB": jobName, "PRIVATE_GIT_REPOSITORIES": pair[0], "PRIVATE_GIT_REPOSITORY_TOKEN": pair[1], "PRIVATE_GIT_HOSTS": "", "PRIVATE_GIT_APP_ENABLED": "client-id", "PRIVATE_GIT_TOKEN": "LEGACY_MUST_NOT_BE_BORROWED"}
+				if out, err := runWorkflowBash(script, env); err == nil || strings.Contains(string(out), "EXACT_SYNTHETIC_SECRET") {
+					t.Fatalf("unpaired exact config accepted: %v %s", err, out)
+				}
+			}
+			for _, prefix := range []string{"github.com", "github.com/improveit-now", "github.com/improveit-now/improveit-go", "github.com/improveit-now/improveit-go/child", "github.com/improveit-now/improveit-go.git", "github.com/improveit-now/improveit-go.git/child", "github.com/other/../improveit-now", "github.com/IMPROVEIT-NOW", "github.com/improveit-now/IMPROVEIT-GO", "github.com/IMPROVEIT-NOW/IMPROVEIT-GO/child", "github.com/improveit-now/improveit-go.GIT/child", "GITHUB.COM/improveit-now"} {
+				env := map[string]string{"RUNNER_TEMP": t.TempDir(), "GITHUB_ENV": filepath.Join(t.TempDir(), "env"), "GITHUB_JOB": jobName, "PRIVATE_GIT_REPOSITORIES": "github.com/improveit-now/improveit-go", "PRIVATE_GIT_REPOSITORY_TOKEN": "EXACT_SYNTHETIC_SECRET", "PRIVATE_GIT_HOSTS": prefix}
+				if out, err := runWorkflowBash(script, env); err == nil {
+					t.Fatalf("unsafe mixed legacy prefix accepted: %q %s", prefix, out)
+				}
+			}
+			for _, exactList := range []string{"github.com/IMPROVEIT-NOW/improveit-go", "github.com/improveit-now/IMPROVEIT-GO"} {
+				env := map[string]string{"RUNNER_TEMP": t.TempDir(), "GITHUB_ENV": filepath.Join(t.TempDir(), "env"), "GITHUB_JOB": jobName, "PRIVATE_GIT_REPOSITORIES": exactList, "PRIVATE_GIT_REPOSITORY_TOKEN": "EXACT_SYNTHETIC_SECRET", "PRIVATE_GIT_HOSTS": "github.com/improveit-now/improveit-go.git/child"}
+				if out, err := runWorkflowBash(script, env); err == nil {
+					t.Fatalf("case alias exact recipient overlapped legacy path: %q %s", exactList, out)
+				}
+			}
+
+		})
 	}
 }

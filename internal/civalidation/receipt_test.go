@@ -534,3 +534,42 @@ func TestSecondaryInstallationIsBoundToPolicyReceipt(t *testing.T) {
 		t.Fatal("secondary installation did not change policy digest")
 	}
 }
+
+func TestExactRepositoryRecipientsBindPolicyWithoutChangingLegacyJSON(t *testing.T) {
+	setMinimumPolicyEnvironment(t)
+	t.Setenv("CI_POLICY_GOPRIVATE_GIT_REPOSITORIES", "")
+	original, err := PolicyFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldJSON, err := json.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(oldJSON), "goprivate_git_repositories") {
+		t.Fatal("empty additive input changed legacy policy serialization")
+	}
+	first, err := PolicyDigest(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CI_POLICY_GOPRIVATE_GIT_REPOSITORIES", "github.com/another-org/private-module")
+	changed, err := PolicyFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := PolicyDigest(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("exact repository credential policy was omitted from validation binding")
+	}
+	encoded, err := json.Marshal(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"goprivate_git_repositories":"github.com/another-org/private-module"`) {
+		t.Fatal("exact recipient policy was not serialized")
+	}
+}
