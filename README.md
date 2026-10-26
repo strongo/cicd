@@ -218,6 +218,42 @@ available on `release.yml`.
 historical `github.com` default is preserved for backward compatibility, but
 new and migrated callers should use the scoped plural input.
 
+For a dedicated read-only token that must reach only particular repositories,
+`workflow.yml` additionally accepts `goprivate_git_repositories` paired with the
+optional secret `GOPRIVATE_GIT_REPOSITORY_TOKEN`. Supply both or neither; a
+missing dedicated token never borrows `GH_TOKEN`, including in App mode. Use
+canonical `host/owner/repository` entries, comma- or newline-separated, without
+URL schemes, ports, user information, `.git` suffixes, dot segments or child
+paths. The helper answers only HTTPS requests for that exact host and
+`owner/repository` or `owner/repository.git`; siblings and descendants receive
+no dedicated credential.
+
+```yaml
+with:
+  GOPRIVATE: github.com/my-org,github.com/another-org/private-module
+  goprivate_git_hosts: github.com/my-org
+  goprivate_git_repositories: github.com/another-org/private-module
+secrets:
+  GH_TOKEN: ${{ secrets.EXISTING_NAMESPACE_TOKEN }}
+  GOPRIVATE_GIT_REPOSITORY_TOKEN: ${{ secrets.PRIVATE_MODULE_READ_TOKEN }}
+```
+
+Configure the dedicated token securely with contents-read access to only its
+selected repository; this workflow does not create tokens or expand grants.
+Exact mode, like App mode, disables the legacy single-host default. Existing
+explicit plural legacy prefixes remain available with their original token.
+Remove the exact recipients from that legacy list: mixed mode rejects any
+ancestor, equal or descendant legacy scope overlapping the bare or `.git`
+repository, as well as unsafe/host-wide mixed prefixes. It does not silently
+retain a broader route beside the exact credential. App repository routes stay
+unchanged. Each job stores the dedicated credential in a mode600 runner-temporary
+file and always removes its credential files/helper registration at job end;
+no token value or token hash enters logs, artifacts or validation receipts.
+The nonsecret exact recipient list is part of the exact-tree validation policy.
+This additive input/secret pair applies to `workflow.yml` Build/Test and Lint;
+it is not a new `release.yml` credential mode. Pin a published provider release
+containing the input before passing it from a caller.
+
 For private modules in another organization, prefer a short-lived GitHub App
 installation token over extending a user token across organizations. The App
 must have only `Contents: read` and must be installed only on the repositories
