@@ -797,7 +797,30 @@ jobs:
           git config --global --add credential.helper "$helper_file"
 
       - name: Download dependencies
-        run: go mod download all
+        run: |
+          set -euo pipefail
+          # Git 2.54+ may launch detached maintenance that races a later
+          # unshallow fetch in Go's VCS cache. Scope the guard to Go's children,
+          # retaining inherited runtime pairs and exact credential configuration.
+          config_count="${GIT_CONFIG_COUNT:-0}"
+          if ! [[ "$config_count" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid inherited Git runtime configuration count"
+            exit 1
+          fi
+          # Normalize as text before arithmetic so oversized inherited counts
+          # cannot wrap and overwrite credential pairs. Git counts are signed ints.
+          config_count="${config_count#"${config_count%%[!0]*}"}"
+          config_count="${config_count:-0}"
+          if [[ ${#config_count} -gt 10 ]] || [[ "$config_count" -gt 2147483645 ]]; then
+            echo "::error::Invalid inherited Git runtime configuration count"
+            exit 1
+          fi
+          env "GIT_CONFIG_COUNT=$((config_count + 2))" \
+            "GIT_CONFIG_KEY_${config_count}=maintenance.auto" \
+            "GIT_CONFIG_VALUE_${config_count}=false" \
+            "GIT_CONFIG_KEY_$((config_count + 1))=gc.auto" \
+            "GIT_CONFIG_VALUE_$((config_count + 1))=0" \
+            go mod download all
         shell: bash
         env:
           GOPRIVATE: ${{ inputs.GOPRIVATE }}
@@ -1281,7 +1304,30 @@ jobs:
           git config --global --add credential.helper "$helper_file"
 
       - name: Download dependencies
-        run: go mod download all
+        run: |
+          set -euo pipefail
+          # Git 2.54+ may launch detached maintenance that races a later
+          # unshallow fetch in Go's VCS cache. Scope the guard to Go's children,
+          # retaining inherited runtime pairs and exact credential configuration.
+          config_count="${GIT_CONFIG_COUNT:-0}"
+          if ! [[ "$config_count" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid inherited Git runtime configuration count"
+            exit 1
+          fi
+          # Normalize as text before arithmetic so oversized inherited counts
+          # cannot wrap and overwrite credential pairs. Git counts are signed ints.
+          config_count="${config_count#"${config_count%%[!0]*}"}"
+          config_count="${config_count:-0}"
+          if [[ ${#config_count} -gt 10 ]] || [[ "$config_count" -gt 2147483645 ]]; then
+            echo "::error::Invalid inherited Git runtime configuration count"
+            exit 1
+          fi
+          env "GIT_CONFIG_COUNT=$((config_count + 2))" \
+            "GIT_CONFIG_KEY_${config_count}=maintenance.auto" \
+            "GIT_CONFIG_VALUE_${config_count}=false" \
+            "GIT_CONFIG_KEY_$((config_count + 1))=gc.auto" \
+            "GIT_CONFIG_VALUE_$((config_count + 1))=0" \
+            go mod download all
         shell: bash
         env:
           GOPRIVATE: ${{ inputs.GOPRIVATE }}
