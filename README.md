@@ -74,6 +74,28 @@ surface and is not part of this reusable-workflow timing policy. It uses `go
 mod download all` rather than `go get ./...`, so CI never rewrites a consumer's
 dependency requirements.
 
+## Custom coverage execution
+
+`workflow.yml` accepts an optional `coverage_command` for repositories whose
+complete test suite needs special runtime setup. For example, with
+`working_directory: backend`, set `coverage_command: bash scripts/test-coverage.sh`.
+The trusted command replaces only the existing coverage test invocation, runs
+from that working directory with Bash errexit and pipefail, and must return a
+nonzero status on any failed test or cleanup. It must test the complete module
+and produce a fresh, unmodified `profile.cov` in that directory. The existing
+minimum coverage and raw zero-uncovered-statement gates still check that file;
+lint, build, version and publication policy are unchanged.
+
+An empty input keeps the existing `go test ./... -coverprofile=profile.cov
+-count=1` command and optional `coverpkg` argument. A custom command owns all
+its test flags, including any `coverpkg` or additive build tags. It runs only
+when the existing coverage step would run; this input does not enable coverage
+or replace the ordinary noncoverage test step. Build tags passed by a custom
+command do not extend the shared lint/vet jobs: the caller must arrange static
+analysis of tagged code separately. The command string is bound into the
+exact-tree validation receipt policy, and checked-in scripts are covered by
+the existing source-tree binding.
+
 ## Reuse exact pull-request validation after merge
 
 `workflow.yml` can reuse successful same-repository pull-request validation
