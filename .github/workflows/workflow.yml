@@ -114,6 +114,16 @@ on:
           package — instead of crediting a statement only when its own test lives in
           the same package directory. Leave empty (the default) to preserve today's
           per-package attribution unchanged.
+      coverage_command:
+        type: string
+        required: false
+        default: ''
+        description: >-
+          Optional trusted repository command replacing only the coverage test
+          invocation. Runs in working_directory with Bash errexit and pipefail;
+          must test the complete module and write a fresh profile.cov there.
+          The existing coverage gates still apply. Empty preserves the default
+          go test command, including coverpkg; custom commands own their flags.
       run-goreleaser:
         type: boolean
         description: 'Run GoReleaser'
@@ -269,6 +279,7 @@ env:
   CI_POLICY_ADDITIONAL_GO_TEST_PATH: ${{ inputs.additional_go_test_path }}
   CI_POLICY_MIN_TEST_COVERAGE_PERCENT: ${{ inputs.min_test_coverage_percent }}
   CI_POLICY_COVERPKG: ${{ inputs.coverpkg }}
+  CI_POLICY_COVERAGE_COMMAND: ${{ inputs.coverage_command }}
   CI_POLICY_RUN_GORELEASER: ${{ inputs.run-goreleaser }}
   CI_POLICY_CGO_ENABLED: ${{ inputs.cgo_enabled }}
   CI_POLICY_TAG_PREFIX: ${{ inputs.tag_prefix }}
@@ -1382,9 +1393,15 @@ jobs:
 
       - if: ${{ needs.validation_reuse.outputs.reuse_valid != 'true' && ((inputs.code_coverage && github.ref == 'refs/heads/main') || inputs.min_test_coverage_percent != '') }}
         name: Run tests with coverage
-        run: go test ./... -coverprofile=profile.cov -count=1 ${{ inputs.coverpkg && format('-coverpkg={0}', inputs.coverpkg) || '' }}
+        run: |
+          if [[ -n "$COVERAGE_COMMAND" ]]; then
+            exec bash --noprofile --norc -e -o pipefail -c "$COVERAGE_COMMAND"
+          else
+            go test ./... -coverprofile=profile.cov -count=1 ${{ inputs.coverpkg && format('-coverpkg={0}', inputs.coverpkg) || '' }}
+          fi
         shell: bash
         env:
+          COVERAGE_COMMAND: ${{ inputs.coverage_command }}
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/${{ inputs.GOOGLE_APPLICATION_CREDENTIALS }}
 

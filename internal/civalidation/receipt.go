@@ -38,6 +38,7 @@ type Policy struct {
 	AdditionalGoTestPath                    string `json:"additional_go_test_path"`
 	MinimumTestCoveragePercent              string `json:"min_test_coverage_percent"`
 	CoverPackage                            string `json:"coverpkg"`
+	CoverageCommand                         string `json:"coverage_command,omitempty"`
 	RunGoReleaser                           bool   `json:"run_goreleaser"`
 	CGOEnabled                              bool   `json:"cgo_enabled"`
 	TagPrefix                               string `json:"tag_prefix"`
@@ -202,6 +203,7 @@ func PolicyFromEnvironment() (Policy, error) {
 		AdditionalGoTestPath:                    os.Getenv("CI_POLICY_ADDITIONAL_GO_TEST_PATH"),
 		MinimumTestCoveragePercent:              minimumCoverage,
 		CoverPackage:                            os.Getenv("CI_POLICY_COVERPKG"),
+		CoverageCommand:                         os.Getenv("CI_POLICY_COVERAGE_COMMAND"),
 		RunGoReleaser:                           runGoReleaser,
 		CGOEnabled:                              cgoEnabled,
 		TagPrefix:                               os.Getenv("CI_POLICY_TAG_PREFIX"),

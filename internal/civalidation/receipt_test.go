@@ -573,3 +573,41 @@ func TestExactRepositoryRecipientsBindPolicyWithoutChangingLegacyJSON(t *testing
 		t.Fatal("exact recipient policy was not serialized")
 	}
 }
+
+func TestPolicyDigestBindsCoverageCommand(t *testing.T) {
+	setMinimumPolicyEnvironment(t)
+	t.Setenv("CI_POLICY_COVERAGE_COMMAND", "")
+	baseline, err := PolicyFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline.CoverageCommand != "" || bytes.Contains(encoded, []byte(`"coverage_command"`)) {
+		t.Fatal("empty coverage command must preserve legacy policy JSON")
+	}
+	previous, err := PolicyDigest(baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{"bash scripts/coverage.sh", "bash scripts/coverage.sh\nprintf 'done\\n'", ""} {
+		t.Setenv("CI_POLICY_COVERAGE_COMMAND", command)
+		policy, err := PolicyFromEnvironment()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if policy.CoverageCommand != command {
+			t.Fatalf("command=%q, want=%q", policy.CoverageCommand, command)
+		}
+		digest, err := PolicyDigest(policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if digest == previous {
+			t.Fatal("changing coverage command must change policy digest")
+		}
+		previous = digest
+	}
+}
