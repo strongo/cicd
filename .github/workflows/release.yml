@@ -907,9 +907,137 @@ jobs:
       # git-cliff-based bump success path just above, which always sets
       # outputs, and the `default_bump` forced-bump path just below, which
       # cannot reach here and always sets outputs too).
+      # A retry must not treat this run's failed native build tag as a new
+      # version baseline. Native request metadata correlates parent run, earlier
+      # attempt, tag and source; a caller-supplied title is not authentication.
+      # The exact-source, quality, native, signing and publication gates rerun.
+      - name: Recover this run's native release tag
+        id: retry_native_tag
+        if: ${{ github.ref == 'refs/heads/main' && github.ref_type != 'tag' && github.run_attempt > 1 && inputs.native_build_workflow != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          WORKFLOW: ${{ inputs.native_build_workflow }}
+          PREFIX: ${{ inputs.tag_prefix }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          python3 -I <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+
+          def fail(message):
+              raise SystemExit(message)
+
+
+          def get(endpoint):
+              result = subprocess.run(["gh", "api", "--include", endpoint], capture_output=True, text=True, timeout=60)
+              response = result.stdout.replace("\r\n", "\n")
+              header, separator, body = response.partition("\n\n")
+              status = re.match(r"HTTP/\S+\s+([0-9]{3})\b", header)
+              if not separator or not status or result.returncode or int(status[1]) != 200:
+                  fail("Release retry API read failed or has no verified HTTP 200 status")
+              return json.loads(body)
+
+
+          def git(*args):
+              result = subprocess.run(["git", *args], capture_output=True, text=True, timeout=30)
+              if result.returncode:
+                  fail("Release retry cannot verify local tag identity")
+              return result.stdout.strip()
+
+
+          def releases():
+              # Unlike the published-release-by-tag endpoint, the complete listing
+              # includes drafts visible to this workflow's contents-write token.
+              result = subprocess.run(["gh", "api", "--paginate", "--slurp", "repos/" + repo + "/releases?per_page=100"], capture_output=True, text=True, timeout=60)
+              if result.returncode:
+                  fail("Release retry cannot read the complete release listing")
+              pages = json.loads(result.stdout)
+              if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
+                  fail("Release retry release listing is malformed")
+              entries = [entry for page in pages for entry in page]
+              if any(not isinstance(entry, dict) or not isinstance(entry.get("tag_name"), str) or type(entry.get("draft")) is not bool for entry in entries):
+                  fail("Release retry release entry is malformed")
+              return entries
+
+
+          def public_release(tag, entries):
+              matching = [entry for entry in entries if entry["tag_name"] == tag]
+              if len(matching) > 1 or any(entry["draft"] for entry in matching):
+                  fail("Existing draft or ambiguous release needs separate recovery; refusing overwrite")
+              return bool(matching)
+
+
+          def emit(name, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write(name + "=" + value + "\n")
+
+
+          repo = os.environ["REPO"]
+          sha = os.environ["SHA"]
+          workflow = os.environ["WORKFLOW"]
+          prefix = os.environ["PREFIX"]
+          run_id = os.environ["RUN_ID"]
+          attempt = int(os.environ["RUN_ATTEMPT"])
+          if not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", workflow):
+              fail("Invalid native workflow filename for release retry")
+          version = re.compile(re.escape(prefix) + r"([0-9]+)\.([0-9]+)\.([0-9]+)")
+          runs = get("repos/" + repo + "/actions/workflows/" + workflow + "/runs?event=workflow_dispatch&head_sha=" + sha + "&per_page=100")
+          items = runs.get("workflow_runs")
+          total = runs.get("total_count")
+          if not isinstance(items, list) or type(total) is not int or total != len(items):
+              fail("Native run listing is malformed or truncated; refusing automatic retry")
+          request = re.compile(re.escape("native-release-" + run_id + "-") + r"([1-9][0-9]*)")
+          tags = set()
+          for run in items:
+              match = request.fullmatch(run.get("display_title", ""))
+              if not match or int(match[1]) >= attempt:
+                  continue
+              if run.get("event") != "workflow_dispatch" or run.get("head_sha") != sha:
+                  fail("Prior native release request has wrong event or source commit")
+              tag = run.get("head_branch", "")
+              if not version.fullmatch(tag):
+                  fail("Prior native release request has no exact release tag")
+              tags.add(tag)
+          if not tags:
+              head_tags = [tag for tag in git("tag", "--points-at", sha, "--list").splitlines() if version.fullmatch(tag)]
+              if not head_tags:
+                  print("No earlier native request or release tag belongs to this source; retain normal version resolution.")
+                  sys.exit(0)
+              entries = releases()
+              if len(head_tags) != 1 or not public_release(head_tags[0], entries):
+                  fail("Release-format HEAD tag has no prior native request and is unpublished; explicit recovery is required")
+              emit("already_published", "true")
+              print("::notice::HEAD already has a public release; no publication, assets or downstream work is resumed.")
+              sys.exit(0)
+          if len(tags) != 1:
+              fail("Ambiguous prior native release tags; refusing automatic retry")
+          tag = tags.pop()
+          if git("rev-parse", "--verify", "refs/tags/" + tag + "^{commit}") != sha:
+              fail("Prior native release tag no longer points at the exact source commit")
+          entries = releases()
+          if public_release(tag, entries):
+              emit("already_published", "true")
+              print("::notice::This run's exact tag is public; no publication, assets or downstream work is resumed.")
+              sys.exit(0)
+          candidate_version = tuple(map(int, version.fullmatch(tag).groups()))
+          for other in git("tag", "--list").splitlines():
+              match = version.fullmatch(other)
+              if match and tuple(map(int, match.groups())) > candidate_version:
+                  fail("A newer same-prefix release tag exists; refusing late publication of " + tag)
+          emit("tag", tag)
+          print("::notice::Retrying this run's unpublished exact tag " + tag + "; all native and publication gates remain required.")
+          PY
+
       - name: Resolve configured default bump
         id: resolved_bump
-        if: ${{ github.ref == 'refs/heads/main' && github.ref_type != 'tag' }}
+        if: ${{ github.ref == 'refs/heads/main' && github.ref_type != 'tag' && steps.retry_native_tag.outputs.tag == '' && steps.retry_native_tag.outputs.already_published != 'true' }}
         env:
           PROPOSED_VERSION: ${{ steps.bump_dry.outputs.content }}
           PREFIX: ${{ inputs.tag_prefix }}
@@ -957,7 +1085,7 @@ jobs:
 
       - name: Determine and push guarded tag
         id: tag
-        if: ${{ github.ref == 'refs/heads/main' && github.ref_type != 'tag' && steps.resolved_bump.outputs.new_version != '' }}
+        if: ${{ github.ref == 'refs/heads/main' && github.ref_type != 'tag' && (steps.resolved_bump.outputs.new_version != '' || steps.retry_native_tag.outputs.tag != '') }}
         env:
           PREV: ${{ steps.resolved_bump.outputs.previous_version }}
           NEXT: ${{ steps.resolved_bump.outputs.new_version }}
@@ -965,8 +1093,14 @@ jobs:
           PREV_TAG: ${{ steps.resolved_bump.outputs.previous_tag }}
           ALLOW_MAJOR: ${{ inputs.allow_major_version_bump }}
           PREFIX: ${{ inputs.tag_prefix }}
+          RECOVERED_TAG: ${{ steps.retry_native_tag.outputs.tag }}
         run: |
           set -euo pipefail
+          if [ -n "${RECOVERED_TAG:-}" ]; then
+            [ "$(git rev-parse --verify "refs/tags/${RECOVERED_TAG}^{commit}")" = "$GITHUB_SHA" ] || exit 1
+            echo "new_tag=$RECOVERED_TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # previous_version / new_version are bare SemVer (no prefix).
           prev_major="${PREV%%.*}"
           next_major="${NEXT%%.*}"
@@ -1239,6 +1373,8 @@ jobs:
             ${{ inputs.require_notarized_macos && '--draft' || '' }}
             ${{ inputs.goreleaser_extra_args }}
         env:
+          # Bind GoReleaser to the same exact tag checked and native-built above.
+          GORELEASER_CURRENT_TAG: ${{ steps.tag.outputs.new_tag || github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # required for releases
           GOPRIVATE: ${{ inputs.GOPRIVATE }}
           # Optional cross-repo publisher credentials. Empty when the caller
