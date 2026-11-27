@@ -73,3 +73,16 @@ func TestGoList(t *testing.T) {
 		t.Error("go list in a missing directory succeeded")
 	}
 }
+
+func TestRunEscapesWorkflowCommandError(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	listErr := errors.New("100% failed\r\nline 2\nline 3")
+	code := run(env(map[string]string{"CI_FORBIDDEN_IMPORTS": mem}), listing("", listErr), &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit %d, want 2", code)
+	}
+	want := "::error title=Forbidden imports check failed::100%25 failed%0D%0Aline 2%0Aline 3\n"
+	if got := stderr.String(); got != want {
+		t.Errorf("stderr = %q, want %q", got, want)
+	}
+}

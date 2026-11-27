@@ -45,6 +45,13 @@ func TestGoLintChecksForbiddenImports(t *testing.T) {
 	if strings.Contains(script, "export GOWORK") || strings.Contains(script, "export GOTOOLCHAIN") {
 		t.Error("GOWORK or GOTOOLCHAIN is exported: it would reach the caller's go list")
 	}
+	buildIdx := strings.Index(script, `GOWORK=off GOTOOLCHAIN=auto go build -o "$tool" ./cmd/forbidden-imports`)
+	cdIdx := strings.Index(script, `cd "$GITHUB_WORKSPACE"`)
+	rmIdx := strings.Index(script, `rm -rf "${GITHUB_WORKSPACE}/.strongo-cicd-forbidden-imports-tool"`)
+	runIdx := strings.LastIndex(script, `"$tool"`)
+	if buildIdx < 0 || cdIdx < 0 || rmIdx < 0 || runIdx < 0 || buildIdx >= cdIdx || cdIdx >= rmIdx || rmIdx >= runIdx {
+		t.Errorf("tool checkout is not cleaned up after build and before running tool: %q", script)
+	}
 	if len(lines) == 0 || lines[len(lines)-1] != `"$tool"` {
 		t.Errorf("the built tool is not what the step runs last: %q", lines)
 	}

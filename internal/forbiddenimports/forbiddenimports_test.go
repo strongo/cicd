@@ -38,8 +38,9 @@ func TestCheck(t *testing.T) {
 	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
 		t.Errorf("violations:\n%s\nwant:\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
 	}
-	if msg := got[0].String(); !strings.Contains(msg, `"example.com/app/db `+mem+`"`) || !strings.Contains(msg, "allowed_imports") {
-		t.Errorf("message does not say how to allow it: %s", msg)
+	wantAllow := "example.com/app/db " + mem
+	if msg := got[0].String(); !strings.Contains(msg, wantAllow) || strings.Contains(msg, `"`+wantAllow+`"`) || !strings.Contains(msg, "allowed_imports") {
+		t.Errorf("message does not give an unquoted allowed_imports line: %s", msg)
 	}
 }
 
@@ -56,10 +57,35 @@ func TestRuleForAnExactPackageOnly(t *testing.T) {
 }
 
 func TestParse(t *testing.T) {
-	if got, err := ParseForbidden(" a/b/... \n\n# c\nd"); err != nil || strings.Join(got, ",") != "a/b,d" {
+	if got, err := ParseForbidden(" a/b/... \n\n# c\nd\ngithub.com/dal-go/dalgo/..."); err != nil || strings.Join(got, ",") != "a/b,d,github.com/dal-go/dalgo" {
 		t.Errorf("ParseForbidden = %v, %v", got, err)
 	}
-	for _, bad := range []string{"a,b", "a b", "a # c", "./a", "/a", "a/", "...", "a/*", "a/.../b", "a...", "a/[x]"} {
+	for _, bad := range []string{
+		"a,b",
+		"a b",
+		"a # c",
+		"./a",
+		"/a",
+		"a/",
+		"...",
+		"a/*",
+		"a/.../b",
+		"a...",
+		"a/[x]",
+		`"github.com/a/b"`,
+		`'github.com/a/b'`,
+		"https://github.com/a/b",
+		"github.com/a/b@v1.0.0",
+		"github.com/a//b",
+		"github.com/a/./b",
+		"github.com/a/../b",
+		"github.com/a/b/..",
+		"a;b",
+		`a\b`,
+		"github.com/a/-b",
+		"github.com/a/.../b",
+		"github.com/a/.hidden",
+	} {
 		if _, err := ParseForbidden(bad); err == nil {
 			t.Errorf("ParseForbidden(%q) accepted it", bad)
 		}

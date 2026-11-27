@@ -10,9 +10,20 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/strongo/go-ci-action/internal/forbiddenimports"
 )
+
+var workflowCommandEscaper = strings.NewReplacer(
+	"%", "%25",
+	"\r", "%0D",
+	"\n", "%0A",
+)
+
+func emitError(w io.Writer, title, message string) {
+	_, _ = fmt.Fprintf(w, "::error title=%s::%s\n", title, workflowCommandEscaper.Replace(message))
+}
 
 func main() {
 	os.Exit(run(os.Getenv, goList, os.Stdout, os.Stderr))
@@ -34,7 +45,7 @@ func goList(dir string) ([]byte, error) {
 func run(getenv func(string) string, list func(string) ([]byte, error), stdout, stderr io.Writer) int {
 	forbidden, err := forbiddenimports.ParseForbidden(getenv("CI_FORBIDDEN_IMPORTS"))
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "::error title=Invalid forbidden_imports::%v\n", err)
+		emitError(stderr, "Invalid forbidden_imports", err.Error())
 		return 2
 	}
 	if len(forbidden) == 0 {
@@ -43,7 +54,7 @@ func run(getenv func(string) string, list func(string) ([]byte, error), stdout, 
 	}
 	rules, err := forbiddenimports.ParseRules(getenv("CI_ALLOWED_IMPORTS"))
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "::error title=Invalid allowed_imports::%v\n", err)
+		emitError(stderr, "Invalid allowed_imports", err.Error())
 		return 2
 	}
 	dir := getenv("CI_MODULE_DIR")
@@ -52,17 +63,17 @@ func run(getenv func(string) string, list func(string) ([]byte, error), stdout, 
 	}
 	out, err := list(dir)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "::error title=Forbidden imports check failed::%v\n", err)
+		emitError(stderr, "Forbidden imports check failed", err.Error())
 		return 2
 	}
 	pkgs, err := forbiddenimports.DecodePackages(bytes.NewReader(out))
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "::error title=Forbidden imports check failed::%v\n", err)
+		emitError(stderr, "Forbidden imports check failed", err.Error())
 		return 2
 	}
 	violations := forbiddenimports.Check(pkgs, forbidden, rules)
 	for _, v := range violations {
-		_, _ = fmt.Fprintf(stderr, "::error title=Forbidden import::%s\n", v)
+		emitError(stderr, "Forbidden import", v.String())
 	}
 	if len(violations) > 0 {
 		return 1

@@ -39,7 +39,7 @@ type Violation struct {
 }
 
 func (v Violation) String() string {
-	return fmt.Sprintf("%s imports %s, which this repository forbids (%s); allow it explicitly with the line %q in allowed_imports", v.Package, v.Import, v.Forbidden, v.Package+" "+v.Forbidden)
+	return fmt.Sprintf("%s imports %s, which this repository forbids (%s); allow it explicitly in allowed_imports: %s %s", v.Package, v.Import, v.Forbidden, v.Package, v.Forbidden)
 }
 
 // ParseForbidden reads one import path per line (a trailing "/..." is
@@ -49,7 +49,7 @@ func (v Violation) String() string {
 func ParseForbidden(text string) ([]string, error) {
 	var out []string
 	for _, line := range lines(text) {
-		path, err := importPath("forbidden_imports", line, strings.TrimSuffix(line, "/..."))
+		path, err := importPath("forbidden_imports", line, line)
 		if err != nil {
 			return nil, err
 		}
@@ -58,15 +58,38 @@ func ParseForbidden(text string) ([]string, error) {
 	return out, nil
 }
 
-// importPath validates path, an import path written in line of input.
-func importPath(input, line, path string) (string, error) {
-	switch {
-	// Plain import paths only: no globs or inner "..." patterns, which
-	// would match nothing and silently forbid nothing.
-	case path == "" || strings.ContainsAny(path, " \t,#*?[]") || strings.Contains(path, "...") || strings.HasPrefix(path, "/") || strings.HasPrefix(path, ".") || strings.HasSuffix(path, "/"):
+// importPath strips one optional trailing "/..." from raw and validates the
+// result per Go import-path syntax (go help importpath).
+func importPath(input, line, raw string) (string, error) {
+	path := strings.TrimSuffix(raw, "/...")
+	if !validImportPath(path) {
 		return "", fmt.Errorf("%s line %q: %q is not an import path", input, line, path)
 	}
 	return path, nil
+}
+
+func validImportPath(path string) bool {
+	if path == "" || strings.Contains(path, "...") {
+		return false
+	}
+	for _, seg := range strings.Split(path, "/") {
+		if seg == "" || seg[0] == '.' || seg[0] == '-' {
+			return false
+		}
+		for i := range len(seg) {
+			if !isImportPathChar(seg[i]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isImportPathChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		c == '-' || c == '.' || c == '_' || c == '~' || c == '+'
 }
 
 // ParseRules reads "<pattern> <import>" per line; blank lines and lines
@@ -78,10 +101,10 @@ func ParseRules(text string) ([]Rule, error) {
 		if len(fields) != 2 {
 			return nil, fmt.Errorf("allowed_imports line %q: want \"<package pattern> <import>\"", line)
 		}
-		if _, err := importPath("allowed_imports", line, strings.TrimSuffix(fields[0], "/...")); err != nil {
+		if _, err := importPath("allowed_imports", line, fields[0]); err != nil {
 			return nil, err
 		}
-		imp, err := importPath("allowed_imports", line, strings.TrimSuffix(fields[1], "/..."))
+		imp, err := importPath("allowed_imports", line, fields[1])
 		if err != nil {
 			return nil, err
 		}

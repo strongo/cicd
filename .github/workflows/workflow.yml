@@ -152,7 +152,9 @@ on:
           the in-memory DALgo test database: applications reach it through
           their platform's test helper, which names the production backend's
           profile. A package inside a forbidden import's own tree may always
-          import it. Set to an empty string to check nothing.
+          import it. Only files in the default build context (no extra -tags,
+          runner GOOS/GOARCH) are checked. Set to an empty string to check
+          nothing.
         required: false
         default: 'github.com/dal-go/dalgo/adapters/dalgo2memory'
       allowed_imports:
@@ -885,6 +887,8 @@ jobs:
           set -euo pipefail
           tool="${RUNNER_TEMP}/forbidden-imports"
           GOWORK=off GOTOOLCHAIN=auto go build -o "$tool" ./cmd/forbidden-imports
+          cd "$GITHUB_WORKSPACE"
+          rm -rf "${GITHUB_WORKSPACE}/.strongo-cicd-forbidden-imports-tool"
           "$tool"
 
       - name: golangci-lint
