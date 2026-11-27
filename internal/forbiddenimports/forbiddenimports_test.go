@@ -57,7 +57,7 @@ func TestRuleForAnExactPackageOnly(t *testing.T) {
 }
 
 func TestParse(t *testing.T) {
-	if got, err := ParseForbidden(" a/b/... \n\n# c\nd\ngithub.com/dal-go/dalgo/..."); err != nil || strings.Join(got, ",") != "a/b,d,github.com/dal-go/dalgo" {
+	if got, err := ParseForbidden(" a/b/... \n\n# c\nd\ngithub.com/dal-go/dalgo/...\ngopkg.in/yaml.v3"); err != nil || strings.Join(got, ",") != "a/b,d,github.com/dal-go/dalgo,gopkg.in/yaml.v3" {
 		t.Errorf("ParseForbidden = %v, %v", got, err)
 	}
 	for _, bad := range []string{
@@ -85,6 +85,8 @@ func TestParse(t *testing.T) {
 		"github.com/a/-b",
 		"github.com/a/.../b",
 		"github.com/a/.hidden",
+		"github.com/a/b.",
+		"github.com/a/b..",
 	} {
 		if _, err := ParseForbidden(bad); err == nil {
 			t.Errorf("ParseForbidden(%q) accepted it", bad)
