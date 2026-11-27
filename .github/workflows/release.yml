@@ -367,11 +367,24 @@ on:
           quality workflow's name to make a red suite block the tag.
 
           The guard waits for that workflow, since it usually starts on the
-          same push as this one. A commit for which the workflow produced
-          no run at all (its `paths:` filters excluded it) passes with a
-          notice. A name matching no workflow in the repository FAILS, so a
-          typo can never quietly disable the gate. The most recent run for
-          the commit decides, so re-running a red suite can clear it.
+          same push as this one. Only a `push` run for this exact commit
+          counts, on the same branch when this release runs from a branch,
+          so a manually dispatched or pull-request run at the same SHA
+          cannot decide. It must conclude `success`; `skipped`, red,
+          cancelled, still running at the timeout, or no run at all within
+          five minutes FAILS the release. A named workflow must therefore
+          run on every push it gates: no `paths:` filters on its push
+          trigger (scope inside the workflow instead, with an
+          always-reporting gate job). A name matching no workflow in the
+          repository FAILS, so a typo can never quietly disable the gate.
+          The most recent qualifying run decides, so re-running a red suite
+          can clear it.
+
+          Callers usually serialize releases with a concurrency group that
+          keeps one pending run. When a newer push replaces a pending
+          release, nothing is lost: the newer release tags every commit
+          since the latest tag, and it releases only once its own commit is
+          green.
 
           Reading another workflow's result needs the `actions: read`
           permission on the job that calls this workflow. Public
@@ -479,11 +492,11 @@ jobs:
       # dependency major. When the caller names a required workflow, observe
       # it here and refuse BEFORE the tag step below mutates anything.
       #
-      # Fails closed on a red, cancelled or timed-out run, and on a name that
-      # matches no workflow — a guard that quietly no-ops is worse than none,
-      # which is why the moving @v1 tag was retired. Passes when the required
-      # workflow legitimately produced no run for this commit, so a
-      # paths-filtered docs merge still releases.
+      # Fails closed on a red, skipped, cancelled or timed-out run, on a commit
+      # the workflow produced no push run for, and on a name that matches no
+      # workflow — a guard that quietly no-ops is worse than none, which is why
+      # the moving @v1 tag was retired. Only the exact SHA's push run (on this
+      # branch, when the release runs from one) can authorize a release.
       - name: Require the caller's quality workflow to be green before tagging
         if: ${{ inputs.require_workflow_success != '' }}
         shell: bash
@@ -491,12 +504,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
           WF_NAME: ${{ inputs.require_workflow_success }}
           TIMEOUT: ${{ inputs.require_workflow_success_timeout_seconds }}
         run: |
           set -euo pipefail
-          GRACE=180
+          GRACE=300
           POLL=15
+
+          # Only a push run for this exact commit can authorize the release; on
+          # a branch it must also be that branch's run. A dispatched or
+          # pull-request run at the same SHA never decides.
+          run_filter="event=push"
+          if [ "${REF_TYPE:-}" = branch ] && [ -n "${REF_NAME:-}" ]; then
+            run_filter="$run_filter&branch=$(jq -rn --arg b "$REF_NAME" '$b|@uri')"
+          fi
 
           # Resolve each workflow by its `name:`. A 403 here means the caller
           # opted in without granting `actions: read`; say so, rather than
@@ -536,17 +559,18 @@ jobs:
             echo "required workflow '$name' resolved to id $wf_id"
 
             # The required workflow is usually triggered by the same push as this
-            # release, so its run may not be registered yet. Wait that race out before
-            # concluding it simply does not apply to this commit.
+            # release, so its run may not be registered yet. Wait that race out; a
+            # commit with no qualifying run at all is not releasable.
             waited=0
             runs=""
             while :; do
-              runs="$(gh api "repos/$REPO/actions/workflows/$wf_id/runs?head_sha=$SHA&per_page=100" \
+              runs="$(gh api "repos/$REPO/actions/workflows/$wf_id/runs?head_sha=$SHA&$run_filter&per_page=100" \
                 --jq '[.workflow_runs[] | {id, status, conclusion, created_at, html_url}]
                       | sort_by(.created_at) | reverse')"
               [ "$(printf '%s' "$runs" | jq 'length')" -gt 0 ] && break
               if [ "$waited" -ge "$GRACE" ]; then
-                echo "::notice title=Required workflow did not run::'$name' produced no run for $SHA within ${GRACE}s, so it does not apply to this commit (paths filters). Continuing."
+                echo "::error title=Required workflow did not run::'$name' produced no $run_filter run for $SHA within ${GRACE}s. A gated workflow must run on every push it gates (no paths: filters on its push trigger)."
+                not_green="$not_green '$name'"
                 runs=""
                 break
               fi
@@ -564,7 +588,7 @@ jobs:
               read -r status conclusion <<<"$(gh api "repos/$REPO/actions/runs/$run_id" --jq '"\(.status) \(.conclusion // "-")"')"
               if [ "$status" = "completed" ]; then
                 case "$conclusion" in
-                  success|skipped)
+                  success)
                     echo "::notice title=Required workflow green::'$name' concluded $conclusion for $SHA."
                     ;;
                   *)

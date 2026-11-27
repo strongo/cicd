@@ -387,17 +387,27 @@ Behaviour, all of it fail-closed:
 
 | Situation | Result |
 |---|---|
-| Required workflow concluded `success` (or `skipped`) | release proceeds |
-| Concluded `failure`, `cancelled`, `timed_out` | **refused before any tag is cut** |
+| The exact commit's `push` run (on the release's branch) concluded `success` | release proceeds |
+| Concluded `failure`, `cancelled`, `timed_out` or `skipped` | **refused before any tag is cut** |
 | Still running | waited for, then refused on timeout |
 | Name matches no workflow in the repo | **refused** — a typo must not quietly disable the gate |
 | Several workflows named, any one not green | **refused**, and the error names every one that was not green |
-| Workflow produced no run for this commit (`paths:` filtered it out) | proceeds, with a notice |
+| No `push` run for this commit within five minutes (for example, `paths:` filtered it out) | **refused** — a gated workflow must run on every push it gates |
+| Only a dispatched or pull-request run exists at this SHA | **refused** — those runs never decide |
 
 The guard waits, because your quality workflow usually starts on the same push
-as the release. The newest run for the commit decides, so re-running a red
-suite can clear the gate. Leaving the input unset keeps the previous
+as the release. The newest qualifying run for the commit decides, so re-running
+a red suite can clear the gate. Leaving the input unset keeps the previous
 behaviour exactly.
+
+Do not put `paths:` filters on the gated workflow's push trigger. Scope work
+inside the workflow instead, with an always-reporting gate job (see the fleet
+rule `one-ci-workflow-smart-jobs` in sneat-co/backstage).
+
+A caller's `concurrency: { group: release, cancel-in-progress: false }` keeps
+one pending release. When a newer push replaces it, nothing is lost: the newer
+release tags every commit since the latest tag, and it releases only once its
+own commit is green.
 
 Note the `actions: read` permission. A reusable workflow cannot grant itself
 more than its caller allows, so it must be added on **your** calling job. Public

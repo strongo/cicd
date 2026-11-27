@@ -2381,17 +2381,50 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 		}
 	})
 
-	// A docs-only merge filtered out by the required workflow's `paths:` must
-	// still be releasable, or this guard would red every such release.
-	t.Run("a commit the required workflow never ran for still releases", func(t *testing.T) {
+	// A commit with no qualifying run is not releasable: a gate that passes on
+	// "nothing ran" is a gate any misconfiguration or outage opens.
+	t.Run("a commit the required workflow never ran for blocks the release", func(t *testing.T) {
 		dir := stub(t, `[]`, "completed success")
-		out, err := runBash(dir, "GRACE_OVERRIDE=1\nPATH="+dir+":$PATH\n"+
-			strings.Replace(script, "GRACE=180", "GRACE=0", 1), env(nil))
-		if err != nil {
-			t.Fatalf("a commit with no run for the required workflow must not block: %v\n%s", err, out)
+		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+
+			strings.Replace(script, "GRACE=300", "GRACE=0", 1), env(nil))
+		if err == nil {
+			t.Fatalf("a commit with no run for the required workflow must fail the release, got success:\n%s", out)
 		}
-		if !strings.Contains(string(out), "does not apply to this commit") {
-			t.Fatalf("the pass must be explained as not applicable:\n%s", out)
+		if !strings.Contains(string(out), "Required workflow did not run") || !strings.Contains(string(out), "refusing to tag or publish") {
+			t.Fatalf("failure must say the workflow did not run and the release is refused:\n%s", out)
+		}
+	})
+
+	// A run whose jobs all skipped checked nothing.
+	t.Run("a skipped required workflow blocks the release", func(t *testing.T) {
+		dir := stub(t, oneRun, "completed skipped")
+		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env(nil))
+		if err == nil {
+			t.Fatalf("a skipped required workflow must fail the release, got success:\n%s", out)
+		}
+	})
+
+	// Only the exact SHA's push run on the release's branch can decide; a
+	// dispatched or pull-request run at the same SHA must not.
+	t.Run("only a push run on the release branch is consulted", func(t *testing.T) {
+		for _, tc := range []struct {
+			refType, refName, want string
+		}{
+			{"branch", "releases/v1", "&event=push&branch=releases%2Fv1&"},
+			{"tag", "v1.2.3", "&event=push&per_page"},
+		} {
+			dir := stub(t, oneRun, "completed success")
+			log := filepath.Join(dir, "args.log")
+			logging := "gh() { printf '%s\\n' \"$*\" >> " + log + "; command gh \"$@\"; }\n"
+			out, err := runBash(dir, "PATH="+dir+":$PATH\n"+logging+script,
+				env(map[string]string{"REF_TYPE": tc.refType, "REF_NAME": tc.refName}))
+			if err != nil {
+				t.Fatalf("%s %s: %v\n%s", tc.refType, tc.refName, err, out)
+			}
+			calls, _ := os.ReadFile(log)
+			if !strings.Contains(string(calls), "head_sha=a913de4fd6455e35d2cf9b4f54c4bb5ed36bb4fe"+tc.want) {
+				t.Fatalf("%s %s: runs query must filter with %q, got:\n%s", tc.refType, tc.refName, tc.want, calls)
+			}
 		}
 	})
 
