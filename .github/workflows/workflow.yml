@@ -144,6 +144,26 @@ on:
         description: 'Working directory for all go commands. Useful for repos where the Go module lives in a subdirectory. Defaults to repo root.'
         required: false
         default: '.'
+      forbidden_imports:
+        type: string
+        description: >-
+          Import paths no package of this module may import directly, one per
+          line (each also covers the packages below it). The default forbids
+          the in-memory DALgo test database: applications reach it through
+          their platform's test helper, which names the production backend's
+          profile. A package inside a forbidden import's own tree may always
+          import it. Set to an empty string to check nothing.
+        required: false
+        default: 'github.com/dal-go/dalgo/adapters/dalgo2memory'
+      allowed_imports:
+        type: string
+        description: >-
+          Explicit exceptions to forbidden_imports, one per line:
+          "<package pattern> <import>", where the pattern is an import path or
+          a path ending in "/..." for it and everything below it, for example
+          "github.com/sneat-co/sneat-go-core/sneatcoretesting github.com/dal-go/dalgo/adapters/dalgo2memory".
+        required: false
+        default: ''
       allow_major_version_bump:
         type: boolean
         description: 'Allow automatic major version bump when a commit message contains the major string token. Disabled by default to prevent accidental major bumps.'
@@ -284,6 +304,8 @@ env:
   CI_POLICY_CGO_ENABLED: ${{ inputs.cgo_enabled }}
   CI_POLICY_TAG_PREFIX: ${{ inputs.tag_prefix }}
   CI_POLICY_WORKING_DIRECTORY: ${{ inputs.working_directory }}
+  CI_POLICY_FORBIDDEN_IMPORTS: ${{ inputs.forbidden_imports }}
+  CI_POLICY_ALLOWED_IMPORTS: ${{ inputs.allowed_imports }}
   CI_POLICY_ALLOW_MAJOR_VERSION_BUMP: ${{ inputs.allow_major_version_bump }}
   CI_POLICY_GO_VERSION: ${{ inputs.go_version }}
   CI_POLICY_DEFAULT_BUMP: ${{ inputs.default_bump }}
@@ -838,6 +860,22 @@ jobs:
 
       - run: go vet ./...
         shell: bash
+
+      - name: Checkout exact forbidden-imports tool
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .strongo-cicd-forbidden-imports-tool
+          persist-credentials: false
+
+      - name: Check forbidden imports
+        working-directory: .strongo-cicd-forbidden-imports-tool
+        env:
+          CI_FORBIDDEN_IMPORTS: ${{ inputs.forbidden_imports }}
+          CI_ALLOWED_IMPORTS: ${{ inputs.allowed_imports }}
+          CI_MODULE_DIR: ${{ github.workspace }}/${{ inputs.working_directory }}
+        run: go run ./cmd/forbidden-imports
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9

@@ -43,6 +43,8 @@ type Policy struct {
 	CGOEnabled                              bool   `json:"cgo_enabled"`
 	TagPrefix                               string `json:"tag_prefix"`
 	WorkingDirectory                        string `json:"working_directory"`
+	ForbiddenImports                        string `json:"forbidden_imports"`
+	AllowedImports                          string `json:"allowed_imports"`
 	AllowMajorVersionBump                   bool   `json:"allow_major_version_bump"`
 	GoVersion                               string `json:"go_version"`
 	DefaultBump                             string `json:"default_bump"`
@@ -208,6 +210,8 @@ func PolicyFromEnvironment() (Policy, error) {
 		CGOEnabled:                              cgoEnabled,
 		TagPrefix:                               os.Getenv("CI_POLICY_TAG_PREFIX"),
 		WorkingDirectory:                        os.Getenv("CI_POLICY_WORKING_DIRECTORY"),
+		ForbiddenImports:                        os.Getenv("CI_POLICY_FORBIDDEN_IMPORTS"),
+		AllowedImports:                          os.Getenv("CI_POLICY_ALLOWED_IMPORTS"),
 		AllowMajorVersionBump:                   allowMajor,
 		GoVersion:                               os.Getenv("CI_POLICY_GO_VERSION"),
 		DefaultBump:                             os.Getenv("CI_POLICY_DEFAULT_BUMP"),
