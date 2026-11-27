@@ -15,7 +15,7 @@ func TestGoLintChecksForbiddenImports(t *testing.T) {
 	checkout := strings.Index(job, "      - name: Checkout exact forbidden-imports tool\n")
 	check := strings.Index(job, "      - name: Check forbidden imports\n")
 	lint := strings.Index(job, "      - name: golangci-lint\n")
-	if download < 0 || checkout < 0 || check < 0 || lint < 0 || !(download < checkout && checkout < check && check < lint) {
+	if download < 0 || checkout < 0 || check < 0 || lint < 0 || download >= checkout || checkout >= check || check >= lint {
 		t.Fatalf("steps out of order: download=%d checkout=%d check=%d lint=%d", download, checkout, check, lint)
 	}
 	steps := job[checkout:lint]
@@ -33,5 +33,32 @@ func TestGoLintChecksForbiddenImports(t *testing.T) {
 	}
 	if got := strings.Count(steps, "if: ${{ inputs.forbidden_imports != '' }}"); got != 2 {
 		t.Errorf("%d of 2 forbidden-imports steps are skipped when nothing is forbidden", got)
+	}
+	// The build's environment is its own, and the built tool is what runs.
+	script := workflowStepRun(t, steps[check-checkout:])
+	var lines []string
+	for _, line := range strings.Split(script, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if strings.Contains(script, "export GOWORK") || strings.Contains(script, "export GOTOOLCHAIN") {
+		t.Error("GOWORK or GOTOOLCHAIN is exported: it would reach the caller's go list")
+	}
+	if len(lines) == 0 || lines[len(lines)-1] != `"$tool"` {
+		t.Errorf("the built tool is not what the step runs last: %q", lines)
+	}
+}
+
+// The fleet-wide default forbids the in-memory DALgo test database.
+func TestForbiddenImportsDefaultsToDalgo2memory(t *testing.T) {
+	workflow := readGoCIWorkflow(t)
+	start := strings.Index(workflow, "      forbidden_imports:\n")
+	end := strings.Index(workflow, "      allowed_imports:\n")
+	if start < 0 || end < start {
+		t.Fatal("forbidden_imports input missing")
+	}
+	if !strings.Contains(workflow[start:end], "        default: 'github.com/dal-go/dalgo/adapters/dalgo2memory'\n") {
+		t.Error("forbidden_imports no longer defaults to dalgo2memory")
 	}
 }

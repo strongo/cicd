@@ -61,7 +61,9 @@ func ParseForbidden(text string) ([]string, error) {
 // importPath validates path, an import path written in line of input.
 func importPath(input, line, path string) (string, error) {
 	switch {
-	case path == "" || strings.ContainsAny(path, " \t,#") || strings.HasPrefix(path, "/") || strings.HasPrefix(path, ".") || strings.HasSuffix(path, "/"):
+	// Plain import paths only: no globs or inner "..." patterns, which
+	// would match nothing and silently forbid nothing.
+	case path == "" || strings.ContainsAny(path, " \t,#*?[]") || strings.Contains(path, "...") || strings.HasPrefix(path, "/") || strings.HasPrefix(path, ".") || strings.HasSuffix(path, "/"):
 		return "", fmt.Errorf("%s line %q: %q is not an import path", input, line, path)
 	}
 	return path, nil

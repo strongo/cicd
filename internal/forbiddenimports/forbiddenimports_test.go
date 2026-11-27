@@ -59,7 +59,7 @@ func TestParse(t *testing.T) {
 	if got, err := ParseForbidden(" a/b/... \n\n# c\nd"); err != nil || strings.Join(got, ",") != "a/b,d" {
 		t.Errorf("ParseForbidden = %v, %v", got, err)
 	}
-	for _, bad := range []string{"a,b", "a b", "a # c", "./a", "/a", "a/", "..."} {
+	for _, bad := range []string{"a,b", "a b", "a # c", "./a", "/a", "a/", "...", "a/*", "a/.../b", "a...", "a/[x]"} {
 		if _, err := ParseForbidden(bad); err == nil {
 			t.Errorf("ParseForbidden(%q) accepted it", bad)
 		}
