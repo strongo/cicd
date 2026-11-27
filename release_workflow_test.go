@@ -2430,17 +2430,98 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 		}
 	})
 
-	// A re-push of the same SHA registers a newer run while an older green one
-	// is being checked; the newer one decides.
+	// A re-push of the same SHA registers a newer run while an older one is
+	// still running; the newer one decides. The second listing comes back
+	// oldest-first, so the gate's own sort must pick the newer run.
 	t.Run("a newer run that registers meanwhile decides", func(t *testing.T) {
+		later := `{"workflow_runs":[` +
+			`{"id":1,"status":"in_progress","conclusion":null,"created_at":"2026-09-09T07:01:00Z","html_url":"https://example.test/run/1"},` +
+			`{"id":2,"status":"completed","conclusion":"failure","created_at":"2026-09-09T07:02:00Z","html_url":"https://example.test/run/2"}]}`
+		stub := gateStub{
+			workflows: workflows,
+			runs:      map[string][]string{wf: {gateRuns(1), later}},
+			status:    map[string]string{"1": "in_progress -", "2": "completed failure"},
+		}
+		out, err := run(t, stub, fastPoll, map[string]string{"TIMEOUT": "30"})
+		if err == nil || !strings.Contains(out, "following it") || !strings.Contains(out, "run/2") || !strings.Contains(out, "concluded 'failure'") {
+			t.Fatalf("a newer red run must decide over an older one (err=%v):\n%s", err, out)
+		}
+	})
+
+	t.Run("a newer green run decides over an older red one", func(t *testing.T) {
 		stub := gateStub{
 			workflows: workflows,
 			runs:      map[string][]string{wf: {gateRuns(1), gateRuns(2, 1)}},
-			status:    map[string]string{"1": "completed success", "2": "completed failure"},
+			status:    map[string]string{"1": "in_progress -", "2": "completed success"},
 		}
-		out, err := run(t, stub, script, nil)
-		if err == nil || !strings.Contains(out, "following it") || !strings.Contains(out, "concluded 'failure'") {
-			t.Fatalf("a newer red run must decide over an older green one (err=%v):\n%s", err, out)
+		if out, err := run(t, stub, fastPoll, map[string]string{"TIMEOUT": "30"}); err != nil || !strings.Contains(out, "following it") {
+			t.Fatalf("a newer green run (a re-run after red) must clear the gate (err=%v):\n%s", err, out)
+		}
+	})
+
+	// A stale duplicate left by a renamed workflow file is not active and must
+	// not make the name ambiguous; this also runs the listing's real --jq.
+	t.Run("an inactive duplicate name is ignored", func(t *testing.T) {
+		stub := gateStub{workflows: workflows + "999\tGo CI\tdisabled_manually\n", runs: oneRun, status: map[string]string{"1": "completed success"}}
+		if out, err := run(t, stub, script, nil); err != nil {
+			t.Fatalf("an inactive workflow with the same name must be ignored: %v\n%s", err, out)
+		}
+	})
+
+	t.Run("API failures refuse with an annotation", func(t *testing.T) {
+		for fail, want := range map[string]string{"list": "Cannot list required workflow runs", "read": "Cannot read required workflow run"} {
+			out, err := run(t, gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "completed success"}, fail: fail}, script, nil)
+			if err == nil || !strings.Contains(out, want) || !strings.Contains(out, "refusing to tag or publish") {
+				t.Fatalf("%s failure must refuse with %q (err=%v):\n%s", fail, want, err, out)
+			}
+		}
+	})
+
+	// An inconsistent listing that shows an older run as newest must not pull
+	// the gate back to it (which would also keep resetting its budget).
+	t.Run("an older run never replaces the one being followed", func(t *testing.T) {
+		stub := gateStub{
+			workflows: workflows,
+			runs:      map[string][]string{wf: {gateRuns(2), gateRuns(1)}},
+			status:    map[string]string{"1": "completed success", "2": "in_progress -"},
+		}
+		out, err := run(t, stub, fastPoll, map[string]string{"TIMEOUT": "2"})
+		if err == nil || !strings.Contains(out, "timed out") || strings.Contains(out, "run/1") {
+			t.Fatalf("the gate must stay on the newer run and time out on it (err=%v):\n%s", err, out)
+		}
+	})
+
+	// A listed run that disappears is not a pass.
+	t.Run("a run that vanishes from the listing refuses", func(t *testing.T) {
+		stub := gateStub{
+			workflows: workflows,
+			runs:      map[string][]string{wf: {gateRuns(1), `{"workflow_runs":[]}`}},
+			status:    map[string]string{"1": "in_progress -"},
+		}
+		out, err := run(t, stub, fastPoll, map[string]string{"TIMEOUT": "30"})
+		if err == nil || !strings.Contains(out, "no longer listed") {
+			t.Fatalf("a vanished run must refuse (err=%v):\n%s", err, out)
+		}
+	})
+
+	// A queued release can be overtaken by a force-push that removes its commit.
+	t.Run("a commit no longer on the branch refuses", func(t *testing.T) {
+		for _, reach := range []string{"diverged", "behind"} {
+			out, err := run(t, gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "completed success"}, compare: reach}, script, nil)
+			if err == nil || !strings.Contains(out, "Commit no longer on branch") {
+				t.Fatalf("%s: a commit off its branch must refuse (err=%v):\n%s", reach, err, out)
+			}
+		}
+		if out, err := run(t, gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "completed success"}, compare: "identical"}, script, nil); err != nil {
+			t.Fatalf("the branch head itself must pass: %v\n%s", err, out)
+		}
+	})
+
+	// The name is matched literally: no escape decoding.
+	t.Run("a name with backslash escapes is not decoded", func(t *testing.T) {
+		out, err := run(t, gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "completed success"}}, script, map[string]string{"WF_NAME": `Go\040CI`})
+		if err == nil || !strings.Contains(out, "Unknown required workflow") {
+			t.Fatalf("an escaped name must not match 'Go CI' (err=%v):\n%s", err, out)
 		}
 	})
 
@@ -2458,15 +2539,29 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 // only when the query is filtered to push runs, returns the n-th listing on
 // the n-th call per workflow (the last one repeats), and logs every URL.
 type gateStub struct {
-	workflows string              // "<id>\t<name>" lines, as the --jq listing yields
+	workflows string              // "<id>\t<name>[\t<state>]" lines; state defaults to active
 	runs      map[string][]string // workflow id -> successive listings
 	status    map[string]string   // run id -> "<status> <conclusion>"
+	compare   string              // compare API status of SHA...branch; default "ahead"
+	fail      string              // "list" or "read": that API call exits non-zero
 }
 
 func (s gateStub) write(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	files := map[string]string{"workflows.tsv": s.workflows}
+	var listed []string
+	for _, line := range strings.Split(strings.TrimSpace(s.workflows), "\n") {
+		f := strings.Split(line, "\t")
+		state := "active"
+		if len(f) > 2 {
+			state = f[2]
+		}
+		listed = append(listed, fmt.Sprintf(`{"id":%s,"name":%q,"state":%q}`, f[0], f[1], state))
+	}
+	files := map[string]string{"workflows.json": `{"workflows":[` + strings.Join(listed, ",") + `]}`, "fail": s.fail}
+	if s.compare != "" {
+		files["compare"] = s.compare + "\n"
+	}
 	for wf, lists := range s.runs {
 		for i, list := range lists {
 			files[fmt.Sprintf("runs.%s.%d", wf, i+1)] = list
@@ -2487,8 +2582,9 @@ while [ $# -gt 0 ]; do
 done
 printf '%s\n' "$url" >> "$d/calls.log"
 case "$url" in
-  repos/*/actions/workflows) cat "$d/workflows.tsv"; exit 0 ;;
+  repos/*/actions/workflows) jq -r "$expr" "$d/workflows.json"; exit 0 ;;
   repos/*/actions/workflows/*/runs*)
+    [ "$(cat "$d/fail")" = list ] && exit 1
     wf="${url#*workflows/}"; wf="${wf%%/*}"; file=""
     case "$url" in *event=push*)
       n=$(( $(cat "$d/count.$wf" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$d/count.$wf"
@@ -2497,7 +2593,8 @@ case "$url" in
     esac
     if [ -n "$file" ]; then jq -r "$expr" "$file"; else echo '{"workflow_runs":[]}' | jq -r "$expr"; fi
     exit 0 ;;
-  repos/*/actions/runs/*) id="${url##*/}"; cat "$d/status.$id" 2>/dev/null || exit 1; exit 0 ;;
+  repos/*/actions/runs/*) [ "$(cat "$d/fail")" = read ] && exit 1; id="${url##*/}"; cat "$d/status.$id" 2>/dev/null || exit 1; exit 0 ;;
+  repos/*/compare/*) cat "$d/compare" 2>/dev/null || echo ahead; exit 0 ;;
 esac
 exit 1
 `
@@ -2507,11 +2604,13 @@ exit 1
 	return dir
 }
 
-// gateRuns renders a raw "list workflow runs" response, newest first.
+// gateRuns renders a raw "list workflow runs" response in the given order.
+// A run's created_at derives from its id, so a higher id is always newer and
+// a run keeps its timestamp across listings, as on GitHub.
 func gateRuns(ids ...int) string {
 	runs := make([]string, len(ids))
 	for i, id := range ids {
-		runs[i] = fmt.Sprintf(`{"id":%d,"status":"completed","conclusion":"x","created_at":"2026-09-09T07:%02d:00Z","html_url":"https://example.test/run/%d"}`, id, 59-i, id)
+		runs[i] = fmt.Sprintf(`{"id":%d,"status":"completed","conclusion":"x","created_at":"2026-09-09T07:%02d:00Z","html_url":"https://example.test/run/%d"}`, id, id%60, id)
 	}
 	return `{"workflow_runs":[` + strings.Join(runs, ",") + `]}`
 }

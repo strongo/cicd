@@ -413,7 +413,8 @@ are refused as ambiguous.
 A caller's `concurrency: { group: release, cancel-in-progress: false }` keeps
 one pending release, and a newer run replaces it. The replaced release gets no
 version of its own. When the bump comes from commit history alone, its commits
-ship in the next release cut from `main`. Two cases lose more:
+ship in the next release cut from `main`, as long as they are still on `main` (a
+branch release whose commit was force-pushed away is refused). Two cases lose more:
 
 - a bump decided by the triggering head commit alone (for example a
   `default_bump` computed from that commit's title) is not re-applied;
