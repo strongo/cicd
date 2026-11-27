@@ -367,11 +367,35 @@ on:
           quality workflow's name to make a red suite block the tag.
 
           The guard waits for that workflow, since it usually starts on the
-          same push as this one. A commit for which the workflow produced
-          no run at all (its `paths:` filters excluded it) passes with a
-          notice. A name matching no workflow in the repository FAILS, so a
-          typo can never quietly disable the gate. The most recent run for
-          the commit decides, so re-running a red suite can clear it.
+          same push as this one. Only a `push` run for this exact commit
+          counts, on the same branch when this release runs from a branch,
+          so a manually dispatched or pull-request run at the same SHA
+          cannot decide. It must conclude `success`; `skipped`, red,
+          cancelled, still running at the timeout, or no run at all within
+          five minutes FAILS the release. A named workflow must therefore
+          run on every push it gates: no `paths:` filters on its push
+          trigger (scope inside the workflow instead, with an
+          always-reporting gate job). A name matching no workflow in the
+          repository FAILS, so a typo can never quietly disable the gate.
+          The most recent qualifying run decides, so re-running a red suite
+          can clear it.
+
+          A tag release accepts the tagged commit's push run from any
+          branch, so tag a commit that was pushed as a branch head (or let
+          the gated workflow also run on tag pushes). The gate runs only for
+          main and tag refs, the only refs this workflow publishes from. A
+          head pushed with the default GITHUB_TOKEN triggers no workflows, so
+          it has no push run and cannot be released through this gate.
+
+          Callers usually serialize releases with a concurrency group that
+          keeps one pending run; a newer run replaces the pending one. The
+          replaced release gets no version of its own. When the bump is
+          derived from commit history alone, its commits ship in the next
+          release cut from main, as long as they are still on main. Two cases lose more: a bump decided by the
+          head commit alone (an input such as default_bump computed from the
+          triggering commit) is not re-applied, and a tag-push release in the
+          same group is never published. Give tag-push releases their own
+          concurrency group.
 
           Reading another workflow's result needs the `actions: read`
           permission on the job that calls this workflow. Public
@@ -479,30 +503,52 @@ jobs:
       # dependency major. When the caller names a required workflow, observe
       # it here and refuse BEFORE the tag step below mutates anything.
       #
-      # Fails closed on a red, cancelled or timed-out run, and on a name that
-      # matches no workflow — a guard that quietly no-ops is worse than none,
-      # which is why the moving @v1 tag was retired. Passes when the required
-      # workflow legitimately produced no run for this commit, so a
-      # paths-filtered docs merge still releases.
+      # Fails closed on a red, skipped, cancelled or timed-out run, on a commit
+      # the workflow produced no push run for, and on a name that matches no
+      # workflow — a guard that quietly no-ops is worse than none, which is why
+      # the moving @v1 tag was retired. Only the exact SHA's push run (on main
+      # for a main release; on any branch for a tag release) can authorize it,
+      # and when a newer qualifying run appears while one is checked, the
+      # newest decides.
       - name: Require the caller's quality workflow to be green before tagging
-        if: ${{ inputs.require_workflow_success != '' }}
+        # Only main and tag refs can tag or publish; on any other ref this
+        # workflow publishes nothing, so there is nothing to gate.
+        if: ${{ inputs.require_workflow_success != '' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag') }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
           WF_NAME: ${{ inputs.require_workflow_success }}
           TIMEOUT: ${{ inputs.require_workflow_success_timeout_seconds }}
         run: |
           set -euo pipefail
-          GRACE=180
+          GRACE=300
           POLL=15
+
+          # Only a push run for this exact commit can authorize the release; on
+          # a branch it must also be that branch's run. A dispatched or
+          # pull-request run at the same SHA never decides. A tag release
+          # accepts the commit's push run from any branch: the tag names a
+          # commit that was checked where it was pushed.
+          if [ -z "${REF_TYPE:-}" ]; then
+            echo "::error title=Missing ref type::REF_TYPE is empty; cannot scope the required-workflow lookup. Refusing to release."
+            exit 1
+          fi
+          run_filter="event=push"
+          run_desc="push run"
+          if [ "$REF_TYPE" = branch ]; then
+            run_filter="$run_filter&branch=$(jq -rn --arg b "$REF_NAME" '$b|@uri')"
+            run_desc="push run on branch '$REF_NAME'"
+          fi
 
           # Resolve each workflow by its `name:`. A 403 here means the caller
           # opted in without granting `actions: read`; say so, rather than
           # reporting the workflow as missing.
           if ! workflows="$(gh api "repos/$REPO/actions/workflows" --paginate \
-                --jq '.workflows[] | "\(.id)\t\(.name)"' 2>./wf_err)"; then
+                --jq '.workflows[] | select(.state == "active") | "\(.id)\t\(.name)"' 2>./wf_err)"; then
             if grep -qiE '403|not accessible|Resource not accessible' ./wf_err; then
               echo "::error title=Missing actions:read permission::require_workflow_success is set, but this job cannot read workflow runs in $REPO. Add 'actions: read' to the permissions of the job that calls this workflow."
             else
@@ -527,44 +573,109 @@ jobs:
           while IFS= read -r name; do
             [ -z "$name" ] && continue
 
-            wf_id="$(printf '%s\n' "$workflows" | awk -F'\t' -v n="$name" '$2 == n {print $1; exit}')"
-            if [ -z "$wf_id" ]; then
-              echo "::error title=Unknown required workflow::No workflow named '$name' exists in $REPO. require_workflow_success matches a workflow's 'name:', not its filename. Available:"
+            # Collect every match (no early exit: under pipefail an awk that quits
+            # first can break the printf pipe). Two active workflows sharing a
+            # name are ambiguous, and ambiguity is a refusal, not a guess.
+            # ENVIRON, not -v: -v would decode backslash escapes in the name; the
+            # concatenations force a string comparison, so "01" never equals "1".
+            wf_ids="$(printf '%s\n' "$workflows" | WF_MATCH="$name" awk -F'\t' '($2 "") == (ENVIRON["WF_MATCH"] "") {print $1}')"
+            if [ -z "$wf_ids" ]; then
+              echo "::error title=Unknown required workflow::No active workflow named '$name' exists in $REPO. require_workflow_success matches a workflow's 'name:', not its filename. Available:"
               printf '%s\n' "$workflows" | awk -F'\t' '{print "  " $2}'
               exit 1
             fi
+            if [ "$(printf '%s\n' "$wf_ids" | wc -l)" -gt 1 ]; then
+              echo "::error title=Ambiguous required workflow::More than one active workflow in $REPO is named '$name' (ids: $(printf '%s' "$wf_ids" | tr '\n' ' ')). Give each workflow a unique name:, or disable the stale one."
+              exit 1
+            fi
+            wf_id="$wf_ids"
             echo "required workflow '$name' resolved to id $wf_id"
 
             # The required workflow is usually triggered by the same push as this
-            # release, so its run may not be registered yet. Wait that race out before
-            # concluding it simply does not apply to this commit.
-            waited=0
-            runs=""
+            # release, so its run may not be registered yet. Wait that race out; a
+            # commit with no qualifying run at all is not releasable. The listing
+            # is re-read on every poll and the newest qualifying run is the one
+            # checked, so a newer run (a re-push of the same SHA) takes over. A
+            # re-push whose run registers only after this gate has decided is
+            # beyond what any poll can see. Re-running a red suite can clear the
+            # gate.
+            run_id=""
+            run_url=""
+            started=$SECONDS
+            found_at=""
             while :; do
-              runs="$(gh api "repos/$REPO/actions/workflows/$wf_id/runs?head_sha=$SHA&per_page=100" \
-                --jq '[.workflow_runs[] | {id, status, conclusion, created_at, html_url}]
-                      | sort_by(.created_at) | reverse')"
-              [ "$(printf '%s' "$runs" | jq 'length')" -gt 0 ] && break
-              if [ "$waited" -ge "$GRACE" ]; then
-                echo "::notice title=Required workflow did not run::'$name' produced no run for $SHA within ${GRACE}s, so it does not apply to this commit (paths filters). Continuing."
-                runs=""
+              if ! runs="$(gh api "repos/$REPO/actions/workflows/$wf_id/runs?head_sha=$SHA&$run_filter&per_page=100" \
+                    --jq '[.workflow_runs[] | {id, status, conclusion, html_url}]
+                          | sort_by(.id) | reverse')"; then
+                echo "::error title=Cannot list required workflow runs::Reading '$name' runs for $SHA failed."
+                not_green="$not_green '$name'"
                 break
               fi
-              sleep "$POLL"; waited=$((waited + POLL))
-            done
-            [ -z "$runs" ] && continue
-
-            # Newest run wins, so re-running a red suite can clear this gate.
-            run_id="$(printf '%s' "$runs" | jq -r '.[0].id')"
-            run_url="$(printf '%s' "$runs" | jq -r '.[0].html_url')"
-            echo "gating this release on $run_url"
-
-            waited=0
-            while :; do
-              read -r status conclusion <<<"$(gh api "repos/$REPO/actions/runs/$run_id" --jq '"\(.status) \(.conclusion // "-")"')"
+              newest="$(printf '%s' "$runs" | jq -r '.[0].id // empty')"
+              if [ -z "$newest" ]; then
+                if [ -n "$run_id" ]; then
+                  echo "::error title=Required workflow run vanished::'$name' run $run_url is no longer listed for $SHA."
+                  not_green="$not_green '$name'"
+                  break
+                fi
+                if [ $((SECONDS - started)) -ge "$GRACE" ]; then
+                  echo "::error title=Required workflow did not run::'$name' produced no $run_desc for $SHA within ${GRACE}s. A gated workflow must run on every push it gates (no paths: filters on its push trigger)."
+                  not_green="$not_green '$name'"
+                  break
+                fi
+                sleep "$POLL"
+                continue
+              fi
+              [ -z "$found_at" ] && found_at=$SECONDS
+              # The tracked run must still be listed; a listing that drops it is
+              # inconsistent, and inconsistency refuses.
+              if [ -n "$run_id" ] && ! printf '%s' "$runs" | jq -e --argjson id "$run_id" 'any(.[]; .id == $id)' >/dev/null; then
+                echo "::error title=Required workflow run vanished::'$name' run $run_url is no longer listed for $SHA."
+                not_green="$not_green '$name'"
+                break
+              fi
+              # Run ids only grow, so a higher id is a newer run. Follow only a
+              # newer one; the budget is shared, so a re-push during the wait
+              # cannot extend it (a re-run of the release recovers).
+              if [ -z "$run_id" ] || [ "$newest" -gt "$run_id" ]; then
+                [ -n "$run_id" ] && echo "  a newer '$name' run registered for $SHA; following it"
+                run_id="$newest"
+                run_url="$(printf '%s' "$runs" | jq -r '.[0].html_url')"
+                echo "gating this release on $run_url"
+              fi
+              if ! state="$(gh api "repos/$REPO/actions/runs/$run_id" --jq '"\(.status) \(.conclusion // "-")"')"; then
+                echo "::error title=Cannot read required workflow run::Reading $run_url failed."
+                not_green="$not_green '$name'"
+                break
+              fi
+              read -r status conclusion <<<"$state"
               if [ "$status" = "completed" ]; then
+                # Confirm before deciding: a newer run that registered between the
+                # listing and this status read is followed (next poll, same
+                # budget), and a listing that fails or drops the run refuses.
+                if ! confirm="$(gh api "repos/$REPO/actions/workflows/$wf_id/runs?head_sha=$SHA&$run_filter&per_page=100" \
+                      --jq '[.workflow_runs[].id] | sort | reverse | map(tostring) | join(" ")')"; then
+                  echo "::error title=Cannot list required workflow runs::Re-reading '$name' runs for $SHA failed."
+                  not_green="$not_green '$name'"
+                  break
+                fi
+                read -r confirm_newest _ <<<"$confirm"
+                if ! printf ' %s ' "$confirm" | grep -q " $run_id "; then
+                  echo "::error title=Required workflow run vanished::'$name' run $run_url is no longer listed for $SHA."
+                  not_green="$not_green '$name'"
+                  break
+                fi
+                if [ "$confirm_newest" -gt "$run_id" ]; then
+                  if [ $((SECONDS - found_at)) -ge "$TIMEOUT" ]; then
+                    echo "::error title=Required workflow timed out::a newer '$name' run for $SHA registered after ${TIMEOUT}s."
+                    not_green="$not_green '$name'"
+                    break
+                  fi
+                  sleep "$POLL"
+                  continue
+                fi
                 case "$conclusion" in
-                  success|skipped)
+                  success)
                     echo "::notice title=Required workflow green::'$name' concluded $conclusion for $SHA."
                     ;;
                   *)
@@ -574,13 +685,13 @@ jobs:
                 esac
                 break
               fi
-              if [ "$waited" -ge "$TIMEOUT" ]; then
+              if [ $((SECONDS - found_at)) -ge "$TIMEOUT" ]; then
                 echo "::error title=Required workflow timed out::'$name' was still '$status' for $SHA after ${TIMEOUT}s. See $run_url"
                 not_green="$not_green '$name'"
                 break
               fi
-              echo "  '$name' is $status; waited ${waited}s of ${TIMEOUT}s"
-              sleep "$POLL"; waited=$((waited + POLL))
+              echo "  '$name' is $status; waited $((SECONDS - found_at))s of ${TIMEOUT}s"
+              sleep "$POLL"
             done
           done <<EOF_NAMES
           $names
@@ -589,6 +700,22 @@ jobs:
           if [ -n "$not_green" ]; then
             echo "::error title=Refusing to release::not green for $SHA:$not_green; refusing to tag or publish."
             exit 1
+          fi
+
+          # A release that waited in the queue may have been overtaken by a
+          # force-push. A branch release must still be on its branch.
+          if [ "$REF_TYPE" = branch ]; then
+            if ! reach="$(gh api "repos/$REPO/compare/$SHA...$(jq -rn --arg b "$REF_NAME" '$b|@uri')?per_page=1" --jq .status)"; then
+              echo "::error title=Cannot check branch membership::Comparing $SHA with '$REF_NAME' failed; refusing to tag or publish."
+              exit 1
+            fi
+            case "$reach" in
+              ahead|identical) ;;
+              *)
+                echo "::error title=Commit no longer on branch::$SHA is '$reach' relative to '$REF_NAME' (force-pushed away?); refusing to tag or publish."
+                exit 1
+                ;;
+            esac
           fi
       # Authenticate private-module fetches (GoReleaser's `go mod tidy` hook runs
       # BEFORE the build and will fail to reach private deps otherwise). No-op for

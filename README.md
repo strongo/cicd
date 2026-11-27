@@ -387,17 +387,39 @@ Behaviour, all of it fail-closed:
 
 | Situation | Result |
 |---|---|
-| Required workflow concluded `success` (or `skipped`) | release proceeds |
-| Concluded `failure`, `cancelled`, `timed_out` | **refused before any tag is cut** |
+| The exact commit's `push` run (on the release's branch) concluded `success` | release proceeds |
+| Concluded `failure`, `cancelled`, `timed_out` or `skipped` | **refused before any tag is cut** |
 | Still running | waited for, then refused on timeout |
 | Name matches no workflow in the repo | **refused** — a typo must not quietly disable the gate |
 | Several workflows named, any one not green | **refused**, and the error names every one that was not green |
-| Workflow produced no run for this commit (`paths:` filtered it out) | proceeds, with a notice |
+| No `push` run for this commit within five minutes (for example, `paths:` filtered it out) | **refused** — a gated workflow must run on every push it gates |
+| Only a dispatched or pull-request run exists at this SHA | **refused** — those runs never decide |
 
 The guard waits, because your quality workflow usually starts on the same push
-as the release. The newest run for the commit decides, so re-running a red
-suite can clear the gate. Leaving the input unset keeps the previous
+as the release. The newest qualifying run for the commit decides, so re-running
+a red suite can clear the gate. Leaving the input unset keeps the previous
 behaviour exactly.
+
+Do not put `paths:` filters on the gated workflow's push trigger. Scope work
+inside the workflow instead, with an always-reporting gate job (see the fleet
+rule `one-ci-workflow-smart-jobs` in sneat-co/backstage).
+
+The gate runs only for `main` and tag refs, the only refs this workflow
+publishes from. A tag release accepts the tagged commit's `push` run from any
+branch, so tag a commit that was pushed as a branch head, or let the gated
+workflow also run on tag pushes. Two active workflows with the same `name:`
+are refused as ambiguous.
+
+A caller's `concurrency: { group: release, cancel-in-progress: false }` keeps
+one pending release, and a newer run replaces it. The replaced release gets no
+version of its own. When the bump comes from commit history alone, its commits
+ship in the next release cut from `main`, as long as they are still on `main` (a
+branch release whose commit was force-pushed away is refused). Two cases lose more:
+
+- a bump decided by the triggering head commit alone (for example a
+  `default_bump` computed from that commit's title) is not re-applied;
+- a tag-push release in the same group is never published. Give tag-push
+  releases their own concurrency group.
 
 Note the `actions: read` permission. A reusable workflow cannot grant itself
 more than its caller allows, so it must be added on **your** calling job. Public
