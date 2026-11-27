@@ -611,3 +611,51 @@ func TestPolicyDigestBindsCoverageCommand(t *testing.T) {
 		previous = digest
 	}
 }
+
+// The import rules a run checked are part of its policy: a receipt from a
+// run with other rules is not reused, and empty rules keep the legacy JSON.
+func TestPolicyDigestBindsImportRules(t *testing.T) {
+	setMinimumPolicyEnvironment(t)
+	t.Setenv("CI_POLICY_FORBIDDEN_IMPORTS", "")
+	t.Setenv("CI_POLICY_ALLOWED_IMPORTS", "")
+	baseline, err := PolicyFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(`"forbidden_imports"`)) || bytes.Contains(encoded, []byte(`"allowed_imports"`)) {
+		t.Fatal("empty import rules must preserve legacy policy JSON")
+	}
+	seen := map[string]string{}
+	digest := func() string {
+		t.Helper()
+		policy, err := PolicyFromEnvironment()
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := PolicyDigest(policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	for _, tc := range []struct{ forbidden, allowed string }{
+		{"", ""},
+		{"github.com/dal-go/dalgo/adapters/dalgo2memory", ""},
+		{"github.com/dal-go/dalgo/adapters/dalgo2memory", "example.com/core github.com/dal-go/dalgo/adapters/dalgo2memory"},
+	} {
+		t.Setenv("CI_POLICY_FORBIDDEN_IMPORTS", tc.forbidden)
+		t.Setenv("CI_POLICY_ALLOWED_IMPORTS", tc.allowed)
+		d := digest()
+		key := tc.forbidden + "|" + tc.allowed
+		for other, otherDigest := range seen {
+			if otherDigest == d {
+				t.Fatalf("rules %q and %q share digest %s", key, other, d)
+			}
+		}
+		seen[key] = d
+	}
+}
