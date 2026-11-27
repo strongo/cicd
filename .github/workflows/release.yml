@@ -576,8 +576,9 @@ jobs:
             # Collect every match (no early exit: under pipefail an awk that quits
             # first can break the printf pipe). Two active workflows sharing a
             # name are ambiguous, and ambiguity is a refusal, not a guess.
-            # ENVIRON, not -v: -v would decode backslash escapes in the name.
-            wf_ids="$(printf '%s\n' "$workflows" | WF_MATCH="$name" awk -F'\t' '$2 == ENVIRON["WF_MATCH"] {print $1}')"
+            # ENVIRON, not -v: -v would decode backslash escapes in the name; the
+            # concatenations force a string comparison, so "01" never equals "1".
+            wf_ids="$(printf '%s\n' "$workflows" | WF_MATCH="$name" awk -F'\t' '($2 "") == (ENVIRON["WF_MATCH"] "") {print $1}')"
             if [ -z "$wf_ids" ]; then
               echo "::error title=Unknown required workflow::No active workflow named '$name' exists in $REPO. require_workflow_success matches a workflow's 'name:', not its filename. Available:"
               printf '%s\n' "$workflows" | awk -F'\t' '{print "  " $2}'
@@ -594,17 +595,18 @@ jobs:
             # release, so its run may not be registered yet. Wait that race out; a
             # commit with no qualifying run at all is not releasable. The listing
             # is re-read on every poll and the newest qualifying run is the one
-            # checked, so a newer run (a re-push of the same SHA) takes over.
-            # Re-running a red suite can clear the gate.
+            # checked, so a newer run (a re-push of the same SHA) takes over. A
+            # re-push whose run registers only after this gate has decided is
+            # beyond what any poll can see. Re-running a red suite can clear the
+            # gate.
             run_id=""
             run_url=""
-            run_created=""
             started=$SECONDS
             found_at=""
             while :; do
               if ! runs="$(gh api "repos/$REPO/actions/workflows/$wf_id/runs?head_sha=$SHA&$run_filter&per_page=100" \
-                    --jq '[.workflow_runs[] | {id, status, conclusion, created_at, html_url}]
-                          | sort_by(.created_at) | reverse')"; then
+                    --jq '[.workflow_runs[] | {id, status, conclusion, html_url}]
+                          | sort_by(.id) | reverse')"; then
                 echo "::error title=Cannot list required workflow runs::Reading '$name' runs for $SHA failed."
                 not_green="$not_green '$name'"
                 break
@@ -625,16 +627,19 @@ jobs:
                 continue
               fi
               [ -z "$found_at" ] && found_at=$SECONDS
-              newest_created="$(printf '%s' "$runs" | jq -r '.[0].created_at')"
-              # Follow only a strictly newer run, so an inconsistent listing can
-              # never bounce the gate between runs and keep resetting the budget.
-              if [ "$newest" != "$run_id" ] && { [ -z "$run_id" ] || [[ "$newest_created" > "$run_created" ]]; }; then
-                if [ -n "$run_id" ]; then
-                  echo "  a newer '$name' run registered for $SHA; following it"
-                  found_at=$SECONDS  # the followed run gets the full budget
-                fi
+              # The tracked run must still be listed; a listing that drops it is
+              # inconsistent, and inconsistency refuses.
+              if [ -n "$run_id" ] && ! printf '%s' "$runs" | jq -e --argjson id "$run_id" 'any(.[]; .id == $id)' >/dev/null; then
+                echo "::error title=Required workflow run vanished::'$name' run $run_url is no longer listed for $SHA."
+                not_green="$not_green '$name'"
+                break
+              fi
+              # Run ids only grow, so a higher id is a newer run. Follow only a
+              # newer one; the budget is shared, so a re-push during the wait
+              # cannot extend it (a re-run of the release recovers).
+              if [ -z "$run_id" ] || [ "$newest" -gt "$run_id" ]; then
+                [ -n "$run_id" ] && echo "  a newer '$name' run registered for $SHA; following it"
                 run_id="$newest"
-                run_created="$newest_created"
                 run_url="$(printf '%s' "$runs" | jq -r '.[0].html_url')"
                 echo "gating this release on $run_url"
               fi
@@ -676,7 +681,7 @@ jobs:
           # A release that waited in the queue may have been overtaken by a
           # force-push. A branch release must still be on its branch.
           if [ "$REF_TYPE" = branch ]; then
-            if ! reach="$(gh api "repos/$REPO/compare/$SHA...$(jq -rn --arg b "$REF_NAME" '$b|@uri')" --jq .status)"; then
+            if ! reach="$(gh api "repos/$REPO/compare/$SHA...$(jq -rn --arg b "$REF_NAME" '$b|@uri')?per_page=1" --jq .status)"; then
               echo "::error title=Cannot check branch membership::Comparing $SHA with '$REF_NAME' failed; refusing to tag or publish."
               exit 1
             fi

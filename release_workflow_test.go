@@ -2420,6 +2420,15 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 			if !strings.Contains(string(calls), "head_sha=a913de4fd6455e35d2cf9b4f54c4bb5ed36bb4fe"+tc.want) {
 				t.Fatalf("%s %q: runs query must filter with %q, got:\n%s", tc.refType, tc.refName, tc.want, calls)
 			}
+			// Branch membership is checked as SHA...branch ("ahead" = still on
+			// it); a tag release has no branch to check.
+			compare := "repos/datatug/datatug-cli/compare/a913de4fd6455e35d2cf9b4f54c4bb5ed36bb4fe..."
+			if tc.refType == "branch" && !strings.Contains(string(calls), compare+strings.TrimSuffix(strings.TrimPrefix(tc.want, "&event=push&branch="), "&")+"?per_page=1") {
+				t.Fatalf("%s %q: branch check must compare SHA...branch, got:\n%s", tc.refType, tc.refName, calls)
+			}
+			if tc.refType == "tag" && strings.Contains(string(calls), "/compare/") {
+				t.Fatalf("a tag release must not compare against a branch:\n%s", calls)
+			}
 		}
 	})
 
@@ -2482,7 +2491,7 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 	t.Run("an older run never replaces the one being followed", func(t *testing.T) {
 		stub := gateStub{
 			workflows: workflows,
-			runs:      map[string][]string{wf: {gateRuns(2), gateRuns(1)}},
+			runs:      map[string][]string{wf: {gateRuns(2), gateRuns(1, 2)}},
 			status:    map[string]string{"1": "completed success", "2": "in_progress -"},
 		}
 		out, err := run(t, stub, fastPoll, map[string]string{"TIMEOUT": "2"})
@@ -2501,6 +2510,26 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 		out, err := run(t, stub, fastPoll, map[string]string{"TIMEOUT": "30"})
 		if err == nil || !strings.Contains(out, "no longer listed") {
 			t.Fatalf("a vanished run must refuse (err=%v):\n%s", err, out)
+		}
+	})
+
+	t.Run("a tracked run missing from a non-empty listing refuses", func(t *testing.T) {
+		stub := gateStub{
+			workflows: workflows,
+			runs:      map[string][]string{wf: {gateRuns(5), gateRuns(3)}},
+			status:    map[string]string{"3": "completed success", "5": "in_progress -"},
+		}
+		out, err := run(t, stub, fastPoll, map[string]string{"TIMEOUT": "30"})
+		if err == nil || !strings.Contains(out, "no longer listed") {
+			t.Fatalf("a listing that drops the tracked run must refuse (err=%v):\n%s", err, out)
+		}
+	})
+
+	t.Run("numeric-looking names compare as strings", func(t *testing.T) {
+		stub := gateStub{workflows: "7\t01\n", runs: map[string][]string{"7": {gateRuns(1)}}, status: map[string]string{"1": "completed success"}}
+		out, err := run(t, stub, script, map[string]string{"WF_NAME": "1"})
+		if err == nil || !strings.Contains(out, "Unknown required workflow") {
+			t.Fatalf("'1' must not match a workflow named '01' (err=%v):\n%s", err, out)
 		}
 	})
 
@@ -2582,7 +2611,7 @@ while [ $# -gt 0 ]; do
 done
 printf '%s\n' "$url" >> "$d/calls.log"
 case "$url" in
-  repos/*/actions/workflows) jq -r "$expr" "$d/workflows.json"; exit 0 ;;
+  repos/*/actions/workflows) jq -r "$expr" "$d/workflows.json"; exit $? ;;
   repos/*/actions/workflows/*/runs*)
     [ "$(cat "$d/fail")" = list ] && exit 1
     wf="${url#*workflows/}"; wf="${wf%%/*}"; file=""
@@ -2592,7 +2621,7 @@ case "$url" in
       [ "$n" -gt 0 ] && file="$d/runs.$wf.$n" ;;
     esac
     if [ -n "$file" ]; then jq -r "$expr" "$file"; else echo '{"workflow_runs":[]}' | jq -r "$expr"; fi
-    exit 0 ;;
+    exit $? ;;
   repos/*/actions/runs/*) [ "$(cat "$d/fail")" = read ] && exit 1; id="${url##*/}"; cat "$d/status.$id" 2>/dev/null || exit 1; exit 0 ;;
   repos/*/compare/*) cat "$d/compare" 2>/dev/null || echo ahead; exit 0 ;;
 esac
