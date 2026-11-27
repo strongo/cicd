@@ -2307,9 +2307,17 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 	script := releaseWorkflowRunBlock(t, stepName)
 	workflow := readReleaseWorkflow(t)
 
-	// Opt-in: an unset input must leave every existing consumer untouched.
-	if !strings.Contains(workflow, "if: ${{ inputs.require_workflow_success != '' }}") {
-		t.Fatal("the required-workflow guard must be skipped when require_workflow_success is empty")
+	// Opt-in: an unset input must leave every existing consumer untouched, and
+	// only refs that can publish (main, tags) are gated.
+	if !strings.Contains(workflow, "if: ${{ inputs.require_workflow_success != '' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag') }}") {
+		t.Fatal("the required-workflow guard must be skipped when require_workflow_success is empty, and run only for main and tag refs")
+	}
+	// The ref scoping is wired from the caller's context; without it the
+	// branch filter would silently disappear.
+	for _, line := range []string{"REF_TYPE: ${{ github.ref_type }}", "REF_NAME: ${{ github.ref_name }}"} {
+		if !strings.Contains(workflow, line) {
+			t.Fatalf("the guard must receive %q", line)
+		}
 	}
 	// It must refuse BEFORE anything is mutated, exactly like the signing guard.
 	guardIndex := strings.Index(workflow, stepName)
@@ -2318,29 +2326,13 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 		t.Fatal("the required-workflow guard must run before the guarded tag step")
 	}
 
-	// Stub `gh` so the script's two API shapes are answered from fixtures:
-	// the workflow listing, then a run listing and a single-run lookup.
-	stub := func(t *testing.T, runsJSON, runStatus string) string {
-		t.Helper()
-		dir := t.TempDir()
-		gh := filepath.Join(dir, "gh")
-		script := "#!/usr/bin/env bash\nfor arg in \"$@\"; do\n" +
-			"  case \"$arg\" in\n" +
-			"    repos/*/actions/workflows) echo '181342652\tGo CI'; echo '220477002\tRelease'; exit 0 ;;\n" +
-			"    repos/*/actions/workflows/*/runs*) cat <<'JSON'\n" + runsJSON + "\nJSON\n exit 0 ;;\n" +
-			"    repos/*/actions/runs/*) echo '" + runStatus + "'; exit 0 ;;\n" +
-			"  esac\ndone\nexit 1\n"
-		if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		return dir
-	}
-	const oneRun = `[{"id":1,"status":"completed","conclusion":"x","created_at":"2026-09-09T07:49:09Z","html_url":"https://example.test/run/1"}]`
-
+	const wf = "181342652"
+	workflows := wf + "\tGo CI\n220477002\tRelease\n"
 	env := func(extra map[string]string) map[string]string {
 		base := map[string]string{
 			"GH_TOKEN": "stub", "REPO": "datatug/datatug-cli",
-			"SHA":     "a913de4fd6455e35d2cf9b4f54c4bb5ed36bb4fe",
+			"SHA":      "a913de4fd6455e35d2cf9b4f54c4bb5ed36bb4fe",
+			"REF_TYPE": "branch", "REF_NAME": "main",
 			"WF_NAME": "Go CI", "TIMEOUT": "1",
 		}
 		for k, v := range extra {
@@ -2348,21 +2340,25 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 		}
 		return base
 	}
+	run := func(t *testing.T, stub gateStub, program string, extra map[string]string) (string, error) {
+		t.Helper()
+		dir := stub.write(t)
+		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+program, env(extra))
+		return string(out), err
+	}
+	oneRun := map[string][]string{wf: {gateRuns(1)}}
+	noGrace := mustReplace(t, script, "GRACE=300", "GRACE=0")
+	fastPoll := mustReplace(t, script, "POLL=15", "POLL=1")
 
 	t.Run("red required workflow blocks the release", func(t *testing.T) {
-		dir := stub(t, oneRun, "completed failure")
-		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env(nil))
-		if err == nil {
-			t.Fatalf("a red required workflow must fail the release, got success:\n%s", out)
-		}
-		if !strings.Contains(string(out), "refusing to tag or publish") {
-			t.Fatalf("failure must say the release is refused:\n%s", out)
+		out, err := run(t, gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "completed failure"}}, script, nil)
+		if err == nil || !strings.Contains(out, "refusing to tag or publish") {
+			t.Fatalf("a red required workflow must refuse the release (err=%v):\n%s", err, out)
 		}
 	})
 
 	t.Run("green required workflow allows the release", func(t *testing.T) {
-		dir := stub(t, oneRun, "completed success")
-		if out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env(nil)); err != nil {
+		if out, err := run(t, gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "completed success"}}, script, nil); err != nil {
 			t.Fatalf("a green required workflow must not block the release: %v\n%s", err, out)
 		}
 	})
@@ -2371,75 +2367,164 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 	// the moving @v1 tag let require_notarized_macos no-op. A name matching
 	// no workflow is a typo, not a pass.
 	t.Run("unknown workflow name fails loudly instead of no-oping", func(t *testing.T) {
-		dir := stub(t, oneRun, "completed success")
-		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env(map[string]string{"WF_NAME": "Go-CI"}))
-		if err == nil {
-			t.Fatalf("an unknown required workflow name must fail, got success:\n%s", out)
+		out, err := run(t, gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "completed success"}}, script, map[string]string{"WF_NAME": "Go-CI"})
+		if err == nil || !strings.Contains(out, "Unknown required workflow") {
+			t.Fatalf("an unknown required workflow name must fail and say so (err=%v):\n%s", err, out)
 		}
-		if !strings.Contains(string(out), "Unknown required workflow") {
-			t.Fatalf("failure must name the misconfiguration:\n%s", out)
+	})
+
+	// Two active workflows sharing a name: picking one could let a green
+	// workflow stand in for a red one.
+	t.Run("an ambiguous workflow name refuses", func(t *testing.T) {
+		out, err := run(t, gateStub{workflows: workflows + "999\tGo CI\n", runs: oneRun, status: map[string]string{"1": "completed success"}}, script, nil)
+		if err == nil || !strings.Contains(out, "Ambiguous required workflow") {
+			t.Fatalf("a name matching two workflows must refuse (err=%v):\n%s", err, out)
 		}
 	})
 
 	// A commit with no qualifying run is not releasable: a gate that passes on
 	// "nothing ran" is a gate any misconfiguration or outage opens.
 	t.Run("a commit the required workflow never ran for blocks the release", func(t *testing.T) {
-		dir := stub(t, `[]`, "completed success")
-		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+
-			strings.Replace(script, "GRACE=300", "GRACE=0", 1), env(nil))
-		if err == nil {
-			t.Fatalf("a commit with no run for the required workflow must fail the release, got success:\n%s", out)
+		out, err := run(t, gateStub{workflows: workflows}, noGrace, nil)
+		if err == nil || !strings.Contains(out, "Required workflow did not run") || !strings.Contains(out, "refusing to tag or publish") {
+			t.Fatalf("a commit with no run must refuse and say the workflow did not run (err=%v):\n%s", err, out)
 		}
-		if !strings.Contains(string(out), "Required workflow did not run") || !strings.Contains(string(out), "refusing to tag or publish") {
-			t.Fatalf("failure must say the workflow did not run and the release is refused:\n%s", out)
+		if !strings.Contains(out, "push run on branch 'main'") {
+			t.Fatalf("the refusal must name what was looked for:\n%s", out)
 		}
 	})
 
 	// A run whose jobs all skipped checked nothing.
 	t.Run("a skipped required workflow blocks the release", func(t *testing.T) {
-		dir := stub(t, oneRun, "completed skipped")
-		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env(nil))
-		if err == nil {
-			t.Fatalf("a skipped required workflow must fail the release, got success:\n%s", out)
+		out, err := run(t, gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "completed skipped"}}, script, nil)
+		if err == nil || !strings.Contains(out, "concluded 'skipped'") {
+			t.Fatalf("a skipped required workflow must refuse and say so (err=%v):\n%s", err, out)
 		}
 	})
 
-	// Only the exact SHA's push run on the release's branch can decide; a
-	// dispatched or pull-request run at the same SHA must not.
+	// The stub answers only queries filtered to push runs, so every subtest
+	// above already depends on the filter. These pin its exact shape.
 	t.Run("only a push run on the release branch is consulted", func(t *testing.T) {
-		for _, tc := range []struct {
-			refType, refName, want string
-		}{
-			{"branch", "releases/v1", "&event=push&branch=releases%2Fv1&"},
+		for _, tc := range []struct{ refType, refName, want string }{
+			{"branch", "main", "&event=push&branch=main&"},
+			{"branch", "a&b#c+d e/f", "&event=push&branch=a%26b%23c%2Bd%20e%2Ff&"},
 			{"tag", "v1.2.3", "&event=push&per_page"},
 		} {
-			dir := stub(t, oneRun, "completed success")
-			log := filepath.Join(dir, "args.log")
-			logging := "gh() { printf '%s\\n' \"$*\" >> " + log + "; command gh \"$@\"; }\n"
-			out, err := runBash(dir, "PATH="+dir+":$PATH\n"+logging+script,
-				env(map[string]string{"REF_TYPE": tc.refType, "REF_NAME": tc.refName}))
+			stub := gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "completed success"}}
+			dir := stub.write(t)
+			out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env(map[string]string{"REF_TYPE": tc.refType, "REF_NAME": tc.refName}))
 			if err != nil {
-				t.Fatalf("%s %s: %v\n%s", tc.refType, tc.refName, err, out)
+				t.Fatalf("%s %q: %v\n%s", tc.refType, tc.refName, err, out)
 			}
-			calls, _ := os.ReadFile(log)
+			calls, _ := os.ReadFile(filepath.Join(dir, "calls.log"))
 			if !strings.Contains(string(calls), "head_sha=a913de4fd6455e35d2cf9b4f54c4bb5ed36bb4fe"+tc.want) {
-				t.Fatalf("%s %s: runs query must filter with %q, got:\n%s", tc.refType, tc.refName, tc.want, calls)
+				t.Fatalf("%s %q: runs query must filter with %q, got:\n%s", tc.refType, tc.refName, tc.want, calls)
 			}
+		}
+	})
+
+	t.Run("a missing ref type refuses instead of widening the lookup", func(t *testing.T) {
+		out, err := run(t, gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "completed success"}}, script, map[string]string{"REF_TYPE": ""})
+		if err == nil || !strings.Contains(out, "Missing ref type") {
+			t.Fatalf("an empty REF_TYPE must refuse (err=%v):\n%s", err, out)
+		}
+	})
+
+	// A re-push of the same SHA registers a newer run while an older green one
+	// is being checked; the newer one decides.
+	t.Run("a newer run that registers meanwhile decides", func(t *testing.T) {
+		stub := gateStub{
+			workflows: workflows,
+			runs:      map[string][]string{wf: {gateRuns(1), gateRuns(2, 1)}},
+			status:    map[string]string{"1": "completed success", "2": "completed failure"},
+		}
+		out, err := run(t, stub, script, nil)
+		if err == nil || !strings.Contains(out, "following it") || !strings.Contains(out, "concluded 'failure'") {
+			t.Fatalf("a newer red run must decide over an older green one (err=%v):\n%s", err, out)
 		}
 	})
 
 	// Still running when the budget runs out is not a pass.
 	t.Run("a required workflow that never finishes blocks the release", func(t *testing.T) {
-		dir := stub(t, oneRun, "in_progress -")
-		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+
-			strings.Replace(script, "POLL=15", "POLL=1", 1), env(nil))
-		if err == nil {
-			t.Fatalf("an unfinished required workflow must fail the release, got success:\n%s", out)
-		}
-		if !strings.Contains(string(out), "timed out") {
-			t.Fatalf("failure must report the timeout:\n%s", out)
+		out, err := run(t, gateStub{workflows: workflows, runs: oneRun, status: map[string]string{"1": "in_progress -"}}, fastPoll, nil)
+		if err == nil || !strings.Contains(out, "timed out") {
+			t.Fatalf("an unfinished required workflow must refuse on timeout (err=%v):\n%s", err, out)
 		}
 	})
+}
+
+// gateStub writes a fake `gh` for the required-workflow guard. It serves raw
+// API JSON through the caller's real --jq expression, answers a runs listing
+// only when the query is filtered to push runs, returns the n-th listing on
+// the n-th call per workflow (the last one repeats), and logs every URL.
+type gateStub struct {
+	workflows string              // "<id>\t<name>" lines, as the --jq listing yields
+	runs      map[string][]string // workflow id -> successive listings
+	status    map[string]string   // run id -> "<status> <conclusion>"
+}
+
+func (s gateStub) write(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	files := map[string]string{"workflows.tsv": s.workflows}
+	for wf, lists := range s.runs {
+		for i, list := range lists {
+			files[fmt.Sprintf("runs.%s.%d", wf, i+1)] = list
+		}
+	}
+	for id, st := range s.status {
+		files["status."+id] = st + "\n"
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const gh = `#!/usr/bin/env bash
+d="$(dirname "$0")"; url=""; expr="."
+while [ $# -gt 0 ]; do
+  case "$1" in --jq) expr="$2"; shift 2 ;; api|--paginate) shift ;; *) url="$1"; shift ;; esac
+done
+printf '%s\n' "$url" >> "$d/calls.log"
+case "$url" in
+  repos/*/actions/workflows) cat "$d/workflows.tsv"; exit 0 ;;
+  repos/*/actions/workflows/*/runs*)
+    wf="${url#*workflows/}"; wf="${wf%%/*}"; file=""
+    case "$url" in *event=push*)
+      n=$(( $(cat "$d/count.$wf" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$d/count.$wf"
+      while [ "$n" -gt 0 ] && [ ! -f "$d/runs.$wf.$n" ]; do n=$((n - 1)); done
+      [ "$n" -gt 0 ] && file="$d/runs.$wf.$n" ;;
+    esac
+    if [ -n "$file" ]; then jq -r "$expr" "$file"; else echo '{"workflow_runs":[]}' | jq -r "$expr"; fi
+    exit 0 ;;
+  repos/*/actions/runs/*) id="${url##*/}"; cat "$d/status.$id" 2>/dev/null || exit 1; exit 0 ;;
+esac
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(gh), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// gateRuns renders a raw "list workflow runs" response, newest first.
+func gateRuns(ids ...int) string {
+	runs := make([]string, len(ids))
+	for i, id := range ids {
+		runs[i] = fmt.Sprintf(`{"id":%d,"status":"completed","conclusion":"x","created_at":"2026-09-09T07:%02d:00Z","html_url":"https://example.test/run/%d"}`, id, 59-i, id)
+	}
+	return `{"workflow_runs":[` + strings.Join(runs, ",") + `]}`
+}
+
+// mustReplace replaces old once and fails when it is absent, so a changed
+// literal (a poll interval, a grace period) cannot silently disable a test's
+// speed-up and turn it into a long sleep.
+func mustReplace(t *testing.T, s, old, replacement string) string {
+	t.Helper()
+	if !strings.Contains(s, old) {
+		t.Fatalf("expected %q in the guard script", old)
+	}
+	return strings.Replace(s, old, replacement, 1)
 }
 
 // The release job must NOT re-declare a permissions block. A called workflow's
@@ -2493,47 +2578,17 @@ func TestReleaseJobDoesNotNarrowTheCallersPermissions(t *testing.T) {
 func TestReleaseWorkflowGatesOnEveryNamedWorkflow(t *testing.T) {
 	script := releaseWorkflowRunBlock(t,
 		"Require the caller's quality workflow to be green before tagging")
-
-	// Stub `gh`: two workflows exist; each run's conclusion is keyed by id, so
-	// one can be green while the other is red.
-	stub := func(t *testing.T, greenID, redID string) string {
-		t.Helper()
-		dir := t.TempDir()
-		runs := func(id string) string {
-			return `[{"id":` + id + `,"status":"completed","conclusion":"x",` +
-				`"created_at":"2026-09-09T07:49:09Z","html_url":"https://example.test/run/` + id + `"}]`
-		}
-		body := "#!/usr/bin/env bash\nprev=\"\"\nfor arg in \"$@\"; do\n" +
-			"  case \"$arg\" in\n" +
-			"    repos/*/actions/workflows) printf '11\\tAlpha CI\\n22\\tBeta CI\\n'; exit 0 ;;\n" +
-			"    repos/*/actions/workflows/11/runs*) cat <<'J'\n" + runs("111") + "\nJ\n exit 0 ;;\n" +
-			"    repos/*/actions/workflows/22/runs*) cat <<'J'\n" + runs("222") + "\nJ\n exit 0 ;;\n" +
-			"    repos/*/actions/runs/" + greenID + ") echo 'completed success'; exit 0 ;;\n" +
-			"    repos/*/actions/runs/" + redID + ") echo 'completed failure'; exit 0 ;;\n" +
-			"  esac\ndone\nexit 1\n"
-		if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(body), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		return dir
-	}
+	workflows := "11\tAlpha CI\n22\tBeta CI\n"
 	env := map[string]string{
 		"GH_TOKEN": "stub", "REPO": "acme/widget",
-		"SHA":     "a913de4fd6455e35d2cf9b4f54c4bb5ed36bb4fe",
+		"SHA":      "a913de4fd6455e35d2cf9b4f54c4bb5ed36bb4fe",
+		"REF_TYPE": "branch", "REF_NAME": "main",
 		"WF_NAME": "Alpha CI, Beta CI", "TIMEOUT": "1",
 	}
+	runs := map[string][]string{"11": {gateRuns(111)}, "22": {gateRuns(222)}}
 
 	t.Run("every named workflow green passes", func(t *testing.T) {
-		dir := stub(t, "111", "999") // 222 unmatched would exit 1, so make both green
-		body, err := os.ReadFile(filepath.Join(dir, "gh"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Make the second run green too.
-		green := strings.Replace(string(body), "repos/*/actions/runs/999", "repos/*/actions/runs/222", 1)
-		green = strings.Replace(green, "echo 'completed failure'", "echo 'completed success'", 1)
-		if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(green), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		dir := gateStub{workflows: workflows, runs: runs, status: map[string]string{"111": "completed success", "222": "completed success"}}.write(t)
 		if out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env); err != nil {
 			t.Fatalf("all-green must pass: %v\n%s", err, out)
 		}
@@ -2542,22 +2597,25 @@ func TestReleaseWorkflowGatesOnEveryNamedWorkflow(t *testing.T) {
 	// The whole point: a second named workflow being red must block, even
 	// though the first one passed.
 	t.Run("one red among several blocks and names it", func(t *testing.T) {
-		dir := stub(t, "111", "222") // Alpha green, Beta red
+		dir := gateStub{workflows: workflows, runs: runs, status: map[string]string{"111": "completed success", "222": "completed failure"}}.write(t)
 		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+script, env)
-		if err == nil {
-			t.Fatalf("a red workflow among several must fail the release:\n%s", out)
-		}
 		text := string(out)
-		if !strings.Contains(text, "'Beta CI'") {
-			t.Fatalf("failure must name the workflow that was not green:\n%s", text)
-		}
-		if !strings.Contains(text, "Refusing to release") {
-			t.Fatalf("failure must say the release is refused:\n%s", text)
+		if err == nil || !strings.Contains(text, "'Beta CI'") || !strings.Contains(text, "Refusing to release") {
+			t.Fatalf("a red workflow among several must refuse and name it (err=%v):\n%s", err, text)
 		}
 		// It must not stop at the first name: the green one is still reported,
 		// so one run shows the whole picture.
 		if !strings.Contains(text, "'Alpha CI' concluded success") {
 			t.Fatalf("every named workflow must be checked, not just up to the first failure:\n%s", text)
+		}
+	})
+
+	t.Run("one with no run among several blocks and names it", func(t *testing.T) {
+		dir := gateStub{workflows: workflows, runs: map[string][]string{"11": {gateRuns(111)}}, status: map[string]string{"111": "completed success"}}.write(t)
+		out, err := runBash(dir, "PATH="+dir+":$PATH\n"+mustReplace(t, script, "GRACE=300", "GRACE=0"), env)
+		text := string(out)
+		if err == nil || !strings.Contains(text, "'Beta CI' produced no push run") || !strings.Contains(text, "'Alpha CI' concluded success") {
+			t.Fatalf("a workflow with no run must refuse while the others are still reported (err=%v):\n%s", err, text)
 		}
 	})
 }
