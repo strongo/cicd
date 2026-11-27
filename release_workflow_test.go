@@ -2500,6 +2500,20 @@ func TestReleaseWorkflowRefusesToPublishWhenRequiredWorkflowIsNotGreen(t *testin
 		}
 	})
 
+	// A newer run can register between the listing and the moment the tracked
+	// run is read as completed green; the confirmation read catches it.
+	t.Run("a newer run registering as the tracked run completes decides", func(t *testing.T) {
+		stub := gateStub{
+			workflows: workflows,
+			runs:      map[string][]string{wf: {gateRuns(1), gateRuns(2, 1)}},
+			status:    map[string]string{"1": "completed success", "2": "completed failure"},
+		}
+		out, err := run(t, stub, fastPoll, map[string]string{"TIMEOUT": "30"})
+		if err == nil || !strings.Contains(out, "following it") || !strings.Contains(out, "concluded 'failure'") {
+			t.Fatalf("the confirmation read must catch a newer red run (err=%v):\n%s", err, out)
+		}
+	})
+
 	// A listed run that disappears is not a pass.
 	t.Run("a run that vanishes from the listing refuses", func(t *testing.T) {
 		stub := gateStub{

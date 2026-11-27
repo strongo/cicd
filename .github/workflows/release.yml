@@ -650,6 +650,30 @@ jobs:
               fi
               read -r status conclusion <<<"$state"
               if [ "$status" = "completed" ]; then
+                # Confirm before deciding: a newer run that registered between the
+                # listing and this status read is followed (next poll, same
+                # budget), and a listing that fails or drops the run refuses.
+                if ! confirm="$(gh api "repos/$REPO/actions/workflows/$wf_id/runs?head_sha=$SHA&$run_filter&per_page=100" \
+                      --jq '[.workflow_runs[].id] | sort | reverse | map(tostring) | join(" ")')"; then
+                  echo "::error title=Cannot list required workflow runs::Re-reading '$name' runs for $SHA failed."
+                  not_green="$not_green '$name'"
+                  break
+                fi
+                read -r confirm_newest _ <<<"$confirm"
+                if ! printf ' %s ' "$confirm" | grep -q " $run_id "; then
+                  echo "::error title=Required workflow run vanished::'$name' run $run_url is no longer listed for $SHA."
+                  not_green="$not_green '$name'"
+                  break
+                fi
+                if [ "$confirm_newest" -gt "$run_id" ]; then
+                  if [ $((SECONDS - found_at)) -ge "$TIMEOUT" ]; then
+                    echo "::error title=Required workflow timed out::a newer '$name' run for $SHA registered after ${TIMEOUT}s."
+                    not_green="$not_green '$name'"
+                    break
+                  fi
+                  sleep "$POLL"
+                  continue
+                fi
                 case "$conclusion" in
                   success)
                     echo "::notice title=Required workflow green::'$name' concluded $conclusion for $SHA."
