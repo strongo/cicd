@@ -73,7 +73,7 @@ func validImportPath(path string) bool {
 		return false
 	}
 	for _, seg := range strings.Split(path, "/") {
-		if seg == "" || seg[0] == '.' || seg[0] == '-' {
+		if seg == "" || seg[0] == '.' || seg[len(seg)-1] == '.' || seg[0] == '-' {
 			return false
 		}
 		for i := range len(seg) {
