@@ -862,6 +862,7 @@ jobs:
         shell: bash
 
       - name: Checkout exact forbidden-imports tool
+        if: ${{ inputs.forbidden_imports != '' }}
         uses: actions/checkout@v7
         with:
           repository: ${{ job.workflow_repository }}
@@ -870,12 +871,21 @@ jobs:
           persist-credentials: false
 
       - name: Check forbidden imports
+        if: ${{ inputs.forbidden_imports != '' }}
         working-directory: .strongo-cicd-forbidden-imports-tool
         env:
           CI_FORBIDDEN_IMPORTS: ${{ inputs.forbidden_imports }}
           CI_ALLOWED_IMPORTS: ${{ inputs.allowed_imports }}
           CI_MODULE_DIR: ${{ github.workspace }}/${{ inputs.working_directory }}
-        run: go run ./cmd/forbidden-imports
+        shell: bash
+        # The tool is built on its own terms (its go.mod's toolchain, no
+        # caller go.work), then runs go list with the caller's Go and
+        # workspace: an older go_version or a go.work file is no obstacle.
+        run: |
+          set -euo pipefail
+          tool="${RUNNER_TEMP}/forbidden-imports"
+          GOWORK=off GOTOOLCHAIN=auto go build -o "$tool" ./cmd/forbidden-imports
+          "$tool"
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9

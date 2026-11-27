@@ -43,8 +43,8 @@ type Policy struct {
 	CGOEnabled                              bool   `json:"cgo_enabled"`
 	TagPrefix                               string `json:"tag_prefix"`
 	WorkingDirectory                        string `json:"working_directory"`
-	ForbiddenImports                        string `json:"forbidden_imports"`
-	AllowedImports                          string `json:"allowed_imports"`
+	ForbiddenImports                        string `json:"forbidden_imports,omitempty"`
+	AllowedImports                          string `json:"allowed_imports,omitempty"`
 	AllowMajorVersionBump                   bool   `json:"allow_major_version_bump"`
 	GoVersion                               string `json:"go_version"`
 	DefaultBump                             string `json:"default_bump"`

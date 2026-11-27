@@ -42,14 +42,29 @@ func (v Violation) String() string {
 	return fmt.Sprintf("%s imports %s, which this repository forbids (%s); allow it explicitly with the line %q in allowed_imports", v.Package, v.Import, v.Forbidden, v.Package+" "+v.Forbidden)
 }
 
-// ParseForbidden reads one import path per line; blank lines and lines
-// starting with # are ignored.
-func ParseForbidden(text string) []string {
+// ParseForbidden reads one import path per line (a trailing "/..." is
+// allowed and means the same); blank lines and lines starting with # are
+// ignored. An entry that is not a plain import path is an error: a check
+// that silently forbids nothing is worse than a failing one.
+func ParseForbidden(text string) ([]string, error) {
 	var out []string
 	for _, line := range lines(text) {
-		out = append(out, strings.TrimSuffix(line, "/..."))
+		path, err := importPath("forbidden_imports", line, strings.TrimSuffix(line, "/..."))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, path)
 	}
-	return out
+	return out, nil
+}
+
+// importPath validates path, an import path written in line of input.
+func importPath(input, line, path string) (string, error) {
+	switch {
+	case path == "" || strings.ContainsAny(path, " \t,#") || strings.HasPrefix(path, "/") || strings.HasPrefix(path, ".") || strings.HasSuffix(path, "/"):
+		return "", fmt.Errorf("%s line %q: %q is not an import path", input, line, path)
+	}
+	return path, nil
 }
 
 // ParseRules reads "<pattern> <import>" per line; blank lines and lines
@@ -61,7 +76,14 @@ func ParseRules(text string) ([]Rule, error) {
 		if len(fields) != 2 {
 			return nil, fmt.Errorf("allowed_imports line %q: want \"<package pattern> <import>\"", line)
 		}
-		rules = append(rules, Rule{Pattern: fields[0], Import: strings.TrimSuffix(fields[1], "/...")})
+		if _, err := importPath("allowed_imports", line, strings.TrimSuffix(fields[0], "/...")); err != nil {
+			return nil, err
+		}
+		imp, err := importPath("allowed_imports", line, strings.TrimSuffix(fields[1], "/..."))
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, Rule{Pattern: fields[0], Import: imp})
 	}
 	return rules, nil
 }
@@ -95,7 +117,7 @@ func matches(pattern, pkg string) bool {
 func Check(pkgs []Package, forbidden []string, rules []Rule) []Violation {
 	var found []Violation
 	for _, pkg := range pkgs {
-		owner := strings.TrimSuffix(pkg.ImportPath, "_test") // an external test package
+		owner := pkg.ImportPath
 		seen := map[string]bool{}
 		for _, list := range [][]string{pkg.Imports, pkg.TestImports, pkg.XTestImports} {
 			for _, imp := range list {
@@ -104,10 +126,11 @@ func Check(pkgs []Package, forbidden []string, rules []Rule) []Violation {
 				}
 				seen[imp] = true
 				for _, f := range forbidden {
-					if !within(imp, f) || within(owner, f) || allowed(rules, owner, f) {
+					if !within(imp, f) || within(owner, f) || allowed(rules, owner, imp) {
 						continue
 					}
 					found = append(found, Violation{Package: owner, Import: imp, Forbidden: f})
+					break // one violation per import, whichever entries it falls under
 				}
 			}
 		}
@@ -121,9 +144,11 @@ func Check(pkgs []Package, forbidden []string, rules []Rule) []Violation {
 	return found
 }
 
-func allowed(rules []Rule, pkg, forbidden string) bool {
+// allowed reports whether a rule lets pkg import imp: the rule's import is
+// imp or a path above it.
+func allowed(rules []Rule, pkg, imp string) bool {
 	for _, r := range rules {
-		if r.Import == forbidden && matches(r.Pattern, pkg) {
+		if within(imp, r.Import) && matches(r.Pattern, pkg) {
 			return true
 		}
 	}

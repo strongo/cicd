@@ -22,7 +22,11 @@ func TestCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := Check(pkgs, ParseForbidden(mem+"\n# comment\n"), rules)
+	forbidden, err := ParseForbidden(mem + "\n# comment\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := Check(pkgs, forbidden, rules)
 	var lines []string
 	for _, v := range got {
 		lines = append(lines, v.Package+" -> "+v.Import)
@@ -52,8 +56,18 @@ func TestRuleForAnExactPackageOnly(t *testing.T) {
 }
 
 func TestParse(t *testing.T) {
-	if got := ParseForbidden(" a/b/... \n\n# c\nd"); strings.Join(got, ",") != "a/b,d" {
-		t.Errorf("ParseForbidden = %v", got)
+	if got, err := ParseForbidden(" a/b/... \n\n# c\nd"); err != nil || strings.Join(got, ",") != "a/b,d" {
+		t.Errorf("ParseForbidden = %v, %v", got, err)
+	}
+	for _, bad := range []string{"a,b", "a b", "a # c", "./a", "/a", "a/", "..."} {
+		if _, err := ParseForbidden(bad); err == nil {
+			t.Errorf("ParseForbidden(%q) accepted it", bad)
+		}
+	}
+	for _, bad := range []string{"p/ x", "p ./x", "p x,y"} {
+		if _, err := ParseRules(bad); err == nil {
+			t.Errorf("ParseRules(%q) accepted it", bad)
+		}
 	}
 	if _, err := ParseRules("only-one-field"); err == nil {
 		t.Error("a rule with one field was accepted")
@@ -72,5 +86,51 @@ func TestDecodePackages(t *testing.T) {
 	}
 	if _, err := DecodePackages(strings.NewReader(`{"ImportPath":`)); err == nil {
 		t.Error("truncated JSON was accepted")
+	}
+}
+
+// A rule names an import at, above or below the forbidden entry: it allows
+// exactly the imports it covers.
+func TestRulesCoverTheImportTheyName(t *testing.T) {
+	pkgs := []Package{
+		{ImportPath: "example.com/p", Imports: []string{"parent/child", "parent/child/deep", "parent/other"}},
+	}
+	for _, tc := range []struct {
+		forbidden, rule string
+		want            []string
+	}{
+		{"parent/child", "example.com/p parent/...", nil},                                           // a broader rule
+		{"parent", "example.com/p parent/child", []string{"parent/other"}},                          // a narrower rule
+		{"parent", "example.com/p parent/child/...", []string{"parent/other"}},                      // "/..." on the import
+		{"parent", "", []string{"parent/child", "parent/child/deep", "parent/other"}},               // no rule
+		{"parent\nparent/child", "", []string{"parent/child", "parent/child/deep", "parent/other"}}, // one violation per import
+	} {
+		forbidden, err := ParseForbidden(tc.forbidden)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rules, err := ParseRules(tc.rule)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, v := range Check(pkgs, forbidden, rules) {
+			got = append(got, v.Import)
+		}
+		if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Errorf("forbidden %q rule %q: %v, want %v", tc.forbidden, tc.rule, got, tc.want)
+		}
+	}
+}
+
+// A real package named foo_test is its own package, not foo's tests.
+func TestPackageNamedLikeATestIsItself(t *testing.T) {
+	pkgs := []Package{{ImportPath: "example.com/foo_test", Imports: []string{mem}}}
+	rules := []Rule{{Pattern: "example.com/foo", Import: mem}}
+	if got := Check(pkgs, []string{mem}, rules); len(got) != 1 || got[0].Package != "example.com/foo_test" {
+		t.Errorf("a rule for foo allowed foo_test: %+v", got)
+	}
+	if got := Check([]Package{{ImportPath: mem + "_test", Imports: []string{mem}}}, []string{mem}, nil); len(got) != 1 {
+		t.Errorf("a sibling %s_test was treated as the forbidden import's own tree: %+v", mem, got)
 	}
 }

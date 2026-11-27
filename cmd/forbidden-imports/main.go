@@ -32,14 +32,18 @@ func goList(dir string) ([]byte, error) {
 }
 
 func run(getenv func(string) string, list func(string) ([]byte, error), stdout, stderr io.Writer) int {
-	forbidden := forbiddenimports.ParseForbidden(getenv("CI_FORBIDDEN_IMPORTS"))
+	forbidden, err := forbiddenimports.ParseForbidden(getenv("CI_FORBIDDEN_IMPORTS"))
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "::error title=Invalid forbidden_imports::%v\n", err)
+		return 2
+	}
 	if len(forbidden) == 0 {
-		fmt.Fprintln(stdout, "No forbidden imports configured.")
+		_, _ = fmt.Fprintln(stdout, "No forbidden imports configured.")
 		return 0
 	}
 	rules, err := forbiddenimports.ParseRules(getenv("CI_ALLOWED_IMPORTS"))
 	if err != nil {
-		fmt.Fprintf(stderr, "::error title=Invalid allowed_imports::%v\n", err)
+		_, _ = fmt.Fprintf(stderr, "::error title=Invalid allowed_imports::%v\n", err)
 		return 2
 	}
 	dir := getenv("CI_MODULE_DIR")
@@ -48,21 +52,21 @@ func run(getenv func(string) string, list func(string) ([]byte, error), stdout, 
 	}
 	out, err := list(dir)
 	if err != nil {
-		fmt.Fprintf(stderr, "::error title=Forbidden imports check failed::%v\n", err)
+		_, _ = fmt.Fprintf(stderr, "::error title=Forbidden imports check failed::%v\n", err)
 		return 2
 	}
 	pkgs, err := forbiddenimports.DecodePackages(bytes.NewReader(out))
 	if err != nil {
-		fmt.Fprintf(stderr, "::error title=Forbidden imports check failed::%v\n", err)
+		_, _ = fmt.Fprintf(stderr, "::error title=Forbidden imports check failed::%v\n", err)
 		return 2
 	}
 	violations := forbiddenimports.Check(pkgs, forbidden, rules)
 	for _, v := range violations {
-		fmt.Fprintf(stderr, "::error title=Forbidden import::%s\n", v)
+		_, _ = fmt.Fprintf(stderr, "::error title=Forbidden import::%s\n", v)
 	}
 	if len(violations) > 0 {
 		return 1
 	}
-	fmt.Fprintf(stdout, "No forbidden imports in %d packages.\n", len(pkgs))
+	_, _ = fmt.Fprintf(stdout, "No forbidden imports in %d packages.\n", len(pkgs))
 	return 0
 }

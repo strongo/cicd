@@ -31,6 +31,7 @@ func TestRun(t *testing.T) {
 		{"violation", map[string]string{"CI_FORBIDDEN_IMPORTS": mem}, listing(bad, nil), 1, "", "::error title=Forbidden import::example.com/app/facade imports " + mem},
 		{"allowed", map[string]string{"CI_FORBIDDEN_IMPORTS": mem, "CI_ALLOWED_IMPORTS": "example.com/app/... " + mem}, listing(bad, nil), 0, "No forbidden imports in 1 packages", ""},
 		{"bad rule", map[string]string{"CI_FORBIDDEN_IMPORTS": mem, "CI_ALLOWED_IMPORTS": "x"}, listing(bad, nil), 2, "", "Invalid allowed_imports"},
+		{"bad forbidden", map[string]string{"CI_FORBIDDEN_IMPORTS": mem + ", other"}, listing(bad, nil), 2, "", "Invalid forbidden_imports"},
 		{"go list fails", map[string]string{"CI_FORBIDDEN_IMPORTS": mem}, listing("", errors.New("boom")), 2, "", "boom"},
 		{"bad json", map[string]string{"CI_FORBIDDEN_IMPORTS": mem}, listing("{", nil), 2, "", "decode go list output"},
 	} {
